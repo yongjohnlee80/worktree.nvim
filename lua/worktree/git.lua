@@ -144,11 +144,62 @@ function M.has_uncommitted(worktree_path)
   return vim.v.shell_error == 0 and #lines > 0
 end
 
+-- Remote-tracking branches whose short branch name exactly equals `name`,
+-- across all remotes. Returns { { remote, ref } } where `ref` is the short
+-- form like "origin/feature-x". Empty when no remote has the branch.
+function M.find_remote_branches(repo_path, name)
+  local lines = vim.fn.systemlist({
+    "git", "-C", repo_path, "for-each-ref",
+    "--format=%(refname:short)",
+    "refs/remotes/",
+  })
+  if vim.v.shell_error ~= 0 then return {} end
+  local matches = {}
+  for _, line in ipairs(lines) do
+    -- Remote names contain no slashes; branch names can. Anchor the remote
+    -- at `[^/]+` and let the branch consume everything after the first `/`.
+    local remote, branch = line:match("^([^/]+)/(.+)$")
+    if remote and branch == name and not line:match("/HEAD$") then
+      table.insert(matches, { remote = remote, ref = line })
+    end
+  end
+  return matches
+end
+
 -- Run a git subcommand and return (exit_code, combined_output). Uses
 -- vim.system so stderr is captured; systemlist swallows it.
 function M.run(args)
   local res = vim.system(args, { text = true }):wait()
   return res.code, (res.stdout or "") .. (res.stderr or "")
+end
+
+-- Same as run() but pipes `stdin` into the subprocess. Used for plumbing
+-- like `hash-object --stdin < /dev/null`.
+function M.run_with_stdin(args, stdin)
+  local res = vim.system(args, { text = true, stdin = stdin }):wait()
+  return res.code, (res.stdout or "") .. (res.stderr or "")
+end
+
+-- Derive a repo name from a git URL or local path.
+--   git@github.com:foo/bar.git     → bar
+--   https://github.com/foo/bar.git → bar
+--   https://github.com/foo/bar     → bar
+--   /path/to/myrepo                → myrepo
+-- The last run of chars that are neither `/` nor `:` is the segment.
+function M.repo_name_from_url(url)
+  local s = url:gsub("/+$", "")
+  local name = s:match("[^/:]+$") or s
+  return (name:gsub("%.git$", ""))
+end
+
+-- Symbolic HEAD (short form). Falls back to "main" if HEAD isn't resolvable,
+-- e.g. a freshly-initialized repo with no commits.
+function M.default_branch(repo_path)
+  local head = vim.fn.systemlist({
+    "git", "-C", repo_path, "symbolic-ref", "--short", "HEAD",
+  })[1]
+  if vim.v.shell_error == 0 and head and head ~= "" then return head end
+  return "main"
 end
 
 return M

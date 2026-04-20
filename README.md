@@ -31,7 +31,20 @@ repos.
   opened in.
 - **Add worktree** -- prompts for name + base branch and runs
   `git worktree add -b <name> <path> <base>`. If you're already inside a
-  repo, repo selection is skipped.
+  repo, repo selection is skipped. When the name collides with an
+  existing remote-tracking branch (`origin/<name>`), asks whether to
+  **track** it, **shadow** with a fresh local branch from a base, or
+  cancel -- prevents the silent footgun of branching away from the
+  remote by accident.
+- **Clone repo** -- prompts for a git URL + destination name (defaults
+  derived from the URL), clones as a bare in `<root>/<name>/.bare`, fixes
+  the fetch refspec so `origin/*` refs populate, writes a `.git` gitfile
+  pointer, and checks out an initial worktree on the default branch.
+  Refuses if you're already inside a git repo.
+- **Init project** -- prompts for a project name, scaffolds a fresh
+  bare+worktree layout under `<root>/<name>/` with an empty initial
+  commit on `main` and a ready-to-use `main` worktree. Refuses if you're
+  already inside a git repo.
 - **Remove worktree** -- pick from the list of reachable worktrees, with
   two safety checks (uncommitted disk changes via `git status --porcelain`
   and unsaved buffer modifications). After removal, any buffer pointing
@@ -63,6 +76,8 @@ needed, zero external deps:
     { "<leader>gW", function() require("worktree").home() end,   desc = "Worktree: back to root" },
     { "<leader>gA", function() require("worktree").add() end,    desc = "Worktree: add" },
     { "<leader>gR", function() require("worktree").remove() end, desc = "Worktree: remove" },
+    { "<leader>gC", function() require("worktree").clone() end,  desc = "Worktree: clone" },
+    { "<leader>gc", function() require("worktree").init() end,   desc = "Worktree: init new project" },
   },
 }
 ```
@@ -83,6 +98,8 @@ Realistic spec with LSP + statusline + neo-tree integration:
     { "<leader>gW", function() require("worktree").home() end,   desc = "Worktree: back to root" },
     { "<leader>gA", function() require("worktree").add() end,    desc = "Worktree: add" },
     { "<leader>gR", function() require("worktree").remove() end, desc = "Worktree: remove" },
+    { "<leader>gC", function() require("worktree").clone() end,  desc = "Worktree: clone" },
+    { "<leader>gc", function() require("worktree").init() end,   desc = "Worktree: init new project" },
   },
 }
 ```
@@ -98,12 +115,14 @@ use {
 
 ## Commands
 
-| Command            | Function                      |
-|--------------------|-------------------------------|
-| `:WorktreePick`    | Pick a worktree, `:cd` to it  |
-| `:WorktreeHome`    | `:cd` back to root            |
-| `:WorktreeAdd`     | Create a new worktree         |
-| `:WorktreeRemove`  | Remove a worktree             |
+| Command            | Function                                   |
+|--------------------|--------------------------------------------|
+| `:WorktreePick`    | Pick a worktree, `:cd` to it               |
+| `:WorktreeHome`    | `:cd` back to root                         |
+| `:WorktreeAdd`     | Create a new worktree                      |
+| `:WorktreeRemove`  | Remove a worktree                          |
+| `:WorktreeClone`   | Clone a remote into a bare+worktree layout |
+| `:WorktreeInit`    | Init a new project in the same layout      |
 
 ## Configuration
 
@@ -127,6 +146,17 @@ require("worktree").setup({
   },
 
   notify_title = "worktree",
+
+  -- Directory holding the bare repo for new projects scaffolded by
+  -- :WorktreeClone / :WorktreeInit. Two common conventions:
+  --   ".bare"  (default) -- bare lives in .bare/, .git is a gitfile pointing
+  --                        at it. Canonical in most bare+worktree guides.
+  --   ".git"             -- bare lives directly in .git/ (core.bare = true).
+  --                        Simpler, no gitfile. What you get from
+  --                        `git clone --bare <url> .git`.
+  -- Detection supports both regardless of this setting; only new projects
+  -- scaffolded by this plugin are affected.
+  bare_dir = ".bare",
 })
 ```
 
@@ -205,6 +235,63 @@ New worktrees are placed at `<parent-of-git-common-dir>/<name>`:
 
 Branch name = worktree name (via `git worktree add -b`). If that's not
 what you want, pass `-b` yourself with `:!git worktree add ...`.
+
+## Remote-branch collisions on add
+
+If the name you type for a new worktree matches an existing remote
+branch (`origin/<name>`, or any other remote), a plain
+`git worktree add -b <name>` would silently create a fresh local branch
+starting from your chosen base -- disconnected from the remote. First
+`git push` then fights over the same branch name.
+
+Instead, the plugin detects the collision and asks:
+
+- **Track `origin/<name>`** -- runs
+  `git worktree add --track -b <name> <path> origin/<name>`, so the new
+  local branch tracks the remote. Skips the base-branch prompt.
+- **Create new local `<name>` from a base branch (ignore remote)** --
+  falls through to the normal flow and creates a branch shadowing the
+  remote. Useful when you actually want to start over.
+- **Cancel** -- no-op.
+
+Multiple remotes with the same branch name each get their own track
+option.
+
+## Clone / init layout
+
+`<leader>gC` (`:WorktreeClone`) and `<leader>gc` (`:WorktreeInit`) both
+scaffold a bare+worktree layout under the plugin's root directory. The
+exact shape depends on `bare_dir` (see [Configuration](#configuration)):
+
+```
+# bare_dir = ".bare"  (default)
+<root>/
+└── <name>/
+    ├── .bare/        # bare repository
+    ├── .git          # gitfile: "gitdir: ./.bare"
+    └── <branch>/     # initial worktree
+
+# bare_dir = ".git"
+<root>/
+└── <name>/
+    ├── .git/         # bare repository (core.bare = true)
+    └── <branch>/     # initial worktree
+```
+
+Detection (switching, adding, removing worktrees) works regardless of
+which layout a given project uses -- the plugin's `is_git` check treats
+`.git` as either a dir (regular repo or bare-as-git) or a file (gitfile
+pointing at a sibling bare). You can mix conventions across projects
+under the same root without issues; `bare_dir` only controls what gets
+created for *new* projects.
+
+Both commands refuse to run if your cwd is already inside a git repo --
+they want to land at the root, not nest repos inside each other.
+`<leader>gW` first if you need to hop back.
+
+For init, an empty initial commit on `main` is seeded via plumbing
+(`hash-object` → `commit-tree` → `update-ref`) because `git worktree
+add` needs a ref to check out and a fresh `--bare` has none.
 
 ## Safety rails on remove
 

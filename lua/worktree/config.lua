@@ -21,6 +21,17 @@ M.defaults = {
 
   -- Notification title. Set to false to let vim.notify use its own default.
   notify_title = "worktree",
+
+  -- Directory name that holds the bare repo for projects created by
+  -- :WorktreeClone / :WorktreeInit. Two conventions in the wild:
+  --   ".bare"  (default) -- bare lives in .bare/, .git is a gitfile pointing
+  --                        at it. Canonical pattern in most worktree guides.
+  --   ".git"             -- bare lives directly in .git/ (clone --bare <url>
+  --                        .git style). No gitfile written; core.bare = true
+  --                        tells git the dir is bare.
+  -- Detection handles both regardless of this setting -- only new projects
+  -- you scaffold via this plugin are affected.
+  bare_dir = ".bare",
 }
 
 M.options = vim.deepcopy(M.defaults)

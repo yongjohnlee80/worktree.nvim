@@ -200,6 +200,48 @@ function M.add()
   local cwd = git.norm(vim.fn.getcwd())
   local here_common = git.git_common_dir(cwd)
 
+  -- `--track -b <name> <path> <remote>/<name>` -- new local branch tracking
+  -- the remote. Use when the user picks "Track" on a name collision.
+  local function create_tracking(repo_common, container, name, remote_ref)
+    local target = container .. "/" .. name
+    local code, out = git.run({
+      "git", "-C", repo_common, "worktree", "add", "--track",
+      "-b", name, target, remote_ref,
+    })
+    if code ~= 0 then
+      notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+      return
+    end
+    refresh_file_tree()
+    notify(("+ %s (tracking %s)"):format(relative_to_root(target), remote_ref))
+  end
+
+  -- `-b <name> <path> <base>` -- plain new branch from a local base. Used
+  -- when there's no remote collision, or when the user explicitly picks
+  -- "shadow" past one.
+  local function create_from_base(repo_common, container, name)
+    local branches = git.list_branches(repo_common)
+    if #branches == 0 then
+      notify("No branches found in repo", vim.log.levels.ERROR)
+      return
+    end
+    vim.ui.select(branches, {
+      prompt = ("Base branch for '%s':"):format(name),
+    }, function(base)
+      if not base then return end
+      local target = container .. "/" .. name
+      local code, out = git.run({
+        "git", "-C", repo_common, "worktree", "add", "-b", name, target, base,
+      })
+      if code ~= 0 then
+        notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+        return
+      end
+      refresh_file_tree()
+      notify(("+ %s (from %s)"):format(relative_to_root(target), base))
+    end)
+  end
+
   local function proceed(repo_common, label)
     local container = git.repo_container(repo_common)
 
@@ -208,27 +250,42 @@ function M.add()
       name = vim.trim(name)
       if name == "" then return end
 
-      local branches = git.list_branches(repo_common)
-      if #branches == 0 then
-        notify("No branches found in repo", vim.log.levels.ERROR)
+      -- If the name collides with one or more remote branches, ask before
+      -- creating. Default `-b` would silently shadow the remote, starting a
+      -- fresh local branch disconnected from `origin/<name>` -- almost
+      -- always a footgun.
+      local remote_matches = git.find_remote_branches(repo_common, name)
+      if #remote_matches > 0 then
+        local options = {}
+        for _, m in ipairs(remote_matches) do
+          table.insert(options, {
+            kind = "track",
+            ref = m.ref,
+            label = ("Track %s"):format(m.ref),
+          })
+        end
+        table.insert(options, {
+          kind = "shadow",
+          label = ("Create new local '%s' from a base branch (ignore remote)")
+            :format(name),
+        })
+        table.insert(options, { kind = "cancel", label = "Cancel" })
+
+        vim.ui.select(options, {
+          prompt = ("'%s' already exists on a remote -- what to do?"):format(name),
+          format_item = function(o) return o.label end,
+        }, function(choice)
+          if not choice or choice.kind == "cancel" then return end
+          if choice.kind == "track" then
+            create_tracking(repo_common, container, name, choice.ref)
+          else
+            create_from_base(repo_common, container, name)
+          end
+        end)
         return
       end
 
-      vim.ui.select(branches, {
-        prompt = ("Base branch for '%s':"):format(name),
-      }, function(base)
-        if not base then return end
-        local target = container .. "/" .. name
-        local code, out = git.run({
-          "git", "-C", repo_common, "worktree", "add", "-b", name, target, base,
-        })
-        if code ~= 0 then
-          notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
-          return
-        end
-        refresh_file_tree()
-        notify(("+ %s (from %s)"):format(relative_to_root(target), base))
-      end)
+      create_from_base(repo_common, container, name)
     end)
   end
 
@@ -364,6 +421,190 @@ function M.remove()
       return
     end
     notify(("- branch %s"):format(choice.branch))
+  end)
+end
+
+-- Guard: refuse an operation if the cwd is inside a git repo. Used by the
+-- clone/init commands -- both want to land at the root layout and would do
+-- the wrong thing if run from inside an existing checkout.
+local function require_not_in_repo(op_label)
+  local cwd = git.norm(vim.fn.getcwd())
+  if git.git_common_dir(cwd) then
+    notify(
+      ("refusing to %s -- cwd is inside a git repo (%s). Hop back to root first (<leader>gW).")
+        :format(op_label, cwd),
+      vim.log.levels.ERROR
+    )
+    return false
+  end
+  return true
+end
+
+-- Write a gitfile at `<dir>/.git` pointing at `./<bare_rel>`. Makes
+-- `git -C <dir>` discover the bare repo automatically so the rest of the
+-- plugin (collect_worktrees, list_child_repos, etc.) finds it.
+local function write_gitfile(dir, bare_rel)
+  local path = dir .. "/.git"
+  local f, err = io.open(path, "w")
+  if not f then return false, err or "unknown error" end
+  f:write("gitdir: ./" .. bare_rel .. "\n")
+  f:close()
+  return true
+end
+
+-- Create the first worktree on `branch` under `<repo_dir>/<branch>` and
+-- `:cd` into it. Called after clone/init so the user lands in a usable
+-- checkout instead of staring at a bare dir.
+local function add_initial_worktree(bare_path, repo_dir, branch)
+  local target = repo_dir .. "/" .. branch
+  local code, out = git.run({
+    "git", "-C", bare_path, "worktree", "add", target, branch,
+  })
+  if code ~= 0 then
+    notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+    return false
+  end
+  vim.cmd.cd(vim.fn.fnameescape(target))
+  refresh_file_tree()
+  return true
+end
+
+function M.clone()
+  if not require_not_in_repo("clone") then return end
+
+  vim.ui.input({ prompt = "Git URL to clone: " }, function(url)
+    if not url or vim.trim(url) == "" then return end
+    url = vim.trim(url)
+
+    vim.ui.input({
+      prompt = "Repo directory name: ",
+      default = git.repo_name_from_url(url),
+    }, function(name)
+      if not name or vim.trim(name) == "" then return end
+      name = vim.trim(name)
+
+      local root = M.ensure_root()
+      local repo_dir = root .. "/" .. name
+      local bare_dir = config.options.bare_dir or ".bare"
+      local bare_path = repo_dir .. "/" .. bare_dir
+
+      if vim.fn.isdirectory(repo_dir) == 1 then
+        notify(
+          ("'%s' already exists under %s"):format(name, root),
+          vim.log.levels.ERROR
+        )
+        return
+      end
+
+      notify(("cloning %s → %s ..."):format(url, relative_to_root(repo_dir)))
+      local code, out = git.run({ "git", "clone", "--bare", url, bare_path })
+      if code ~= 0 then
+        notify("git clone --bare failed:\n" .. out, vim.log.levels.ERROR)
+        return
+      end
+
+      -- `clone --bare` defaults the fetch refspec to mirror-style
+      -- (+refs/heads/*:refs/heads/*), which breaks the worktree layout
+      -- because remote branches won't land under refs/remotes/origin/*.
+      -- Rewrite the refspec and re-fetch so `origin/*` refs populate.
+      git.run({
+        "git", "-C", bare_path, "config",
+        "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*",
+      })
+      git.run({ "git", "-C", bare_path, "fetch", "origin" })
+
+      -- Only write a gitfile when the bare is in a sibling dir (e.g. .bare/).
+      -- When bare_dir == ".git", the .git/ dir *is* the bare and git finds
+      -- it natively via core.bare = true.
+      if bare_dir ~= ".git" then
+        local ok, err = write_gitfile(repo_dir, bare_dir)
+        if not ok then
+          notify("failed to write .git gitfile: " .. err, vim.log.levels.ERROR)
+          return
+        end
+      end
+
+      local default = git.default_branch(bare_path)
+      if add_initial_worktree(bare_path, repo_dir, default) then
+        notify(("cloned → %s (worktree on %s)"):format(
+          relative_to_root(repo_dir), default
+        ))
+      end
+    end)
+  end)
+end
+
+function M.init()
+  if not require_not_in_repo("init") then return end
+
+  vim.ui.input({ prompt = "New project name: " }, function(name)
+    if not name or vim.trim(name) == "" then return end
+    name = vim.trim(name)
+
+    local root = M.ensure_root()
+    local repo_dir = root .. "/" .. name
+    local bare_dir = config.options.bare_dir or ".bare"
+    local bare_path = repo_dir .. "/" .. bare_dir
+
+    if vim.fn.isdirectory(repo_dir) == 1 then
+      notify(
+        ("'%s' already exists under %s"):format(name, root),
+        vim.log.levels.ERROR
+      )
+      return
+    end
+
+    local code, out = git.run({
+      "git", "init", "--bare", "-b", "main", bare_path,
+    })
+    if code ~= 0 then
+      notify("git init --bare failed:\n" .. out, vim.log.levels.ERROR)
+      return
+    end
+
+    -- Seed an initial empty commit on main. Without it `worktree add` has
+    -- nothing to check out (no ref exists yet) and fails on a fresh bare.
+    -- Plumbing-only so we don't need a working tree to make the commit.
+    local hc, empty_tree = git.run_with_stdin(
+      { "git", "-C", bare_path, "hash-object", "-t", "tree", "--stdin" }, ""
+    )
+    if hc ~= 0 then
+      notify("hash-object failed:\n" .. empty_tree, vim.log.levels.ERROR)
+      return
+    end
+    empty_tree = vim.trim(empty_tree)
+
+    local cc, commit = git.run({
+      "git", "-C", bare_path, "commit-tree", empty_tree, "-m", "Initial commit",
+    })
+    if cc ~= 0 then
+      notify("commit-tree failed:\n" .. commit, vim.log.levels.ERROR)
+      return
+    end
+    commit = vim.trim(commit)
+
+    local uc, uout = git.run({
+      "git", "-C", bare_path, "update-ref", "refs/heads/main", commit,
+    })
+    if uc ~= 0 then
+      notify("update-ref failed:\n" .. uout, vim.log.levels.ERROR)
+      return
+    end
+
+    -- See clone() for the bare_dir == ".git" case -- no gitfile needed.
+    if bare_dir ~= ".git" then
+      local ok, err = write_gitfile(repo_dir, bare_dir)
+      if not ok then
+        notify("failed to write .git gitfile: " .. err, vim.log.levels.ERROR)
+        return
+      end
+    end
+
+    if add_initial_worktree(bare_path, repo_dir, "main") then
+      notify(("initialized → %s (empty commit on main)"):format(
+        relative_to_root(repo_dir)
+      ))
+    end
   end)
 end
 

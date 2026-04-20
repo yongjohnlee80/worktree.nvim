@@ -15,6 +15,8 @@ user_cmd("WorktreePick", "pick", "Worktree: switch")
 user_cmd("WorktreeHome", "home", "Worktree: back to root")
 user_cmd("WorktreeAdd", "add", "Worktree: add")
 user_cmd("WorktreeRemove", "remove", "Worktree: remove")
+user_cmd("WorktreeClone", "clone", "Worktree: clone a remote into a bare+worktree layout")
+user_cmd("WorktreeInit", "init", "Worktree: init a new project in a bare+worktree layout")
 
 vim.api.nvim_create_autocmd("VimEnter", {
   once = true,
