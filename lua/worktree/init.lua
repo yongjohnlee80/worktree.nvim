@@ -216,8 +216,26 @@ function M.add()
     notify(("+ %s (tracking %s)"):format(relative_to_root(target), remote_ref))
   end
 
+  -- `worktree add <path> <branch>` (no `-b`) -- checks out the existing
+  -- local branch into a new worktree. Used when the user picks
+  -- "Check out existing local" on a name collision.
+  local function create_checkout_local(repo_common, container, name)
+    local target = container .. "/" .. name
+    local code, out = git.run({
+      "git", "-C", repo_common, "worktree", "add", target, name,
+    })
+    if code ~= 0 then
+      notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+      return
+    end
+    refresh_file_tree()
+    notify(("+ %s (checked out existing local '%s')"):format(
+      relative_to_root(target), name
+    ))
+  end
+
   -- `-b <name> <path> <base>` -- plain new branch from a local base. Used
-  -- when there's no remote collision, or when the user explicitly picks
+  -- when there's no collision, or when the user explicitly picks
   -- "shadow" past one.
   local function create_from_base(repo_common, container, name)
     local branches = git.list_branches(repo_common)
@@ -250,42 +268,83 @@ function M.add()
       name = vim.trim(name)
       if name == "" then return end
 
-      -- If the name collides with one or more remote branches, ask before
-      -- creating. Default `-b` would silently shadow the remote, starting a
-      -- fresh local branch disconnected from `origin/<name>` -- almost
-      -- always a footgun.
+      -- Sniff existing branches that match the requested name. Three things
+      -- matter: does a local branch exist, is it already checked out by
+      -- another worktree (hard conflict), and does any remote have it too.
+      local local_exists = git.local_branch_exists(repo_common, name)
+      local wt_path = local_exists
+        and git.worktree_for_branch(repo_common, name)
+        or nil
       local remote_matches = git.find_remote_branches(repo_common, name)
-      if #remote_matches > 0 then
-        local options = {}
-        for _, m in ipairs(remote_matches) do
-          table.insert(options, {
-            kind = "track",
-            ref = m.ref,
-            label = ("Track %s"):format(m.ref),
-          })
-        end
-        table.insert(options, {
-          kind = "shadow",
-          label = ("Create new local '%s' from a base branch (ignore remote)")
-            :format(name),
-        })
-        table.insert(options, { kind = "cancel", label = "Cancel" })
 
-        vim.ui.select(options, {
-          prompt = ("'%s' already exists on a remote -- what to do?"):format(name),
-          format_item = function(o) return o.label end,
-        }, function(choice)
-          if not choice or choice.kind == "cancel" then return end
-          if choice.kind == "track" then
-            create_tracking(repo_common, container, name, choice.ref)
-          else
-            create_from_base(repo_common, container, name)
-          end
-        end)
+      -- Hard stop: git refuses to check out the same branch in two
+      -- worktrees. Tell the user where it lives so they can switch instead.
+      if wt_path then
+        notify(
+          ("'%s' is already checked out in worktree %s"):format(
+            name, relative_to_root(wt_path)
+          ),
+          vim.log.levels.ERROR
+        )
         return
       end
 
-      create_from_base(repo_common, container, name)
+      -- No collision at all → straight to the base-branch prompt.
+      if not local_exists and #remote_matches == 0 then
+        create_from_base(repo_common, container, name)
+        return
+      end
+
+      -- Build a dynamic option list across the collision cases. The plain
+      -- `-b <name>` git would run by default silently shadows either the
+      -- local branch (error) or the remote branch (footgun), so we always
+      -- ask when there's a name collision.
+      local options = {}
+      if local_exists then
+        table.insert(options, {
+          kind = "checkout_local",
+          label = ("Check out existing local '%s' into a new worktree")
+            :format(name),
+        })
+      end
+      for _, m in ipairs(remote_matches) do
+        table.insert(options, {
+          kind = "track",
+          ref = m.ref,
+          label = ("Track %s (new local '%s' tracking it)")
+            :format(m.ref, name),
+        })
+      end
+      table.insert(options, {
+        kind = "shadow",
+        label = ("Create new local '%s' from a base branch"):format(name),
+      })
+      table.insert(options, { kind = "cancel", label = "Cancel" })
+
+      local prompt
+      if local_exists and #remote_matches > 0 then
+        prompt = ("'%s' exists locally and on a remote -- what to do?")
+          :format(name)
+      elseif local_exists then
+        prompt = ("'%s' exists as a local branch -- what to do?"):format(name)
+      else
+        prompt = ("'%s' already exists on a remote -- what to do?")
+          :format(name)
+      end
+
+      vim.ui.select(options, {
+        prompt = prompt,
+        format_item = function(o) return o.label end,
+      }, function(choice)
+        if not choice or choice.kind == "cancel" then return end
+        if choice.kind == "track" then
+          create_tracking(repo_common, container, name, choice.ref)
+        elseif choice.kind == "checkout_local" then
+          create_checkout_local(repo_common, container, name)
+        else
+          create_from_base(repo_common, container, name)
+        end
+      end)
     end)
   end
 

@@ -144,6 +144,29 @@ function M.has_uncommitted(worktree_path)
   return vim.v.shell_error == 0 and #lines > 0
 end
 
+-- `true` if a local branch with this exact name exists in the repo.
+function M.local_branch_exists(repo_path, name)
+  vim.fn.systemlist({
+    "git", "-C", repo_path, "rev-parse", "--verify", "--quiet",
+    "refs/heads/" .. name,
+  })
+  return vim.v.shell_error == 0
+end
+
+-- Path of the worktree currently checking out `branch`, if any. Git refuses
+-- to check out the same branch in two worktrees, so this tells the caller
+-- when a "use existing local branch" option is actually available.
+function M.worktree_for_branch(repo_path, branch)
+  local lines = vim.fn.systemlist({
+    "git", "-C", repo_path, "worktree", "list", "--porcelain",
+  })
+  if vim.v.shell_error ~= 0 then return nil end
+  for _, wt in ipairs(M.parse_porcelain(lines)) do
+    if wt.branch == branch then return wt.path end
+  end
+  return nil
+end
+
 -- Remote-tracking branches whose short branch name exactly equals `name`,
 -- across all remotes. Returns { { remote, ref } } where `ref` is the short
 -- form like "origin/feature-x". Empty when no remote has the branch.

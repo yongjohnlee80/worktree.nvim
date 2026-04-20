@@ -236,26 +236,36 @@ New worktrees are placed at `<parent-of-git-common-dir>/<name>`:
 Branch name = worktree name (via `git worktree add -b`). If that's not
 what you want, pass `-b` yourself with `:!git worktree add ...`.
 
-## Remote-branch collisions on add
+## Branch-name collisions on add
 
-If the name you type for a new worktree matches an existing remote
-branch (`origin/<name>`, or any other remote), a plain
-`git worktree add -b <name>` would silently create a fresh local branch
-starting from your chosen base -- disconnected from the remote. First
-`git push` then fights over the same branch name.
+`git worktree add -b <name>` silently does the wrong thing when the name
+is already taken: it errors if a local branch exists, and it *doesn't*
+error if only a remote exists (instead creating a fresh local branch
+disconnected from `origin/<name>`). The plugin detects both cases up
+front and asks what you want to do. The options shown depend on the
+kind of collision:
 
-Instead, the plugin detects the collision and asks:
+| Existing branch | Worktree for it? | Options shown                                                |
+|-----------------|------------------|--------------------------------------------------------------|
+| None            | —                | (no prompt) create new from base                             |
+| Local only      | No               | Check out local / Shadow with new branch / Cancel            |
+| Remote only     | —                | Track `<remote>/<name>` / Shadow / Cancel                    |
+| Both            | Local has none   | Check out local / Track each remote / Shadow / Cancel        |
+| Local only      | **Yes**          | Hard error — git refuses two worktrees on the same branch    |
 
-- **Track `origin/<name>`** -- runs
-  `git worktree add --track -b <name> <path> origin/<name>`, so the new
-  local branch tracks the remote. Skips the base-branch prompt.
-- **Create new local `<name>` from a base branch (ignore remote)** --
-  falls through to the normal flow and creates a branch shadowing the
-  remote. Useful when you actually want to start over.
-- **Cancel** -- no-op.
+**Action details:**
 
-Multiple remotes with the same branch name each get their own track
-option.
+- **Check out existing local** — runs `git worktree add <path> <name>`
+  (no `-b`), so the new worktree uses the existing branch as-is.
+- **Track `<remote>/<name>`** — runs
+  `git worktree add --track -b <name> <path> <remote>/<name>`, so the
+  new local branch tracks the remote. Multiple remotes with the same
+  branch name each get their own track option.
+- **Shadow with new branch** — falls through to the base-branch prompt
+  and runs `git worktree add -b <name> <path> <base>`. Creates a fresh
+  branch independent of any existing one. Only the right choice when
+  you genuinely want to start over under the same name.
+- **Cancel** — no-op.
 
 ## Clone / init layout
 
