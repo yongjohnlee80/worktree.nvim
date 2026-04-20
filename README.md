@@ -55,7 +55,7 @@ needed, zero external deps:
 
 ```lua
 {
-  "your-user/worktree.nvim",
+  "yongjohnlee80/worktree.nvim",
   event = "VeryLazy",
   opts = {},
   keys = {
@@ -71,7 +71,7 @@ Realistic spec with LSP + statusline + neo-tree integration:
 
 ```lua
 {
-  "your-user/worktree.nvim",
+  "yongjohnlee80/worktree.nvim",
   event = "VeryLazy",
   opts = {
     -- Restart these servers on :cd so root_dir re-resolves against the
@@ -91,7 +91,7 @@ Realistic spec with LSP + statusline + neo-tree integration:
 
 ```lua
 use {
-  "your-user/worktree.nvim",
+  "yongjohnlee80/worktree.nvim",
   config = function() require("worktree").setup() end,
 }
 ```
