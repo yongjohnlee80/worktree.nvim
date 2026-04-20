@@ -141,11 +141,25 @@ local function restart_workspace_lsps()
 
   -- Stop is async; defer re-attach so the old client is fully gone before
   -- lspconfig's autocmd fires a new launch.
+  --
+  -- Scope the re-attach to buffers whose path is inside the new cwd.
+  -- Buffers pointing into a prior worktree stay detached until the user
+  -- navigates into them again. This prevents two problems:
+  --   1. Spawning an LSP client rooted at a stale workspace (e.g. gopls
+  --      anchoring at an old Go worktree while the user is now on a TS
+  --      one), which produces transient "no package metadata" errors and
+  --      doubles the running LSP set.
+  --   2. LSP attach events triggering neo-tree's `follow_current_file`
+  --      to re-anchor the file tree back to the old worktree.
   vim.defer_fn(function()
+    local cwd = vim.fn.getcwd()
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buftype == "" then
         if vim.bo[bufnr].filetype ~= "" then
-          pcall(vim.api.nvim_exec_autocmds, "FileType", { buffer = bufnr })
+          local path = vim.api.nvim_buf_get_name(bufnr)
+          if path ~= "" and vim.startswith(path, cwd .. "/") then
+            pcall(vim.api.nvim_exec_autocmds, "FileType", { buffer = bufnr })
+          end
         end
       end
     end
