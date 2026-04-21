@@ -166,12 +166,52 @@ local function restart_workspace_lsps()
   end, 150)
 end
 
+-- Close file-buffers under `old_path` that aren't under `new_path`, and
+-- redirect the current window away from any buffer about to disappear so
+-- nvim doesn't pick an arbitrary alternate. Returns the notification
+-- suffix to append to the switch message (e.g. "closed 3 buffer(s)").
+-- No-op when cleanup_on_switch is disabled.
+local function cleanup_stale_buffers(old_path, new_path)
+  if not config.options.cleanup_on_switch then return "" end
+  if old_path == new_path then return "" end
+
+  local win = vim.api.nvim_get_current_win()
+  if buffers.win_is_stale(win, old_path, new_path) then
+    local landing = buffers.first_under(new_path)
+    if landing then
+      vim.api.nvim_win_set_buf(win, landing)
+    else
+      vim.cmd("enew")
+    end
+  end
+
+  local closed, dirty = buffers.close_between(old_path, new_path)
+
+  if #dirty > 0 then
+    vim.schedule(function()
+      notify(
+        ("%d unsaved buffer(s) left open:\n  %s"):format(
+          #dirty, table.concat(dirty, "\n  ")
+        ),
+        vim.log.levels.WARN
+      )
+    end)
+  end
+
+  if closed > 0 then
+    return (" (closed %d buffer(s))"):format(closed)
+  end
+  return ""
+end
+
 local function switch_to(path)
+  local old_cwd = git.norm(vim.fn.getcwd())
   local target = git.norm(path)
   vim.cmd.cd(vim.fn.fnameescape(target))
+  local suffix = cleanup_stale_buffers(old_cwd, target)
   restart_workspace_lsps()
   refresh_file_tree()
-  notify(("worktree → %s"):format(relative_to_root(target)))
+  notify(("worktree → %s%s"):format(relative_to_root(target), suffix))
 end
 
 function M.pick()
@@ -200,14 +240,16 @@ end
 
 function M.home()
   local root = M.ensure_root()
-  if git.norm(vim.fn.getcwd()) == git.norm(root) then
+  local old_cwd = git.norm(vim.fn.getcwd())
+  if old_cwd == git.norm(root) then
     notify(("already at root: %s"):format(root))
     return
   end
   vim.cmd.cd(vim.fn.fnameescape(root))
+  local suffix = cleanup_stale_buffers(old_cwd, git.norm(root))
   restart_workspace_lsps()
   refresh_file_tree()
-  notify(("worktree ← root (%s)"):format(root))
+  notify(("worktree ← root (%s)%s"):format(root, suffix))
 end
 
 function M.add()

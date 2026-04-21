@@ -147,6 +147,15 @@ require("worktree").setup({
 
   notify_title = "worktree",
 
+  -- When switching worktrees (pick/home), close UNMODIFIED file-buffers
+  -- that live under the old worktree but not under the new one. Fixes
+  -- neo-tree's `follow_current_file` snapping back to the old worktree
+  -- when the current window is still showing an old buffer, plus stale
+  -- LSP diagnostics from the old workspace rendering in the new tree.
+  -- Modified buffers are always left intact and surfaced in a warning
+  -- notification so unsaved work never disappears silently.
+  cleanup_on_switch = true,
+
   -- Directory holding the bare repo for new projects scaffolded by
   -- :WorktreeClone / :WorktreeInit. Two common conventions:
   --   ".bare"  (default) -- bare lives in .bare/, .git is a gitfile pointing
