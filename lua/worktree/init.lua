@@ -204,32 +204,33 @@ local function cleanup_stale_buffers(old_path, new_path)
   return ""
 end
 
--- Save/load the per-cwd nvim session via folke/persistence.nvim when
--- `integrations.persistence` is on. pcall-guarded so a missing plugin is
--- a silent no-op; save always happens BEFORE :cd (keyed to old cwd),
--- load always happens AFTER cd+cleanup (keyed to new cwd). Returns a
--- notification suffix so the caller can surface "loaded session" state.
-local function persistence_save()
+-- Per-worktree buffer tracking. Lightweight replacement for v0.3.0's
+-- persistence.nvim integration: we save the list of file-buffers
+-- belonging to the old worktree BEFORE :cd, then on return to a
+-- worktree :badd the saved buffers back. Window layout is never
+-- touched, so neo-tree / terminals / dap-view all survive the switch.
+-- Gated on the same `integrations.persistence` option.
+local function persistence_save(old_cwd)
   if not config.options.integrations.persistence then return end
-  local ok, p = pcall(require, "persistence")
-  if ok and p.save then pcall(p.save) end
+  require("worktree.session").save(old_cwd)
 end
 
-local function persistence_load()
+local function persistence_load(new_cwd)
   if not config.options.integrations.persistence then return "" end
-  local ok, p = pcall(require, "persistence")
-  if not (ok and p.load) then return "" end
-  local had = pcall(p.load, { last = false })
-  return had and " (session restored)" or ""
+  local ok, count = require("worktree.session").load(new_cwd)
+  if ok and count > 0 then
+    return (" (restored %d buffer(s))"):format(count)
+  end
+  return ""
 end
 
 local function switch_to(path)
   local old_cwd = git.norm(vim.fn.getcwd())
   local target = git.norm(path)
-  persistence_save()
+  persistence_save(old_cwd)
   vim.cmd.cd(vim.fn.fnameescape(target))
   local cleanup_suffix = cleanup_stale_buffers(old_cwd, target)
-  local session_suffix = persistence_load()
+  local session_suffix = persistence_load(target)
   restart_workspace_lsps()
   refresh_file_tree()
   notify(("worktree → %s%s%s"):format(
@@ -268,10 +269,11 @@ function M.home()
     notify(("already at root: %s"):format(root))
     return
   end
-  persistence_save()
+  persistence_save(old_cwd)
   vim.cmd.cd(vim.fn.fnameescape(root))
-  local cleanup_suffix = cleanup_stale_buffers(old_cwd, git.norm(root))
-  local session_suffix = persistence_load()
+  local new_cwd = git.norm(root)
+  local cleanup_suffix = cleanup_stale_buffers(old_cwd, new_cwd)
+  local session_suffix = persistence_load(new_cwd)
   restart_workspace_lsps()
   refresh_file_tree()
   notify(("worktree ← root (%s)%s%s"):format(root, cleanup_suffix, session_suffix))
@@ -538,6 +540,11 @@ function M.remove()
     end
 
     local wiped = buffers.wipe_under(choice.path)
+    -- Drop the saved session for the removed worktree so we don't keep
+    -- stale JSON files around. Silently no-ops if sessions aren't in use.
+    if config.options.integrations.persistence then
+      require("worktree.session").forget(choice.path)
+    end
     refresh_file_tree()
     notify(("- %s%s"):format(
       relative_to_root(choice.path),

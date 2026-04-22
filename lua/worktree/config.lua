@@ -17,15 +17,19 @@ M.defaults = {
     neotree = true,
     -- Stop+restart workspace LSPs after :cd.
     lsp = true,
-    -- Per-worktree session save/load via folke/persistence.nvim. When
-    -- enabled, a worktree switch:
-    --   1. saves the nvim session keyed to the OLD cwd (current window
-    --      layout, buffer list, jumps, marks)
+    -- Per-worktree buffer memory. When enabled, a worktree switch:
+    --   1. saves the file-buffers under the OLD cwd to a small JSON file
+    --      keyed by the cwd hash (no window layout, no terminals, no
+    --      neo-tree state -- just file paths and the focused file)
     --   2. :cd to the new worktree + cleanup_on_switch as usual
-    --   3. loads the session saved for the NEW cwd, if one exists
-    -- Pairs best with cleanup_on_switch = true so the loaded session
-    -- doesn't fight with stale buffers left over from the old worktree.
-    -- Silently no-ops if persistence.nvim isn't installed.
+    --   3. :badd the saved buffers for the NEW cwd (if any) so they show
+    --      up in the buffer list, picker, :bnext/:bprev
+    -- Neo-tree, terminals, dap-view, and any other ad-hoc panels are
+    -- left untouched -- the restore only populates the buffer list.
+    -- Pairs best with cleanup_on_switch = true.
+    --
+    -- Superseded v0.3.0's persistence.nvim integration; the plugin name
+    -- is kept for backwards config compatibility.
     persistence = false,
   },
 

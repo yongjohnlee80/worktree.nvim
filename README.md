@@ -233,9 +233,9 @@ local s = require("worktree").status()
 if require("worktree").is_linked_worktree() then ... end
 ```
 
-### persistence.nvim (per-worktree sessions)
+### Per-worktree buffer memory
 
-Opt-in integration with [folke/persistence.nvim](https://github.com/folke/persistence.nvim) that gives each worktree its own restored workspace (open files, window layout, jumps, marks). Enable it with:
+Opt-in integration that gives each worktree its own remembered set of file-buffers across switches, without touching your neo-tree / terminal / dap-view panels. Enable it with:
 
 ```lua
 require("worktree").setup({
@@ -245,16 +245,20 @@ require("worktree").setup({
 
 When enabled, every `:WorktreePick` / `<leader>gw` and `:WorktreeHome` / `<leader>gW` does:
 
-1. `persistence.save()` — snapshot the current session keyed to the OLD cwd
-2. `:cd` into the target worktree
-3. Run `cleanup_on_switch` as usual (close stale buffers)
-4. `persistence.load({ last = false })` — restore the session saved for the NEW cwd, if any exists
+1. Snapshots the list of normal file-buffers under the OLD cwd to `~/.local/state/nvim/worktree-sessions/<hash>.json` (file paths + the currently focused file — nothing else).
+2. `:cd` into the target worktree.
+3. Runs `cleanup_on_switch` as usual (closes stale buffers).
+4. `:badd`s every saved buffer for the NEW cwd (if a snapshot exists) so they show up in `:ls`, your buffer picker, and `:bnext`/`:bprev`. If the current window is a blank no-name buffer (what cleanup leaves you on when the new worktree has no existing open files), the last-focused file is `:edit`ed into it.
 
-First visit to a worktree has no saved session → load is a silent no-op. Every subsequent return replays what you had open last time. The notification on switch appends `(session restored)` when a session actually loaded.
+**What's preserved vs not.** Restore only touches the buffer list. Ad-hoc panels — neo-tree, `:terminal`, dap-view, whatever splits you had open — stay exactly where they were. No `:source session.vim`, no window layout replay.
 
-**Pairs best with `cleanup_on_switch = true`** (default). Without cleanup, the loaded session fights with stale buffers from the old worktree that neo-tree's `follow_current_file` keeps chasing.
+First visit to a worktree has no snapshot → step 4 is a silent no-op. Every subsequent return replays what you had loaded last time. The notification on switch appends `(restored N buffer(s))` when a snapshot was actually read.
 
-persistence.nvim's own `VimLeavePre` auto-save still runs on exit, so sessions also survive nvim restarts.
+**Pairs best with `cleanup_on_switch = true`** (default) so the old worktree's buffers are gone before the new worktree's get `:badd`ed, keeping the buffer list tidy.
+
+Snapshots for a removed worktree are deleted automatically when you `<leader>gR` that worktree, so stale JSON files don't accumulate.
+
+> *History:* v0.3.0 implemented this via [folke/persistence.nvim](https://github.com/folke/persistence.nvim), which clobbered existing window layouts on every switch. v0.3.1 swapped the backing to a home-grown JSON-per-cwd tracker to fix that — same option name, same opt-in semantics, quieter behavior.
 
 ## How worktree paths are chosen
 
