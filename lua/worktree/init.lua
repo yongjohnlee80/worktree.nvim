@@ -204,14 +204,37 @@ local function cleanup_stale_buffers(old_path, new_path)
   return ""
 end
 
+-- Save/load the per-cwd nvim session via folke/persistence.nvim when
+-- `integrations.persistence` is on. pcall-guarded so a missing plugin is
+-- a silent no-op; save always happens BEFORE :cd (keyed to old cwd),
+-- load always happens AFTER cd+cleanup (keyed to new cwd). Returns a
+-- notification suffix so the caller can surface "loaded session" state.
+local function persistence_save()
+  if not config.options.integrations.persistence then return end
+  local ok, p = pcall(require, "persistence")
+  if ok and p.save then pcall(p.save) end
+end
+
+local function persistence_load()
+  if not config.options.integrations.persistence then return "" end
+  local ok, p = pcall(require, "persistence")
+  if not (ok and p.load) then return "" end
+  local had = pcall(p.load, { last = false })
+  return had and " (session restored)" or ""
+end
+
 local function switch_to(path)
   local old_cwd = git.norm(vim.fn.getcwd())
   local target = git.norm(path)
+  persistence_save()
   vim.cmd.cd(vim.fn.fnameescape(target))
-  local suffix = cleanup_stale_buffers(old_cwd, target)
+  local cleanup_suffix = cleanup_stale_buffers(old_cwd, target)
+  local session_suffix = persistence_load()
   restart_workspace_lsps()
   refresh_file_tree()
-  notify(("worktree → %s%s"):format(relative_to_root(target), suffix))
+  notify(("worktree → %s%s%s"):format(
+    relative_to_root(target), cleanup_suffix, session_suffix
+  ))
 end
 
 function M.pick()
@@ -245,11 +268,13 @@ function M.home()
     notify(("already at root: %s"):format(root))
     return
   end
+  persistence_save()
   vim.cmd.cd(vim.fn.fnameescape(root))
-  local suffix = cleanup_stale_buffers(old_cwd, git.norm(root))
+  local cleanup_suffix = cleanup_stale_buffers(old_cwd, git.norm(root))
+  local session_suffix = persistence_load()
   restart_workspace_lsps()
   refresh_file_tree()
-  notify(("worktree ← root (%s)%s"):format(root, suffix))
+  notify(("worktree ← root (%s)%s%s"):format(root, cleanup_suffix, session_suffix))
 end
 
 function M.add()

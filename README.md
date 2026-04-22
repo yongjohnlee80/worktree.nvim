@@ -141,8 +141,9 @@ require("worktree").setup({
   lsp_servers_to_restart = {},
 
   integrations = {
-    neotree = true, -- re-anchor the neo-tree filesystem source after :cd
-    lsp = true,     -- restart workspace LSPs after :cd
+    neotree = true,     -- re-anchor the neo-tree filesystem source after :cd
+    lsp = true,         -- restart workspace LSPs after :cd
+    persistence = false, -- per-worktree session save/load via folke/persistence.nvim
   },
 
   notify_title = "worktree",
@@ -231,6 +232,29 @@ local s = require("worktree").status()
 -- Just the boolean:
 if require("worktree").is_linked_worktree() then ... end
 ```
+
+### persistence.nvim (per-worktree sessions)
+
+Opt-in integration with [folke/persistence.nvim](https://github.com/folke/persistence.nvim) that gives each worktree its own restored workspace (open files, window layout, jumps, marks). Enable it with:
+
+```lua
+require("worktree").setup({
+  integrations = { persistence = true },
+})
+```
+
+When enabled, every `:WorktreePick` / `<leader>gw` and `:WorktreeHome` / `<leader>gW` does:
+
+1. `persistence.save()` — snapshot the current session keyed to the OLD cwd
+2. `:cd` into the target worktree
+3. Run `cleanup_on_switch` as usual (close stale buffers)
+4. `persistence.load({ last = false })` — restore the session saved for the NEW cwd, if any exists
+
+First visit to a worktree has no saved session → load is a silent no-op. Every subsequent return replays what you had open last time. The notification on switch appends `(session restored)` when a session actually loaded.
+
+**Pairs best with `cleanup_on_switch = true`** (default). Without cleanup, the loaded session fights with stale buffers from the old worktree that neo-tree's `follow_current_file` keeps chasing.
+
+persistence.nvim's own `VimLeavePre` auto-save still runs on exit, so sessions also survive nvim restarts.
 
 ## How worktree paths are chosen
 

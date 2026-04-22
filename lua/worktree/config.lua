@@ -17,6 +17,16 @@ M.defaults = {
     neotree = true,
     -- Stop+restart workspace LSPs after :cd.
     lsp = true,
+    -- Per-worktree session save/load via folke/persistence.nvim. When
+    -- enabled, a worktree switch:
+    --   1. saves the nvim session keyed to the OLD cwd (current window
+    --      layout, buffer list, jumps, marks)
+    --   2. :cd to the new worktree + cleanup_on_switch as usual
+    --   3. loads the session saved for the NEW cwd, if one exists
+    -- Pairs best with cleanup_on_switch = true so the loaded session
+    -- doesn't fight with stale buffers left over from the old worktree.
+    -- Silently no-ops if persistence.nvim isn't installed.
+    persistence = false,
   },
 
   -- Notification title. Set to false to let vim.notify use its own default.
