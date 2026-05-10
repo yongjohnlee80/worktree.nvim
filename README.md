@@ -2,11 +2,30 @@
 
 > *Search no more — the Neovim worktree plugin you've all been waiting
 > for. Switches, adds, removes, refuses to nuke your unsaved work, and
-> doesn't leave ghost buffers haunting the next session.*
+> doesn't leave ghost buffers haunting the next session. Plus a
+> multi-repo git graph dashboard for the bare+worktree life.*
 
 Switch between git worktrees that live as children of a single root
-directory, plus add and remove worktrees with safety rails. No hard
-dependencies -- just Neovim (≥ 0.10 for `vim.system`) and `git`.
+directory, plus add and remove worktrees with safety rails. As of
+**v0.4.0** also a multi-repo git-graph dashboard (`worktree.graph`)
+that absorbs every feature of the now-archived
+[`gitsgraph.nvim`](https://github.com/yongjohnlee80/gitsgraph.nvim) —
+fan-out across every repo under your root, IntelliJ-style commit
+graph, cursor-driven diff stat preview, fetch / pull / destroy with
+the same `vim.ui.select` prompt UX you know.
+
+### Dependencies
+
+- **Neovim ≥ 0.10** (for `vim.system`) and `git`.
+- [`auto-core.nvim`](https://github.com/yongjohnlee80/auto-core.nvim) —
+  required as of v0.4.0. Provides the canonical `git.worktree`
+  parsers, the multi-pane float primitive, the workspace-root state
+  surface, the tech-stack-aware LSP reset on switch, and the
+  fetch/pull/destroy mutating ops. The legacy in-tree `git_legacy.lua`
+  fallback retires after one minor release.
+- [`isakbm/gitgraph.nvim`](https://github.com/isakbm/gitgraph.nvim) —
+  optional, only required for the graph view. The graph dashboard
+  delegates to it for the actual character-art commit rendering.
 
 Built for the "bare repo with sibling worktrees" layout:
 
@@ -50,12 +69,32 @@ repos.
   and unsaved buffer modifications). After removal, any buffer pointing
   at a file inside the removed worktree is force-closed so you don't get
   ghost buffers. Optionally deletes the matching branch too.
-- **Workspace LSP re-anchor** -- workspace-rooted LSPs (opt in: e.g.
-  `gopls`, `rust_analyzer`, `pyright`) are stopped + restarted on switch
-  so `root_dir` resolves against the new cwd.
+- **Workspace LSP re-anchor** -- workspace-rooted LSPs are stopped on
+  switch (with **tech-stack-aware filtering** — only servers belonging
+  to the new path's stack get touched, so a Go-only switch no longer
+  restarts `ts_ls` and produces false errors during cold-start). The
+  detected stack reads markers like `go.mod`, `package.json`,
+  `pyproject.toml`, `Cargo.toml`, `lazy-lock.json`, `build.zig`, etc.;
+  polyglot dirs union the matched stacks. Lazy re-attach via the
+  existing `LspAttach` autocmd flow on next BufEnter. Your existing
+  `lsp_servers_to_restart` config is honored as `extra_servers`
+  (additive over the auto-detected set).
+- **`worktree:switched` event** -- every successful switch publishes on
+  `auto-core.events`, so siblings (auto-finder repos panel, statusline
+  integrations, future agent-side notifiers) refresh without polling.
 - **neo-tree refresh** -- if neo-tree's filesystem window is visible, it
   re-anchors at the new cwd after every switch / mutation. No-op
   otherwise.
+- **Multi-repo graph dashboard** (`<leader>gt`) -- one floating panel
+  with a numbered repo picker on the left, an `isakbm/gitgraph.nvim`
+  commit graph in the middle, a `git show --stat` preview on the
+  right, and a footer hint strip. `1`-`9` to jump between repos,
+  `<CR>` for the full unified diff in a top-zindex float, `f` / `F`
+  fetch one repo / fetch all, `p` pull (context-aware: cursor on repo
+  row pulls every worktree of that repo; cursor on a worktree row
+  pulls just that one), `D` destroy worktree + local branch, `r`
+  rescan, `<Tab>` cycle pane focus. Diverged / dirty cases prompt for
+  force confirmation before any destructive op runs.
 
 Terminal buffers keep their own pwd -- they're independent child
 processes that inherited cwd at spawn time, and a global `:cd` doesn't
@@ -63,21 +102,27 @@ retroactively change them.
 
 ## Quick start
 
-Minimal [lazy.nvim](https://github.com/folke/lazy.nvim) spec -- no config
-needed, zero external deps:
+Minimal [lazy.nvim](https://github.com/folke/lazy.nvim) spec — `auto-core`
+is required as of v0.4.0; `gitgraph` only needed if you want the graph
+view:
 
 ```lua
 {
   "yongjohnlee80/worktree.nvim",
+  dependencies = {
+    "yongjohnlee80/auto-core.nvim",
+    "isakbm/gitgraph.nvim",  -- optional; only for :WorktreeGraph
+  },
   event = "VeryLazy",
   opts = {},
   keys = {
-    { "<leader>gw", function() require("worktree").pick() end,   desc = "Worktree: switch" },
-    { "<leader>gW", function() require("worktree").home() end,   desc = "Worktree: back to root" },
-    { "<leader>gA", function() require("worktree").add() end,    desc = "Worktree: add" },
-    { "<leader>gR", function() require("worktree").remove() end, desc = "Worktree: remove" },
-    { "<leader>gC", function() require("worktree").clone() end,  desc = "Worktree: clone" },
-    { "<leader>gc", function() require("worktree").init() end,   desc = "Worktree: init new project" },
+    { "<leader>gw", function() require("worktree").pick() end,           desc = "Worktree: switch" },
+    { "<leader>gW", function() require("worktree").home() end,           desc = "Worktree: back to root" },
+    { "<leader>gA", function() require("worktree").add() end,            desc = "Worktree: add" },
+    { "<leader>gR", function() require("worktree").remove() end,         desc = "Worktree: remove" },
+    { "<leader>gC", function() require("worktree").clone() end,          desc = "Worktree: clone" },
+    { "<leader>gc", function() require("worktree").init() end,           desc = "Worktree: init new project" },
+    { "<leader>gt", function() require("worktree").graph.toggle() end,   desc = "Worktree: multi-repo graph" },
   },
 }
 ```
@@ -87,19 +132,25 @@ Realistic spec with LSP + statusline + neo-tree integration:
 ```lua
 {
   "yongjohnlee80/worktree.nvim",
+  dependencies = {
+    "yongjohnlee80/auto-core.nvim",
+    "isakbm/gitgraph.nvim",
+  },
   event = "VeryLazy",
   opts = {
-    -- Restart these servers on :cd so root_dir re-resolves against the
-    -- new worktree. Pick whatever matches your stack.
+    -- Additive: stack-detection picks the relevant servers automatically;
+    -- this list is folded in as `extra_servers` for cases where a server
+    -- isn't keyed off any of the standard project markers.
     lsp_servers_to_restart = { "gopls", "rust_analyzer", "pyright" },
   },
   keys = {
-    { "<leader>gw", function() require("worktree").pick() end,   desc = "Worktree: switch" },
-    { "<leader>gW", function() require("worktree").home() end,   desc = "Worktree: back to root" },
-    { "<leader>gA", function() require("worktree").add() end,    desc = "Worktree: add" },
-    { "<leader>gR", function() require("worktree").remove() end, desc = "Worktree: remove" },
-    { "<leader>gC", function() require("worktree").clone() end,  desc = "Worktree: clone" },
-    { "<leader>gc", function() require("worktree").init() end,   desc = "Worktree: init new project" },
+    { "<leader>gw", function() require("worktree").pick() end,           desc = "Worktree: switch" },
+    { "<leader>gW", function() require("worktree").home() end,           desc = "Worktree: back to root" },
+    { "<leader>gA", function() require("worktree").add() end,            desc = "Worktree: add" },
+    { "<leader>gR", function() require("worktree").remove() end,         desc = "Worktree: remove" },
+    { "<leader>gC", function() require("worktree").clone() end,          desc = "Worktree: clone" },
+    { "<leader>gc", function() require("worktree").init() end,           desc = "Worktree: init new project" },
+    { "<leader>gt", function() require("worktree").graph.toggle() end,   desc = "Worktree: multi-repo graph" },
   },
 }
 ```
@@ -115,14 +166,90 @@ use {
 
 ## Commands
 
-| Command            | Function                                   |
-|--------------------|--------------------------------------------|
-| `:WorktreePick`    | Pick a worktree, `:cd` to it               |
-| `:WorktreeHome`    | `:cd` back to root                         |
-| `:WorktreeAdd`     | Create a new worktree                      |
-| `:WorktreeRemove`  | Remove a worktree                          |
-| `:WorktreeClone`   | Clone a remote into a bare+worktree layout |
-| `:WorktreeInit`    | Init a new project in the same layout      |
+| Command                   | Function                                                  |
+|---------------------------|-----------------------------------------------------------|
+| `:WorktreePick`           | Pick a worktree, `:cd` to it                              |
+| `:WorktreeHome`           | `:cd` back to root                                        |
+| `:WorktreeAdd`            | Create a new worktree                                     |
+| `:WorktreeRemove`         | Remove a worktree                                         |
+| `:WorktreeClone`          | Clone a remote into a bare+worktree layout                |
+| `:WorktreeInit`           | Init a new project in the same layout                     |
+| `:WorktreeGraph`          | Toggle the multi-repo graph dashboard                     |
+| `:WorktreeGraphRefresh`   | Refresh the graph view (drops `auto-core.git.graph` caches)|
+
+## Multi-repo graph view (`worktree.graph`)
+
+> One floating panel. Every repo under your root. Three panes: pick,
+> graph, preview. `<CR>` for the full diff. `q` to close.
+
+Absorbed from the now-archived
+[`gitsgraph.nvim`](https://github.com/yongjohnlee80/gitsgraph.nvim) in
+v0.4.0. `<leader>gt` (or `:WorktreeGraph`) opens a floating dashboard
+with a numbered repo picker on the left, an
+[`isakbm/gitgraph.nvim`](https://github.com/isakbm/gitgraph.nvim)
+commit graph in the middle, a `git show --stat` preview on the right,
+and a footer key-hint strip.
+
+```
+┌─ worktree.graph ──────────────────────────────────────────────────────────┐
+│ Repos (4) — ~/Src      │ Graph: api          │ Preview                    │
+│                        │                     │                            │
+│ ▶ [1] api              │ * a1b2c3 feat:oauth │ commit a1b2c3def...        │
+│   ├─ main @a1b2c3d     │ │* d4e5f6 fix:leak  │ Author: johno              │
+│   └─ feature-x @e7f8g9 │ │ * 7h8i9j refactor │ Date:   Mon Apr 28 ...     │
+│   [2] cli              │ │/                  │                            │
+│   [3] web              │ * k0l1m2 initial    │     feat: add oauth        │
+│   [4] tooling (bare)   │                     │                            │
+│                        │                     │  src/auth.go | 12 ++++--   │
+│ <Tab> cycle • <CR> diff • 1-9 repo • f fetch • F fetch all • p pull • D destroy wt • r rescan • q close │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+The selected repo expands to show its worktrees as sub-rows
+(`├─` / `└─` connector glyphs, branch label, 7-char HEAD short SHA).
+That row shape powers the cursor-aware action keymaps below.
+
+### Keymap surface
+
+| Key | Pane | Action |
+|---|---|---|
+| `1`..`9`  | left | Select repo by index (preview-row + graph re-anchor) |
+| `<CR>` on a repo row | left | Same as `1`..`9` |
+| `<CR>` on a commit row | middle | Open the full unified diff in a top-zindex float (`q` / `<Esc>` to dismiss) |
+| `f` | left + middle + preview | Fetch the selected repo (notify on completion; `⟳` indicator while in flight) |
+| `F` | left + middle + preview | Fetch every repo, sequentially (one at a time so a single remote isn't swamped with parallel connections) |
+| `p` | left + middle + preview | **Pull, context-aware**. Cursor on a repo row → fetch + pull every worktree of that repo. Cursor on a worktree row → fetch + pull just that worktree. Non-left pane → falls back to the selected repo. Clean fast-forwards run silently; diverged / dirty / ahead+dirty cases prompt `Force pull` / `Cancel` via `vim.ui.select` |
+| `D` | left only, worktree row only | Destroy worktree + local branch. Clean worktrees prompt `Destroy` / `Cancel`; dirty worktrees prompt `Force destroy` / `Cancel` |
+| `r` | left | Rescan repos (drops `auto-core.git.graph` caches and re-fans-out) |
+| `<Tab>` / `<S-Tab>` | all | Cycle pane focus (skips footer) |
+| `q` / `<Esc>` | all | Close the panel |
+
+### Round-trip safety
+
+The auto-core APIs underneath (`auto-core.git.fetch`,
+`auto-core.git.pull`, `auto-core.git.worktree.destroy`) are
+**consultative**: they never prompt the user themselves. The
+worktree.graph consumer probes status (`pull_status`,
+`worktree_dirty`), prompts via `vim.ui.select` on conflict / dirty,
+then calls the auto-core action with `mode = "reset"` /
+`opts.force = true` only on confirmation. If you'd rather wire your
+own UI you can call those modules directly — see
+[`auto-core.nvim`](https://github.com/yongjohnlee80/auto-core.nvim)'s
+`git.fetch` / `git.pull` / `git.worktree` for the surface.
+
+### Topics
+
+The graph view fires the standard auto-core git topics on every
+mutation, so you can subscribe from anywhere:
+
+| Topic                                | Payload                                                                 |
+|--------------------------------------|-------------------------------------------------------------------------|
+| `core.git.fetch:started`             | `{ repo = { common_dir, label }, label }`                               |
+| `core.git.fetch:completed`           | `{ repo, label, ok, stderr? }`                                          |
+| `core.git.pull:started`              | `{ wt = { path, branch }, mode }`                                       |
+| `core.git.pull:completed`            | `{ wt, mode, ok, stderr? }`                                             |
+| `core.git.worktree:destroyed`        | `{ repo = { common_dir }, wt, force, ok, err?, branch_err? }`           |
+| `worktree:switched`                  | `{ from, to, cwd }` — every successful `<leader>gw` / `<leader>gW`      |
 
 ## Configuration
 

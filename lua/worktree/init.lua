@@ -11,6 +11,21 @@ local buffers = require("worktree.buffers")
 
 local M = {}
 
+-- Multi-repo graph view (ADR 0007 Phase 3 — absorbed from
+-- gitsgraph.nvim). Lazy-required so consumers that don't open the
+-- panel don't pay the gitgraph.nvim import cost. Use via:
+--   require("worktree").graph.open() / .close() / .toggle() / .refresh()
+M.graph = setmetatable({}, {
+  __index = function(_, key)
+    return require("worktree.graph")[key]
+  end,
+})
+
+-- Local mirror of the workspace root. Per ADR 0007 §1.3 the
+-- canonical source-of-truth is `auto-core.git.worktree.{set,get}_workspace_root`
+-- when auto-core is available; this mirror is kept in sync so
+-- `lualine_component()` and the synchronous read paths don't have
+-- to round-trip through auto-core on every redraw.
 local captured_root = nil
 
 local function notify(msg, level)
@@ -19,20 +34,49 @@ local function notify(msg, level)
   vim.notify(msg, level or vim.log.levels.INFO, opts)
 end
 
+-- Soft-dep probe for auto-core. Callers above each integration
+-- point also pcall, so a missing auto-core is silently tolerated.
+local function _core()
+  local ok, core = pcall(require, "auto-core")
+  if ok and type(core) == "table" then return core end
+  return nil
+end
+
 function M.set_root(path)
-  captured_root = git.norm(path)
+  local norm = git.norm(path)
+  captured_root = norm
+  -- Write through to the canonical state.namespace key so siblings
+  -- (auto-finder repos panel, future status-bar consumers, etc.)
+  -- read the same value. Auto-publishes
+  -- `core.workspace_root:changed` per the auto-core state contract.
+  local core = _core()
+  if core and core.git and core.git.worktree
+      and type(core.git.worktree.set_workspace_root) == "function" then
+    pcall(core.git.worktree.set_workspace_root, norm)
+  end
 end
 
 function M.get_root()
+  -- Read-through: prefer auto-core's value when present so the
+  -- "wandering `<leader>gQ`/`<leader>gW`" pain captured in ADR 0006
+  -- §9 stays fixed. Fall back to the local mirror when auto-core
+  -- isn't installed (legacy users).
+  local core = _core()
+  if core and core.git and core.git.worktree
+      and type(core.git.worktree.get_workspace_root) == "function" then
+    local v = core.git.worktree.get_workspace_root()
+    if type(v) == "string" and v ~= "" then return v end
+  end
   return captured_root
 end
 
 -- Capture the startup cwd lazily. Called by plugin/worktree.lua on VimEnter
 -- if the user hasn't already configured a root via setup().
 function M.ensure_root()
-  if captured_root then return captured_root end
+  local existing = M.get_root()
+  if existing then return existing end
   M.set_root(vim.fn.getcwd(-1, -1))
-  return captured_root
+  return M.get_root()
 end
 
 function M.setup(opts)
@@ -127,17 +171,45 @@ end
 -- Stop workspace-rooted LSP clients and re-fire FileType on every loaded
 -- buffer so lspconfig's attach logic runs again with the new cwd as the
 -- root-resolution anchor.
+--
+-- Per ADR 0007 §1.5 the STOP step prefers `auto-core.lsp.reset.reset_for`
+-- (tech-stack-aware: only stops clients whose root_dir doesn't fit the
+-- new path AND that belong to the detected stack — go.mod, package.json,
+-- etc.). This fixes the false-error-on-switch UX (a Go-only switch no
+-- longer restarts ts_ls). The user's existing
+-- `config.options.lsp_servers_to_restart` is folded in as
+-- `extra_servers` so explicit overrides keep working — additive over
+-- the auto-detected stack.
+--
+-- Re-attach (the FileType re-fire) stays here. Auto-core's reset
+-- explicitly delegates re-attach to the existing LspAttach autocmd
+-- on next BufEnter, but worktree.nvim's prior UX was eager
+-- (re-fire FileType on all buffers under the new cwd). We keep that
+-- eagerness so already-open buffers re-attach immediately rather
+-- than waiting for the user to BufEnter into them.
 local function restart_workspace_lsps()
   if not config.options.integrations.lsp then return end
+  local cwd = vim.fn.getcwd()
 
-  local stopped = 0
-  for _, name in ipairs(config.options.lsp_servers_to_restart or {}) do
-    for _, client in ipairs(vim.lsp.get_clients({ name = name })) do
-      vim.lsp.stop_client(client.id, true)
-      stopped = stopped + 1
+  local stopped_count
+  local core = _core()
+  if core and core.lsp and core.lsp.reset
+      and type(core.lsp.reset.reset_for) == "function" then
+    local result = core.lsp.reset.reset_for(cwd, {
+      extra_servers = config.options.lsp_servers_to_restart or {},
+    })
+    stopped_count = #(result.stopped or {})
+  else
+    -- Legacy fallback: stop every server in the configured list.
+    stopped_count = 0
+    for _, name in ipairs(config.options.lsp_servers_to_restart or {}) do
+      for _, client in ipairs(vim.lsp.get_clients({ name = name })) do
+        vim.lsp.stop_client(client.id, true)
+        stopped_count = stopped_count + 1
+      end
     end
   end
-  if stopped == 0 then return end
+  if stopped_count == 0 then return end
 
   -- Stop is async; defer re-attach so the old client is fully gone before
   -- lspconfig's autocmd fires a new launch.
@@ -152,7 +224,6 @@ local function restart_workspace_lsps()
   --   2. LSP attach events triggering neo-tree's `follow_current_file`
   --      to re-anchor the file tree back to the old worktree.
   vim.defer_fn(function()
-    local cwd = vim.fn.getcwd()
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buftype == "" then
         if vim.bo[bufnr].filetype ~= "" then
@@ -164,6 +235,24 @@ local function restart_workspace_lsps()
       end
     end
   end, 150)
+end
+
+-- Publish `worktree:switched` on the auto-core events bus + update
+-- `core.active_worktree` state. Per ADR 0007 §1.4: closes the
+-- dangling subscription that auto-finder v0.2.0 step 4 wired
+-- (commit `a72bc7a`). Today only worktree.nvim's deliberate switch
+-- paths (M.pick callback, M.home) publish; an arbitrary :cd does NOT.
+local function publish_switch(old_cwd, new_cwd)
+  local core = _core()
+  if not core then return end
+  if core.events and type(core.events.publish) == "function" then
+    pcall(core.events.publish, "worktree:switched",
+      { from = old_cwd, to = new_cwd, cwd = new_cwd })
+  end
+  if core.git and core.git.worktree
+      and type(core.git.worktree.set_active) == "function" then
+    pcall(core.git.worktree.set_active, new_cwd)
+  end
 end
 
 -- Close file-buffers under `old_path` that aren't under `new_path`, and
@@ -233,6 +322,7 @@ local function switch_to(path)
   local session_suffix = persistence_load(target)
   restart_workspace_lsps()
   refresh_file_tree()
+  publish_switch(old_cwd, target)
   notify(("worktree → %s%s%s"):format(
     relative_to_root(target), cleanup_suffix, session_suffix
   ))
@@ -276,6 +366,7 @@ function M.home()
   local session_suffix = persistence_load(new_cwd)
   restart_workspace_lsps()
   refresh_file_tree()
+  publish_switch(old_cwd, new_cwd)
   notify(("worktree ← root (%s)%s%s"):format(root, cleanup_suffix, session_suffix))
 end
 
