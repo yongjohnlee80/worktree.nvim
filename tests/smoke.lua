@@ -17,14 +17,10 @@ local plugin_root = vim.fn.fnamemodify(
 
 local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
 for _, p in ipairs({
-  plugin_root,
-  -- auto-core soft-dep: when present, exercises the canonical path.
-  -- The legacy-fallback path is exercised in [2] by re-arming the
-  -- probe with auto-core artificially absent. Prefer a sibling
-  -- bare-repo worktree if present; fall back to the lazy install.
-  vim.fn.fnamemodify(plugin_root, ":h") .. "/auto-core.nvim/main",
-  LAZY .. "/auto-core.nvim",
   LAZY .. "/plenary.nvim",
+  LAZY .. "/auto-core.nvim",
+  vim.fn.fnamemodify(plugin_root, ":h:h") .. "/auto-core.nvim/main",
+  plugin_root,
 }) do
   if vim.fn.isdirectory(p) == 1 then
     vim.opt.runtimepath:prepend(p)
@@ -244,6 +240,39 @@ local hash = vim.fn.systemlist({
 local stat = core.git.graph.show_stat(repos_at_root[1].common_dir, hash)
 ok("show_stat returns content for fixture commit", #stat > 0)
 
+-- Responsive layout test
+wt.graph.set_root(gtmp)
+wt.graph.open()
+ok("wt.graph.open() opened the panel", wt.graph.is_open())
+
+local mfloat = core.ui.float.multi.get("worktree.graph")
+if mfloat then
+  local left_win = mfloat:winid("left")
+  local prev_win = mfloat:winid("preview")
+  
+  -- vim.o.columns = 200
+  -- width_pct = 0.92 -> 184
+  -- inner_w = 184 - 2 = 182
+  -- left = 0.15 * 182 = 27
+  -- preview = 0.40 * 182 = 72
+  ok("responsive: left window width (15%)", 
+    vim.api.nvim_win_get_width(left_win) == 27, "got " .. vim.api.nvim_win_get_width(left_win))
+  ok("responsive: preview window width (40%)",
+    vim.api.nvim_win_get_width(prev_win) == 72, "got " .. vim.api.nvim_win_get_width(prev_win))
+  
+  -- Resize and check again
+  vim.o.columns = 150
+  mfloat:resize()
+  -- inner_w = floor(150 * 0.92) - 2 = 138 - 2 = 136
+  -- left = 0.15 * 136 = 20
+  -- preview = 0.40 * 136 = 54
+  ok("responsive: left window width (15%) after resize",
+    vim.api.nvim_win_get_width(left_win) == 20, "got " .. vim.api.nvim_win_get_width(left_win))
+  ok("responsive: preview window width (40%) after resize",
+    vim.api.nvim_win_get_width(prev_win) == 54, "got " .. vim.api.nvim_win_get_width(prev_win))
+end
+
+wt.graph.close()
 vim.fn.delete(gtmp, "rf")
 
 -- ───────────────────── summary ─────────────────────

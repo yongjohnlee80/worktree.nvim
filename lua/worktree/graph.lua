@@ -816,7 +816,7 @@ function M.open()
     },
     panes = {
       left = {
-        width = 32,
+        width = 0.15,
         cursorline = true,
       },
       middle = {
@@ -824,11 +824,11 @@ function M.open()
         title_pos = "left",
       },
       preview = {
-        -- Narrower default (70 vs prior 90) so the middle pane
-        -- claims those extra columns. min_width still 40 — drops
+        -- Responsive default (40% of inner width) so the middle pane
+        -- claims the rest. min_width still 40 — drops
         -- the preview entirely on narrow terminals so middle can
         -- use the full inner width.
-        width        = 70,
+        width        = 0.40,
         min_width    = 40,
         min_middle   = 40,
         filetype     = "git",
