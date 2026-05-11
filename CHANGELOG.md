@@ -2,6 +2,13 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.3] — 2026-05-11 — remove max_width constraint from graph dashboard
+
+Bug fix. Removed the hardcoded `max_width = 240` from the graph panel's
+outer container. The previous percentage-based inner pane fix was constrained
+by this outer limit, preventing the panel from utilizing the full width
+of ultrawide monitors.
+
 ## [v0.4.2] — 2026-05-11 — responsive layout for the graph dashboard
 
 Improvement. The multi-repo graph dashboard (`<leader>gt`) now uses
