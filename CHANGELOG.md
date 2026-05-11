@@ -2,6 +2,13 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.2] — 2026-05-11 — responsive layout for the graph dashboard
+
+Improvement. The multi-repo graph dashboard (`<leader>gt`) now uses
+percentage-based widths (0.15 for the repo list, 0.40 for the diff
+preview) so the layout scales proportionally on ultrawide monitors.
+Requires `auto-core.nvim` v0.1.4+.
+
 ## [v0.4.1] — 2026-05-11 — worktree mutations now publish events
 
 Bug fix. The multi-repo graph dashboard (`<leader>gt`) reads its repo
