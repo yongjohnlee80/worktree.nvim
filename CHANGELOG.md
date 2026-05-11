@@ -2,6 +2,46 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.1] — 2026-05-11 — worktree mutations now publish events
+
+Bug fix. The multi-repo graph dashboard (`<leader>gt`) reads its repo
+list from `auto-core.git.graph.fan_out`, which caches per
+`workspace_root` and only invalidates on `worktree:added` /
+`worktree:removed` / `worktree:switched` events. v0.4.0 published only
+`worktree:switched` (from `M.pick` / `M.home`); the four mutation
+paths that change the worktree topology were silent:
+
+- `M.clone()` (`<leader>gC`) — bare-clones + initial worktree
+- `M.init()` (`<leader>gc`) — `git init --bare` + initial worktree
+- `M.add()` (`<leader>gA`) — `git worktree add` (all four sub-flows)
+- `M.remove()` (`<leader>gR`) — `git worktree remove`
+
+Result: cloning or adding a repo via the worktree.nvim commands did
+not show up in the graph dashboard until the user ran
+`:WorktreeGraphRefresh` (or `r` from the open panel).
+
+### Changed
+
+- `worktree.nvim` now publishes `worktree:added` after every
+  successful worktree-creating path (clone, init, add tracking,
+  add checkout_local, add from_base) and `worktree:removed` after a
+  successful `M.remove()`. Payload: `{ path = string }`.
+- `worktree.graph.open()` now calls
+  `auto-core.git.graph.invalidate_fan_out(state.root)` on every UI
+  entry. Even if the user runs `git clone` or `git worktree add` from
+  another terminal, the next `<leader>gt` re-scans the workspace
+  and picks up the new repo. The cost is one directory walk per open
+  (sub-100ms for a typical workspace; the existing per-repo
+  `git rev-parse` / `git status` caches are unchanged).
+
+### Notes for consumers
+
+`worktree:added` and `worktree:removed` were already wired as
+subscribers in `auto-core.git.graph`; this release simply starts
+firing them. Any other plugin that wants to react to topology
+changes can subscribe to the same topics. Topic registry entries in
+auto-core's `events/topics.lua` will land in a doc-only follow-up.
+
 ## [v0.4.0] — 2026-05-10 — auto-core consumer + absorbed graph dashboard
 
 First release on top of [`auto-core.nvim`](https://github.com/yongjohnlee80/auto-core.nvim)

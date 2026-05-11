@@ -237,6 +237,31 @@ local function restart_workspace_lsps()
   end, 150)
 end
 
+-- Publish `worktree:added` on the auto-core events bus. Fired from
+-- every successful worktree-creating path: clone (initial worktree),
+-- init (initial worktree), and the four add() flows (tracking,
+-- checkout_local, from_base, plus the initial-worktree wrapper).
+-- Drops auto-core.git.graph's fan_out cache so <leader>gt picks up
+-- the new repo on the next render without a manual :WorktreeGraphRefresh.
+local function publish_added(path)
+  local core = _core()
+  if not core then return end
+  if core.events and type(core.events.publish) == "function" then
+    pcall(core.events.publish, "worktree:added", { path = path })
+  end
+end
+
+-- Publish `worktree:removed` on the auto-core events bus after a
+-- successful `git worktree remove`. Same cache-invalidation rationale
+-- as publish_added.
+local function publish_removed(path)
+  local core = _core()
+  if not core then return end
+  if core.events and type(core.events.publish) == "function" then
+    pcall(core.events.publish, "worktree:removed", { path = path })
+  end
+end
+
 -- Publish `worktree:switched` on the auto-core events bus + update
 -- `core.active_worktree` state. Per ADR 0007 §1.4: closes the
 -- dangling subscription that auto-finder v0.2.0 step 4 wired
@@ -386,6 +411,7 @@ function M.add()
       notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
+    publish_added(target)
     refresh_file_tree()
     notify(("+ %s (tracking %s)"):format(relative_to_root(target), remote_ref))
   end
@@ -402,6 +428,7 @@ function M.add()
       notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
+    publish_added(target)
     refresh_file_tree()
     notify(("+ %s (checked out existing local '%s')"):format(
       relative_to_root(target), name
@@ -429,6 +456,7 @@ function M.add()
         notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
         return
       end
+      publish_added(target)
       refresh_file_tree()
       notify(("+ %s (from %s)"):format(relative_to_root(target), base))
     end)
@@ -629,6 +657,7 @@ function M.remove()
       notify("git worktree remove failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
+    publish_removed(choice.path)
 
     local wiped = buffers.wipe_under(choice.path)
     -- Drop the saved session for the removed worktree so we don't keep
@@ -702,6 +731,7 @@ local function add_initial_worktree(bare_path, repo_dir, branch)
     notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
     return false
   end
+  publish_added(target)
   vim.cmd.cd(vim.fn.fnameescape(target))
   refresh_file_tree()
   return true

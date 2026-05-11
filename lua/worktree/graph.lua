@@ -782,6 +782,16 @@ function M.open()
   end
 
   state.root = state.root or workspace_root()
+  -- Defensive: drop the fan_out cache for this root on every UI
+  -- entry. Subscriber-driven invalidation (worktree:added/removed/
+  -- switched) catches in-process mutations, but a user who ran
+  -- `git clone` / `git worktree add` from another terminal would
+  -- still see a stale list. Re-scanning per open keeps the panel
+  -- honest at the cost of one directory walk (sub-100ms for a
+  -- typical workspace).
+  if type(core.git.graph.invalidate_fan_out) == "function" then
+    pcall(core.git.graph.invalidate_fan_out, state.root)
+  end
   state.repos = core.git.graph.fan_out(state.root, { max_depth = 3 })
   if #state.repos == 0 then
     notify("no git repositories found under " .. state.root,

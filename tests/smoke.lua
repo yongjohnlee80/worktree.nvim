@@ -8,16 +8,27 @@
 -- the worktree:switched publication path, and the
 -- restart_workspace_lsps → auto-core.lsp.reset wiring.
 
+-- Derive the plugin root from the smoke script's own path so the
+-- driver runs unmodified on any developer's machine (Mac, Linux,
+-- bare-repo worktree, plain clone, …). `tests/smoke.lua` is two
+-- levels below the plugin root.
+local plugin_root = vim.fn.fnamemodify(
+  vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"), ":h:h")
+
 local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
 for _, p in ipairs({
-  "/home/johno/Source/Projects/nvim-plugins/worktree.nvim/main",
+  plugin_root,
   -- auto-core soft-dep: when present, exercises the canonical path.
   -- The legacy-fallback path is exercised in [2] by re-arming the
-  -- probe with auto-core artificially absent.
-  "/home/johno/Source/Projects/nvim-plugins/auto-core.nvim",
+  -- probe with auto-core artificially absent. Prefer a sibling
+  -- bare-repo worktree if present; fall back to the lazy install.
+  vim.fn.fnamemodify(plugin_root, ":h") .. "/auto-core.nvim/main",
+  LAZY .. "/auto-core.nvim",
   LAZY .. "/plenary.nvim",
 }) do
-  vim.opt.runtimepath:prepend(p)
+  if vim.fn.isdirectory(p) == 1 then
+    vim.opt.runtimepath:prepend(p)
+  end
 end
 
 vim.o.columns = 200
