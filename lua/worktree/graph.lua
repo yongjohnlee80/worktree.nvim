@@ -805,11 +805,10 @@ function M.open()
     outer = {
       -- Slightly larger panel so the middle (graph) pane has more
       -- horizontal room for commit messages. width_pct 0.92 vs the
-      -- prior 0.85 + max_width 240 vs 200; height grows a touch too
+      -- prior 0.85; height grows a touch too
       -- so the graph shows more rows without scrolling.
       width_pct  = 0.92,
       height_pct = 0.90,
-      max_width  = 240,
       border     = "rounded",
       title      = " worktree.graph ",
       title_pos  = "center",
