@@ -2,6 +2,22 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.5] — 2026-05-14 — graph: tighten remote-branch row label
+
+Cosmetic. Remote-branch rows in the graph's left pane drop the
+verbose `[rt-branch]` prefix and use parentheses instead:
+
+```text
+before:  └─ [rt-branch] origin/main
+after:   └─ (origin/main)
+```
+
+The `origin/` prefix already telegraphs "this is a remote ref" —
+the prior `[rt-branch]` label was redundant and ate ~12 columns of
+the left pane on every remote row. Parens keep the row visually
+distinguishable from worktree rows (which render as
+`<branch> @<sha7>`) without the prefix tax.
+
 ## [v0.4.4] — 2026-05-14 — remote branch management in the graph dashboard
 
 Feature. Pairs with `auto-core.nvim` v0.1.6 which ships the underlying

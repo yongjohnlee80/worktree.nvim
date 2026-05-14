@@ -335,7 +335,11 @@ local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(left_win), 0, 
 
 local remote_branch_row = nil
 for i, line in ipairs(lines) do
-  if line:match("%[rt%-branch%]") then
+  -- v0.4.5: remote branches now render as `(origin/<branch>)`, the
+  -- parens being the only thing distinguishing them from worktree
+  -- rows (which render as plain `<branch> @<sha>`). The `feature-x`
+  -- ref name is fixed by the test fixture above.
+  if line:find("(origin/feature-x)", 1, true) then
     remote_branch_row = i
     break
   end

@@ -190,7 +190,7 @@ local function render_left()
       if show_remotes then
         for j, ref in ipairs(remotes) do
           local connector = (j == #remotes) and "└─" or "├─"
-          lines[#lines + 1] = string.format("   %s [rt-branch] %s",
+          lines[#lines + 1] = string.format("   %s (%s)",
             connector, ref)
           state.line_map[#lines] = {
             kind = "remote_branch", repo_idx = i, remote_ref = ref,
