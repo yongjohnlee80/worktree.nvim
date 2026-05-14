@@ -145,6 +145,69 @@ function M.list_branches(repo_path)
   return lines
 end
 
+function M.list_remote_branches(repo_path)
+  local lines = vim.fn.systemlist({
+    "git", "-C", repo_path, "for-each-ref",
+    "--format=%(refname:short)", "refs/remotes/",
+  })
+  if vim.v.shell_error ~= 0 then return {} end
+  local out = {}
+  for _, line in ipairs(lines) do
+    if not line:match("/HEAD$") then
+      table.insert(out, line)
+    end
+  end
+  return out
+end
+
+function M.checkout_status(path, branch)
+  if not M.is_git(path) then
+    return { ok = false, reason = "not a git repository" }
+  end
+
+  local existing_wt = M.worktree_for_branch(path, branch)
+  if existing_wt then
+    return { ok = false, reason = "branch already checked out in " .. existing_wt, worktree = existing_wt }
+  end
+
+  if M.has_uncommitted(path) then
+    return { ok = false, reason = "working tree is dirty", dirty = true }
+  end
+
+  return { ok = true }
+end
+
+function M.checkout(path, branch, on_done)
+  local res = vim.system({ "git", "-C", path, "checkout", branch }, { text = true }):wait()
+  if on_done then on_done({ ok = res.code == 0, stderr = res.stderr }) end
+end
+
+function M.delete_remote(path, remote, branch, on_done)
+  local res = vim.system({ "git", "-C", path, "push", remote, "--delete", branch }, { text = true }):wait()
+  if on_done then on_done({ ok = res.code == 0, stderr = res.stderr }) end
+end
+
+function M.create_branch(path, name, base, on_done)
+  local res = vim.system({ "git", "-C", path, "checkout", "-b", name, base }, { text = true }):wait()
+  if on_done then on_done({ ok = res.code == 0, stderr = res.stderr }) end
+end
+
+function M.track(repo, remote_ref, local_name, target_path, on_done)
+  local res = vim.system({
+    "git", "--git-dir=" .. repo.common_dir, "worktree", "add",
+    "--track", "-b", local_name, target_path, remote_ref
+  }, { text = true }):wait()
+  if on_done then on_done({ ok = res.code == 0, stderr = res.stderr }) end
+end
+
+function M.create(repo, branch_name, target_path, base_ref, on_done)
+  local res = vim.system({
+    "git", "--git-dir=" .. repo.common_dir, "worktree", "add",
+    "-b", branch_name, target_path, base_ref
+  }, { text = true }):wait()
+  if on_done then on_done({ ok = res.code == 0, stderr = res.stderr }) end
+end
+
 function M.has_uncommitted(worktree_path)
   local lines =
     vim.fn.systemlist({ "git", "-C", worktree_path, "status", "--porcelain" })

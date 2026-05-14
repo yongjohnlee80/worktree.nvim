@@ -82,6 +82,10 @@ end
 -- ── git.repo delegations ─────────────────────────────────────
 M.is_git         = delegate_repo("is_git")
 M.git_common_dir = delegate_repo("common_dir", "git_common_dir")
+M.checkout       = delegate_repo("checkout")
+M.checkout_status = delegate_repo("checkout_status")
+M.delete_remote  = delegate_repo("delete_remote")
+M.create_branch  = delegate_repo("create_branch")
 
 -- ── git.worktree delegations ─────────────────────────────────
 M.parse_porcelain      = delegate_wt("parse_porcelain")
@@ -90,6 +94,9 @@ M.collect_worktrees    = delegate_wt("collect", "collect_worktrees")
 M.repo_container       = delegate_wt("repo_container")
 M.list_child_repos     = delegate_wt("list_child_repos")
 M.list_branches        = delegate_wt("list_branches")
+M.list_remote_branches = delegate_wt("list_remote_branches")
+M.track                = delegate_wt("track")
+M.create               = delegate_wt("create")
 M.local_branch_exists  = delegate_wt("local_branch_exists")
 M.worktree_for_branch  = delegate_wt("worktree_for_branch")
 M.find_remote_branches = delegate_wt("find_remote_branches")

@@ -2,6 +2,49 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.4] — 2026-05-14 — remote branch management in the graph dashboard
+
+Feature. Pairs with `auto-core.nvim` v0.1.6 which ships the underlying
+git primitives (`git.repo.checkout`, `git.repo.delete_remote`,
+`git.repo.create_branch`, `git.worktree.list_remote_branches`,
+`git.worktree.track`, `git.worktree.create`).
+
+### Added
+
+- **`R`** in the graph's repo pane toggles remote-branch visibility.
+  When on, each repo's selected entry expands with its tracked
+  remote refs (excluding `origin/HEAD` pseudo-refs) rendered as
+  `└─ [rt-branch] origin/feature-x` rows.
+- **`C`** (Checkout) on a remote-branch row:
+  - bare repo → prompts for `local-branch-name` + `worktree-path`,
+    then `git worktree add --track -b <local> <path> <remote-ref>`.
+  - non-bare repo → probes via the new
+    `git.checkout_status(path, branch)` and refuses if the branch
+    is already checked out in another worktree, the working tree is
+    dirty, or the path isn't a git repo — then runs `git checkout
+    <branch>`.
+- **`W`** (new branch/worktree) on either a worktree row or a
+  remote-branch row, deriving the base ref from the cursor target:
+  - bare repo → prompts for branch name + path, then `git worktree
+    add -b <name> <path> <base>`.
+  - non-bare repo → prompts for branch name, then `git checkout -b
+    <name> <base>` (refusing on uncommitted changes).
+- **`D`** (existing destroy keybind) now overloads to also delete
+  remote branches when the cursor sits on a remote-branch row.
+  `vim.ui.select` confirmation; on accept, `git push <remote>
+  --delete <branch>` followed by a `git fetch --prune` so the
+  visible remote tracking ref disappears from the UI. Worktree
+  destruction semantics unchanged on worktree rows.
+
+### Notes
+
+- Callback contract: all async wrappers consume the unified
+  `on_done(res)` table shape (`res.ok :: boolean`, `res.stderr ::
+  string?`) — matches the auto-core primitives. The legacy two-arg
+  callback form has been retired from this module.
+- Footer hint updated to `D destroy wt/remote` to reflect the
+  overload.
+
 ## [v0.4.3] — 2026-05-11 — remove max_width constraint from graph dashboard
 
 Bug fix. Removed the hardcoded `max_width = 240` from the graph panel's

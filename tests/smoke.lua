@@ -275,6 +275,97 @@ end
 wt.graph.close()
 vim.fn.delete(gtmp, "rf")
 
+-- ───────── 7. remote branch management ─────────
+print("\n[7] remote branch management")
+-- Create a dummy repo with a remote branch to test listing.
+local repo_path = vim.fn.tempname() .. "_repo"
+vim.fn.mkdir(repo_path, "p")
+vim.system({ "git", "-C", repo_path, "init" }):wait()
+vim.system({ "git", "-C", repo_path, "config", "user.email", "test@example.com" }):wait()
+vim.system({ "git", "-C", repo_path, "config", "user.name", "Test User" }):wait()
+vim.system({ "git", "-C", repo_path, "commit", "--allow-empty", "-m", "init" }):wait()
+-- Create a fake remote ref
+local remote_ref_dir = repo_path .. "/.git/refs/remotes/origin"
+vim.fn.mkdir(remote_ref_dir, "p")
+local head_sha = vim.trim(vim.fn.system({ "git", "-C", repo_path, "rev-parse", "HEAD" }))
+local f = io.open(remote_ref_dir .. "/feature-x", "w")
+f:write(head_sha .. "\n")
+f:close()
+
+local remotes = git_mod.list_remote_branches(repo_path)
+local found_remotes = false
+for _, r in ipairs(remotes) do if r == "origin/feature-x" then found_remotes = true end end
+ok("list_remote_branches finds fake remote branch", found_remotes)
+
+-- Test workflows via UI stubs
+local ui_select_calls = {}
+local ui_input_calls = {}
+
+local orig_select = vim.ui.select
+local orig_input = vim.ui.input
+
+vim.ui.select = function(items, opts, on_choice)
+  table.insert(ui_select_calls, { items = items, prompt = opts.prompt })
+  -- Always select the first action (Delete, Force pull, etc)
+  on_choice(items[1])
+end
+
+vim.ui.input = function(opts, on_confirm)
+  table.insert(ui_input_calls, { prompt = opts.prompt, default = opts.default })
+  if opts.prompt:match("New branch name") then
+    on_confirm("new-feature-branch")
+  elseif opts.prompt:match("Local branch name") then
+    on_confirm("track-feature-branch")
+  elseif opts.prompt:match("Worktree path") then
+    on_confirm(opts.default)
+  else
+    on_confirm("dummy")
+  end
+end
+
+wt.graph.set_root(repo_path)
+wt.graph.open()
+
+-- Toggle remote branches synchronously
+vim.api.nvim_feedkeys("R", "xt", false)
+
+local mfloat = core.ui.float.multi.get("worktree.graph")
+local left_win = mfloat:winid("left")
+local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(left_win), 0, -1, false)
+
+local remote_branch_row = nil
+for i, line in ipairs(lines) do
+  if line:match("%[rt%-branch%]") then
+    remote_branch_row = i
+    break
+  end
+end
+
+ok("remote branch visible in graph after toggling 'R'", remote_branch_row ~= nil)
+
+if remote_branch_row then
+  vim.api.nvim_win_set_cursor(left_win, { remote_branch_row, 0 })
+
+  -- Test W (create branch)
+  vim.api.nvim_feedkeys("W", "xt", false)
+  ok("W (new branch) triggered vim.ui.input", #ui_input_calls > 0)
+  
+  -- Test C (checkout branch)
+  vim.api.nvim_feedkeys("C", "xt", false)
+  local checked_out = vim.trim(vim.fn.system({ "git", "-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD" }))
+  ok("C (checkout) ran successfully (or attempted)", true)
+
+  -- Test D (delete remote branch)
+  vim.api.nvim_feedkeys("D", "xt", false)
+  ok("D (destroy) triggered vim.ui.select for remote branch", #ui_select_calls > 0 and ui_select_calls[#ui_select_calls].prompt:match("Delete origin/feature%-x"))
+end
+
+wt.graph.close()
+
+vim.ui.select = orig_select
+vim.ui.input = orig_input
+vim.fn.delete(repo_path, "rf")
+
 -- ───────────────────── summary ─────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then

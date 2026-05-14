@@ -47,7 +47,8 @@ end
 ---@field selected integer?         1-based index into repos
 ---@field preview_timer any?
 ---@field fetching table<integer, boolean>  repo_idx -> in-flight fetch
----@field line_map table<integer, table>    row -> { kind, repo_idx, worktree? }
+---@field show_remote_branches boolean?    toggle for remote branches
+---@field line_map table<integer, table>    row -> { kind, repo_idx, worktree?, remote_ref? }
 local state = {
   mfloat    = nil,
   root      = nil,
@@ -55,6 +56,7 @@ local state = {
   selected  = nil,
   fetching  = {},
   line_map  = {},
+  show_remote_branches = false,
 }
 
 local HEADER_LINES = 2
@@ -168,8 +170,13 @@ local function render_left()
     -- added worktrees show up without an explicit rescan.
     if state.selected == i and entry.common_dir then
       local wts = list_worktrees(entry.common_dir)
+      local show_remotes = state.show_remote_branches
+      local remotes = show_remotes
+        and require("worktree.git").list_remote_branches(entry.common_dir)
+        or {}
+
       for j, wt in ipairs(wts) do
-        local connector = (j == #wts) and "└─" or "├─"
+        local connector = (j == #wts and #remotes == 0) and "└─" or "├─"
         local label = wt.branch or (wt.detached and "(detached)" or "?")
         local head7  = (wt.head or ""):sub(1, 7)
         local suffix = (head7 ~= "") and (" @" .. head7) or ""
@@ -178,6 +185,17 @@ local function render_left()
         state.line_map[#lines] = {
           kind = "worktree", repo_idx = i, worktree = wt,
         }
+      end
+
+      if show_remotes then
+        for j, ref in ipairs(remotes) do
+          local connector = (j == #remotes) and "└─" or "├─"
+          lines[#lines + 1] = string.format("   %s [rt-branch] %s",
+            connector, ref)
+          state.line_map[#lines] = {
+            kind = "remote_branch", repo_idx = i, remote_ref = ref,
+          }
+        end
       end
     end
   end
@@ -680,18 +698,187 @@ local function destroy_at_cursor()
   if not state.mfloat then return end
   local left_win = state.mfloat:winid("left")
   if not left_win or vim.api.nvim_get_current_win() ~= left_win then
-    notify("move to a worktree row in the repo pane to destroy",
+    notify("move to a row in the repo pane to destroy",
       vim.log.levels.WARN)
     return
   end
   local row = vim.api.nvim_win_get_cursor(left_win)[1]
   local hit = row_to_hit(row)
-  if not hit or hit.kind ~= "worktree" then
-    notify("D destroys a worktree — select a worktree row",
+  if not hit then return end
+
+  if hit.kind == "worktree" then
+    destroy_worktree_at(hit.repo_idx, hit.worktree)
+  elseif hit.kind == "remote_branch" then
+    local repo = (state.repos or {})[hit.repo_idx]
+    if not repo then return end
+    local remote_ref = hit.remote_ref
+    local remote, branch = remote_ref:match("^([^/]+)/(.+)$")
+    if not remote or not branch then return end
+
+    vim.ui.select({ "Delete remote branch", "Cancel" }, {
+      prompt = string.format("Delete %s? (push --delete to remote)", remote_ref),
+    }, function(choice)
+      if choice == "Delete remote branch" then
+        local git = require("worktree.git")
+        local path = repo.sample_worktree
+          or vim.fn.fnamemodify(repo.common_dir, ":h")
+        git.delete_remote(path, remote, branch, function(res)
+          if res.ok then
+            notify("deleted remote branch " .. remote_ref)
+            -- Prune local tracking ref so it disappears from UI
+            vim.system({ "git", "-C", path, "fetch", "--prune", remote }):wait()
+            render_left()
+          else
+            notify("delete remote failed: " .. (res.stderr or ""),
+              vim.log.levels.ERROR)
+          end
+        end)
+      end
+    end)
+  else
+    notify("D destroys a worktree or remote branch — select a valid row",
+      vim.log.levels.WARN)
+  end
+end
+
+local function checkout_at_cursor()
+  if not state.mfloat then return end
+  local left_win = state.mfloat:winid("left")
+  if not left_win or vim.api.nvim_get_current_win() ~= left_win then
+    notify("move to a remote branch row in the repo pane to checkout",
       vim.log.levels.WARN)
     return
   end
-  destroy_worktree_at(hit.repo_idx, hit.worktree)
+  local row = vim.api.nvim_win_get_cursor(left_win)[1]
+  local hit = row_to_hit(row)
+  if not hit or hit.kind ~= "remote_branch" then
+    notify("C is for checking out remote branches — select a remote branch row",
+      vim.log.levels.WARN)
+    return
+  end
+
+  local repo = (state.repos or {})[hit.repo_idx]
+  if not repo then return end
+  local git = require("worktree.git")
+  local remote_ref = hit.remote_ref
+  local branch_name = remote_ref:match("^[^/]+/(.+)$")
+
+  if repo.is_bare then
+    -- Track into a new worktree.
+    vim.ui.input({
+      prompt = "Local branch name: ",
+      default = branch_name,
+    }, function(local_name)
+      if not local_name or vim.trim(local_name) == "" then return end
+      local_name = vim.trim(local_name)
+      local container = git.repo_container(repo.common_dir)
+      vim.ui.input({
+        prompt = "Worktree path: ",
+        default = container .. "/" .. local_name,
+      }, function(target_path)
+        if not target_path or vim.trim(target_path) == "" then return end
+        target_path = vim.trim(target_path)
+        git.track(repo, remote_ref, local_name, target_path, function(res)
+          if res.ok then
+            notify("tracking " .. remote_ref .. " → " .. target_path)
+            render_left()
+          else
+            notify("track failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+          end
+        end)
+      end)
+    end)
+  else
+    -- Regular checkout.
+    local root = git.norm(vim.fn.fnamemodify(repo.common_dir, ":h"))
+    -- Must-fix 2: use checkout_status probe
+    local status = git.checkout_status(root, branch_name)
+    if not status.ok then
+      notify("refusing to checkout: " .. (status.reason or "?"),
+        vim.log.levels.ERROR)
+      return
+    end
+
+    git.checkout(root, branch_name, function(res)
+      if res.ok then
+        notify("checked out " .. branch_name)
+        render_left()
+        if state.selected == hit.repo_idx then draw_graph_for(repo) end
+      else
+        notify("checkout failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+      end
+    end)
+  end
+end
+
+local function new_at_cursor()
+  if not state.mfloat then return end
+  local left_win = state.mfloat:winid("left")
+  if not left_win or vim.api.nvim_get_current_win() ~= left_win then
+    notify("move to a row in the repo pane to create from",
+      vim.log.levels.WARN)
+    return
+  end
+  local row = vim.api.nvim_win_get_cursor(left_win)[1]
+  local hit = row_to_hit(row)
+  if not hit then return end
+
+  local base_ref
+  if hit.kind == "worktree" then
+    base_ref = hit.worktree.branch or hit.worktree.head
+  elseif hit.kind == "remote_branch" then
+    base_ref = hit.remote_ref
+  else
+    notify("W creates from a worktree or remote branch — select a valid row",
+      vim.log.levels.WARN)
+    return
+  end
+
+  if not base_ref then return end
+
+  local repo = (state.repos or {})[hit.repo_idx]
+  if not repo then return end
+  local git = require("worktree.git")
+
+  vim.ui.input({ prompt = "New branch name: " }, function(name)
+    if not name or vim.trim(name) == "" then return end
+    name = vim.trim(name)
+
+    if repo.is_bare then
+      local container = git.repo_container(repo.common_dir)
+      vim.ui.input({
+        prompt = "Worktree path: ",
+        default = container .. "/" .. name,
+      }, function(target_path)
+        if not target_path or vim.trim(target_path) == "" then return end
+        target_path = vim.trim(target_path)
+        git.create(repo, name, target_path, base_ref, function(res)
+          if res.ok then
+            notify("+ " .. name .. " → " .. target_path)
+            render_left()
+          else
+            notify("create failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+          end
+        end)
+      end)
+    else
+      local root = git.norm(vim.fn.fnamemodify(repo.common_dir, ":h"))
+      if git.has_uncommitted(root) then
+        notify("refusing to create — uncommitted changes in " .. root,
+          vim.log.levels.ERROR)
+        return
+      end
+      git.create_branch(root, name, base_ref, function(res)
+        if res.ok then
+          notify("+ branch " .. name .. " (from " .. base_ref .. ")")
+          render_left()
+          if state.selected == hit.repo_idx then draw_graph_for(repo) end
+        else
+          notify("create branch failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+        end
+      end)
+    end
+  end)
 end
 
 -- ── key bindings ─────────────────────────────────────────────
@@ -705,6 +892,10 @@ local function bind_left_keys()
       { buffer = buf, silent = true, nowait = true, desc = desc })
   end
   map("r",       function() M.refresh() end,  "worktree.graph: refresh repos")
+  map("R", function()
+    state.show_remote_branches = not state.show_remote_branches
+    render_left()
+  end, "worktree.graph: toggle remote branches")
   map("<Tab>",   function() state.mfloat:cycle("forward")  end, "worktree.graph: cycle pane")
   map("<S-Tab>", function() state.mfloat:cycle("backward") end, "worktree.graph: cycle pane back")
   -- Directional pane navigation. Maps to the same forward/backward
@@ -728,6 +919,8 @@ local function bind_left_keys()
   map("f", fetch_selected,    "worktree.graph: fetch selected repo")
   map("F", fetch_all_repos,   "worktree.graph: fetch all repos")
   map("p", pull_at_cursor,    "worktree.graph: pull worktree(s)")
+  map("C", checkout_at_cursor, "worktree.graph: checkout/track branch")
+  map("W", new_at_cursor,      "worktree.graph: create new branch/worktree")
   map("D", destroy_at_cursor, "worktree.graph: destroy worktree + local branch")
 end
 
@@ -834,7 +1027,7 @@ function M.open()
       },
       footer = {
         height  = 1,
-        content = " <Tab> cycle • <CR> diff • 1-9 repo • f fetch • F fetch all • p pull • D destroy wt • r rescan • q close",
+        content = " <Tab> cycle • <CR> diff • 1-9 repo • f fetch • F fetch all • p pull • C checkout • W new • D destroy wt/remote • r rescan • R remotes • q close",
       },
     },
     initial_focus = "left",
