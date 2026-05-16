@@ -35,11 +35,17 @@ local function _probe()
   end
   if not _core_wt and not _warned_fallback then
     _warned_fallback = true
-    pcall(vim.notify,
-      "worktree.nvim: auto-core.nvim not installed; using bundled git_legacy.lua. "
-        .. "Install yongjohnlee80/auto-core.nvim to use the canonical implementation. "
-        .. "The legacy fallback retires after one minor release.",
-      vim.log.levels.WARN, { title = "worktree.nvim" })
+    -- ADR 0021 §6 wrapper: route through `worktree.log` even though
+    -- this WARN fires precisely WHEN auto-core is absent. The
+    -- wrapper has a built-in pre-auto-core vim.notify fallback —
+    -- see log.lua's `_legacy_notify`. pcall guards against a
+    -- corrupt install where worktree.log itself can't load.
+    pcall(function()
+      require("worktree.log").warn("git",
+        "worktree.nvim: auto-core.nvim not installed; using bundled git_legacy.lua. "
+          .. "Install yongjohnlee80/auto-core.nvim to use the canonical implementation. "
+          .. "The legacy fallback retires after one minor release.")
+    end)
   end
 end
 

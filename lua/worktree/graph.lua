@@ -70,8 +70,19 @@ local select_repo
 
 -- ── helpers ──────────────────────────────────────────────────
 
+-- ADR 0021 §6 wrapper: route through `worktree.log` (component
+-- `graph`) so every graph-dashboard toast lands in the auto-core
+-- ring. The pre-existing "worktree.graph" title rendering is now
+-- the wrapper's responsibility — level functions land via
+-- `auto-core.log`'s default sink (ERROR/WARN toast, INFO+ silent).
 local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = "worktree.graph" })
+  local log = require("worktree.log")
+  level = level or vim.log.levels.INFO
+  if level == vim.log.levels.ERROR then return log.error("graph", msg)
+  elseif level == vim.log.levels.WARN then return log.warn("graph", msg)
+  elseif level == vim.log.levels.DEBUG then return log.debug("graph", msg)
+  elseif level == vim.log.levels.TRACE then return log.trace("graph", msg)
+  else return log.info("graph", msg) end
 end
 
 local function workspace_root()

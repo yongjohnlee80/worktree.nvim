@@ -28,10 +28,20 @@ M.graph = setmetatable({}, {
 -- to round-trip through auto-core on every redraw.
 local captured_root = nil
 
+-- ADR 0021 §6 wrapper: route through `worktree.log` so every
+-- emission lands in the auto-core ring AND fires `vim.notify` per
+-- the level's default sink (ERROR/WARN toast, INFO+ silent via
+-- nvim_echo). Pre-auto-core fallback inside the wrapper preserves
+-- the v0.4.x vim.notify-with-title behavior for users without
+-- auto-core installed.
 local function notify(msg, level)
-  local opts = {}
-  if config.options.notify_title then opts.title = config.options.notify_title end
-  vim.notify(msg, level or vim.log.levels.INFO, opts)
+  local log = require("worktree.log")
+  level = level or vim.log.levels.INFO
+  if level == vim.log.levels.ERROR then return log.error(msg)
+  elseif level == vim.log.levels.WARN then return log.warn(msg)
+  elseif level == vim.log.levels.DEBUG then return log.debug(msg)
+  elseif level == vim.log.levels.TRACE then return log.trace(msg)
+  else return log.info(msg) end
 end
 
 -- Soft-dep probe for auto-core. Callers above each integration
