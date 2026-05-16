@@ -2,6 +2,66 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.6] — 2026-05-16 — ADR 0021 Phase 2 wrapper
+
+Internal refactor. No user-facing behavior changes — every existing
+notify in `worktree.nvim` now flows through `lua/worktree/log.lua`
+so the auto-core ring captures the entry for `:AutoCoreLog`
+triage. Toast surface is unchanged at every call site.
+
+### Added — `lua/worktree/log.lua`
+
+Per ADR 0021 §6, every auto-family plugin owns one
+`lua/<plugin>/log.lua` that delegates to `auto-core.log`. Feature
+code in worktree.nvim now calls `require("worktree.log")`
+exclusively; `auto-core.log` is reachable only through the
+wrapper.
+
+Exposes:
+
+```lua
+local log = require("worktree.log")
+
+log.error / .warn / .info / .debug / .trace  -- with worktree.* component prefix
+log.notify(msg, opts?)                        -- force-toast single emission
+log.notifyIf(event, msg, opts?)               -- toast iff event subscribed
+log.register_events(events)                   -- declare at setup
+log.is_level_enabled(name)                    -- predicate
+```
+
+Soft-dep tolerant: when running against an auto-core older than
+v0.1.11 (no `notify` / `notifyIf` / `events.register`), the
+wrapper degrades to ring-only emissions and bare `vim.notify`
+fallbacks instead of crashing. The pre-existing
+`config.options.notify_title` is honored by the legacy fallback
+path so users without auto-core keep the v0.4.x title behavior.
+
+### Changed — routed three notify call sites through the wrapper
+
+- `lua/worktree/init.lua` — the `notify` helper used by 30+ call
+  sites now delegates to `worktree.log.<level>`. Signature
+  unchanged (`notify(msg, level?)`).
+- `lua/worktree/graph.lua` — the `notify` helper used by 45 call
+  sites now delegates to `worktree.log.<level>` with component
+  `graph`. Signature unchanged.
+- `lua/worktree/git.lua` — the direct
+  `pcall(vim.notify, "worktree.nvim: auto-core.nvim not installed; …")`
+  fallback warning now routes through `worktree.log.warn("git",
+  …)`. The wrapper's own pre-auto-core fallback path delivers
+  the toast in that case.
+
+### Tests
+
+`tests/smoke.lua` 42 passed, 0 failed. No new assertions — this
+is a routing change with byte-identical observable behavior at
+every call site that flowed through the two `notify()` helpers.
+
+### Migration
+
+Soft. Consumers pin via `version = "^0.4.0"` and auto-update.
+The wrapper soft-deps against pre-Phase-1 auto-core so consumers
+can stage the upgrade in any order.
+
 ## [v0.4.5] — 2026-05-14 — graph: tighten remote-branch row label
 
 Cosmetic. Remote-branch rows in the graph's left pane drop the
