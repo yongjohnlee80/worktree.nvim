@@ -111,6 +111,14 @@ ok("legacy fallback parse_porcelain works without auto-core",
 package.preload["auto-core"] = nil
 package.loaded["auto-core"] = saved_core
 git_mod._reset_for_tests()
+-- worktree.log caches `core_log` at module-load time. Running the
+-- legacy-fallback dance above forces `worktree.log` to load under the
+-- no-auto-core preload (the git.lua probe emits a warn through it),
+-- which freezes `core_log = nil` for the rest of the session. Drop
+-- the loaded module so the next `require("worktree.log")` re-probes
+-- and picks up the now-restored auto-core. Section [8] depends on
+-- the live wrapper to assert routing.
+package.loaded["worktree.log"] = nil
 
 -- ───────── 3. set_root / get_root write-through ─────────
 print("\n[3] set_root / get_root write through to core.workspace_root")
@@ -369,6 +377,77 @@ wt.graph.close()
 vim.ui.select = orig_select
 vim.ui.input = orig_input
 vim.fn.delete(repo_path, "rf")
+
+-- ───────── 8. interactive feedback toasts (notify regression guard) ─────────
+-- Locks down the v0.4.6 regression: the wrapper sweep landed every
+-- graph/init INFO toast on `log.info(...)` whose default sink is
+-- silent — so users lost every happy-path message ("already at root",
+-- "fetched X", "fast-forwarded Y", "+ worktree", "cloned →").
+--
+-- Fix (2026-05-25) splits each module's emission into two helpers:
+--   • `log(msg, level)`   — severity-routed instrumentation (ERROR/WARN
+--                            toast, INFO+ silent ring). Replaces the
+--                            old misleadingly-named `notify` helper.
+--   • `feedback(msg)`     — force-toast user-action feedback via
+--                            `worktree.log.notify(...)`. Used at the
+--                            ~25 git/worktree action sites in graph.lua
+--                            and init.lua.
+--
+-- See shared/conventions/auto-family-logging.md row 5
+-- ("Interactive feedback on a user-initiated UI action").
+--
+-- Asserts EFFECTS, not calls: we capture `vim.notify` and verify that
+-- the toast actually surfaces.
+print("\n[8] interactive feedback toasts (notify regression guard)")
+
+local notify_captured = {}
+local orig_notify = vim.notify
+vim.notify = function(msg, level, opts)
+  notify_captured[#notify_captured + 1] = { msg = msg, level = level, opts = opts }
+end
+
+-- 8a. Wrapper contract — worktree.log.notify always toasts (force-toast
+-- surface). This is the foundation feedback() depends on. If
+-- auto-core.log.notify's routing ever flips to silent, this catches it.
+notify_captured = {}
+require("worktree.log").notify("smoke: forced INFO toast",
+  { level = "info", component = "smoke" })
+vim.wait(20)
+ok("worktree.log.notify surfaces a toast at INFO",
+  #notify_captured > 0 and notify_captured[1].msg:match("smoke: forced INFO toast"),
+  "captured=" .. vim.inspect(notify_captured))
+
+-- 8b. Inverse contract — worktree.log.info stays silent at default
+-- routing. Pins down "use log.notify, not log.info, for user-facing
+-- feedback." If this flips, the level-semantics table in the
+-- convention doc needs updating before any code does.
+notify_captured = {}
+require("worktree.log").info("smoke", "smoke: silent INFO log")
+vim.wait(20)
+ok("worktree.log.info stays silent at default routing",
+  #notify_captured == 0,
+  "captured=" .. vim.inspect(notify_captured))
+
+-- 8c. init.lua integration — M.home() always emits via feedback()
+-- (either "already at root" or "worktree ← root"). With feedback()
+-- routed through log.notify, a toast must surface. Pre-fix (log.info
+-- path) zero toasts landed.
+--
+-- We don't pre-position cwd: macOS resolves /var/folders → /private/var/
+-- which makes "old_cwd == root" fragile in headless. Both branches
+-- emit; either is fine for this assertion.
+local home_tmp = vim.fn.tempname() .. "_home"
+vim.fn.mkdir(home_tmp, "p")
+wt.set_root(home_tmp)
+notify_captured = {}
+wt.home()
+vim.wait(20)
+ok("init.feedback() surfaces a toast on M.home()",
+  #notify_captured > 0,
+  "captured=" .. vim.inspect(notify_captured))
+vim.fn.delete(home_tmp, "rf")
+
+vim.notify = orig_notify
 
 -- ───────────────────── summary ─────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))

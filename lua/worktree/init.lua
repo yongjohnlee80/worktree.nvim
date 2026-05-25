@@ -28,13 +28,22 @@ M.graph = setmetatable({}, {
 -- to round-trip through auto-core on every redraw.
 local captured_root = nil
 
--- ADR 0021 §6 wrapper: route through `worktree.log` so every
--- emission lands in the auto-core ring AND fires `vim.notify` per
--- the level's default sink (ERROR/WARN toast, INFO+ silent via
--- nvim_echo). Pre-auto-core fallback inside the wrapper preserves
--- the v0.4.x vim.notify-with-title behavior for users without
--- auto-core installed.
-local function notify(msg, level)
+-- Two emission surfaces — pick by INTENT, not by severity.
+--
+-- `log(msg, level)` — severity-routed instrumentation. ERROR/WARN
+-- toast via auto-core.log's default sink; INFO/DEBUG/TRACE land in the
+-- ring only (silent). Use for diagnostics and status that should NOT
+-- spam the user.
+--
+-- `feedback(msg)` — force-toast user-action feedback (`log.notify` at
+-- INFO). Use when the user JUST invoked a command (worktree switch,
+-- add, remove, clone, init) and is waiting on the outcome. These are
+-- not noise — the user typed the command and expects to see the
+-- result.
+--
+-- See shared/conventions/auto-family-logging.md row 5
+-- ("Interactive feedback on a user-initiated UI action").
+local function log(msg, level)
   local log = require("worktree.log")
   level = level or vim.log.levels.INFO
   if level == vim.log.levels.ERROR then return log.error(msg)
@@ -42,6 +51,10 @@ local function notify(msg, level)
   elseif level == vim.log.levels.DEBUG then return log.debug(msg)
   elseif level == vim.log.levels.TRACE then return log.trace(msg)
   else return log.info(msg) end
+end
+
+local function feedback(msg)
+  require("worktree.log").notify(msg, { level = "info" })
 end
 
 -- Soft-dep probe for auto-core. Callers above each integration
@@ -313,7 +326,7 @@ local function cleanup_stale_buffers(old_path, new_path)
 
   if #dirty > 0 then
     vim.schedule(function()
-      notify(
+      log(
         ("%d unsaved buffer(s) left open:\n  %s"):format(
           #dirty, table.concat(dirty, "\n  ")
         ),
@@ -358,7 +371,7 @@ local function switch_to(path)
   restart_workspace_lsps()
   refresh_file_tree()
   publish_switch(old_cwd, target)
-  notify(("worktree → %s%s%s"):format(
+  feedback(("worktree → %s%s%s"):format(
     relative_to_root(target), cleanup_suffix, session_suffix
   ))
 end
@@ -367,7 +380,7 @@ function M.pick()
   local root = M.ensure_root()
   local worktrees = git.collect_worktrees(root)
   if #worktrees == 0 then
-    notify(("no worktrees found under %s"):format(root), vim.log.levels.WARN)
+    log(("no worktrees found under %s"):format(root), vim.log.levels.WARN)
     return
   end
 
@@ -391,7 +404,7 @@ function M.home()
   local root = M.ensure_root()
   local old_cwd = git.norm(vim.fn.getcwd())
   if old_cwd == git.norm(root) then
-    notify(("already at root: %s"):format(root))
+    feedback(("already at root: %s"):format(root))
     return
   end
   persistence_save(old_cwd)
@@ -402,7 +415,7 @@ function M.home()
   restart_workspace_lsps()
   refresh_file_tree()
   publish_switch(old_cwd, new_cwd)
-  notify(("worktree ← root (%s)%s%s"):format(root, cleanup_suffix, session_suffix))
+  feedback(("worktree ← root (%s)%s%s"):format(root, cleanup_suffix, session_suffix))
 end
 
 function M.add()
@@ -418,12 +431,12 @@ function M.add()
       "-b", name, target, remote_ref,
     })
     if code ~= 0 then
-      notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+      log("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
     publish_added(target)
     refresh_file_tree()
-    notify(("+ %s (tracking %s)"):format(relative_to_root(target), remote_ref))
+    feedback(("+ %s (tracking %s)"):format(relative_to_root(target), remote_ref))
   end
 
   -- `worktree add <path> <branch>` (no `-b`) -- checks out the existing
@@ -435,12 +448,12 @@ function M.add()
       "git", "-C", repo_common, "worktree", "add", target, name,
     })
     if code ~= 0 then
-      notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+      log("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
     publish_added(target)
     refresh_file_tree()
-    notify(("+ %s (checked out existing local '%s')"):format(
+    feedback(("+ %s (checked out existing local '%s')"):format(
       relative_to_root(target), name
     ))
   end
@@ -451,7 +464,7 @@ function M.add()
   local function create_from_base(repo_common, container, name)
     local branches = git.list_branches(repo_common)
     if #branches == 0 then
-      notify("No branches found in repo", vim.log.levels.ERROR)
+      log("No branches found in repo", vim.log.levels.ERROR)
       return
     end
     vim.ui.select(branches, {
@@ -463,12 +476,12 @@ function M.add()
         "git", "-C", repo_common, "worktree", "add", "-b", name, target, base,
       })
       if code ~= 0 then
-        notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+        log("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
         return
       end
       publish_added(target)
       refresh_file_tree()
-      notify(("+ %s (from %s)"):format(relative_to_root(target), base))
+      feedback(("+ %s (from %s)"):format(relative_to_root(target), base))
     end)
   end
 
@@ -492,7 +505,7 @@ function M.add()
       -- Hard stop: git refuses to check out the same branch in two
       -- worktrees. Tell the user where it lives so they can switch instead.
       if wt_path then
-        notify(
+        log(
           ("'%s' is already checked out in worktree %s"):format(
             name, relative_to_root(wt_path)
           ),
@@ -569,7 +582,7 @@ function M.add()
   local root = M.ensure_root()
   local repos = git.list_child_repos(root)
   if #repos == 0 then
-    notify(("no repos found under %s"):format(root), vim.log.levels.WARN)
+    log(("no repos found under %s"):format(root), vim.log.levels.WARN)
     return
   end
   vim.ui.select(repos, {
@@ -579,7 +592,7 @@ function M.add()
     if not choice then return end
     local repo_common = git.git_common_dir(choice.path)
     if not repo_common then
-      notify(
+      log(
         "Could not resolve git-common-dir for " .. choice.path,
         vim.log.levels.ERROR
       )
@@ -618,7 +631,7 @@ function M.remove()
   end
 
   if #removable == 0 then
-    notify("no removable worktrees found", vim.log.levels.WARN)
+    log("no removable worktrees found", vim.log.levels.WARN)
     return
   end
 
@@ -635,7 +648,7 @@ function M.remove()
     if not choice then return end
 
     if git.has_uncommitted(choice.path) then
-      notify(
+      log(
         ("refusing to remove — uncommitted changes in %s"):format(
           relative_to_root(choice.path)
         ),
@@ -646,7 +659,7 @@ function M.remove()
 
     local dirty = buffers.modified_under(choice.path)
     if #dirty > 0 then
-      notify(
+      log(
         ("refusing to remove — unsaved buffers in %s:\n  %s"):format(
           relative_to_root(choice.path),
           table.concat(dirty, "\n  ")
@@ -664,7 +677,7 @@ function M.remove()
       "git", "-C", choice.path, "worktree", "remove", choice.path,
     })
     if code ~= 0 then
-      notify("git worktree remove failed:\n" .. out, vim.log.levels.ERROR)
+      log("git worktree remove failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
     publish_removed(choice.path)
@@ -676,7 +689,7 @@ function M.remove()
       require("worktree.session").forget(choice.path)
     end
     refresh_file_tree()
-    notify(("- %s%s"):format(
+    feedback(("- %s%s"):format(
       relative_to_root(choice.path),
       wiped > 0 and (" (closed %d buffer(s))"):format(wiped) or ""
     ))
@@ -694,10 +707,10 @@ function M.remove()
       "git", "-C", repo_common, "branch", "-D", choice.branch,
     })
     if bcode ~= 0 then
-      notify("git branch -D failed:\n" .. bout, vim.log.levels.ERROR)
+      log("git branch -D failed:\n" .. bout, vim.log.levels.ERROR)
       return
     end
-    notify(("- branch %s"):format(choice.branch))
+    feedback(("- branch %s"):format(choice.branch))
   end)
 end
 
@@ -707,7 +720,7 @@ end
 local function require_not_in_repo(op_label)
   local cwd = git.norm(vim.fn.getcwd())
   if git.git_common_dir(cwd) then
-    notify(
+    log(
       ("refusing to %s -- cwd is inside a git repo (%s). Hop back to root first (<leader>gW).")
         :format(op_label, cwd),
       vim.log.levels.ERROR
@@ -738,7 +751,7 @@ local function add_initial_worktree(bare_path, repo_dir, branch)
     "git", "-C", bare_path, "worktree", "add", target, branch,
   })
   if code ~= 0 then
-    notify("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
+    log("git worktree add failed:\n" .. out, vim.log.levels.ERROR)
     return false
   end
   publish_added(target)
@@ -767,17 +780,17 @@ function M.clone()
       local bare_path = repo_dir .. "/" .. bare_dir
 
       if vim.fn.isdirectory(repo_dir) == 1 then
-        notify(
+        log(
           ("'%s' already exists under %s"):format(name, root),
           vim.log.levels.ERROR
         )
         return
       end
 
-      notify(("cloning %s → %s ..."):format(url, relative_to_root(repo_dir)))
+      feedback(("cloning %s → %s ..."):format(url, relative_to_root(repo_dir)))
       local code, out = git.run({ "git", "clone", "--bare", url, bare_path })
       if code ~= 0 then
-        notify("git clone --bare failed:\n" .. out, vim.log.levels.ERROR)
+        log("git clone --bare failed:\n" .. out, vim.log.levels.ERROR)
         return
       end
 
@@ -797,14 +810,14 @@ function M.clone()
       if bare_dir ~= ".git" then
         local ok, err = write_gitfile(repo_dir, bare_dir)
         if not ok then
-          notify("failed to write .git gitfile: " .. err, vim.log.levels.ERROR)
+          log("failed to write .git gitfile: " .. err, vim.log.levels.ERROR)
           return
         end
       end
 
       local default = git.default_branch(bare_path)
       if add_initial_worktree(bare_path, repo_dir, default) then
-        notify(("cloned → %s (worktree on %s)"):format(
+        feedback(("cloned → %s (worktree on %s)"):format(
           relative_to_root(repo_dir), default
         ))
       end
@@ -825,7 +838,7 @@ function M.init()
     local bare_path = repo_dir .. "/" .. bare_dir
 
     if vim.fn.isdirectory(repo_dir) == 1 then
-      notify(
+      log(
         ("'%s' already exists under %s"):format(name, root),
         vim.log.levels.ERROR
       )
@@ -836,7 +849,7 @@ function M.init()
       "git", "init", "--bare", "-b", "main", bare_path,
     })
     if code ~= 0 then
-      notify("git init --bare failed:\n" .. out, vim.log.levels.ERROR)
+      log("git init --bare failed:\n" .. out, vim.log.levels.ERROR)
       return
     end
 
@@ -847,7 +860,7 @@ function M.init()
       { "git", "-C", bare_path, "hash-object", "-t", "tree", "--stdin" }, ""
     )
     if hc ~= 0 then
-      notify("hash-object failed:\n" .. empty_tree, vim.log.levels.ERROR)
+      log("hash-object failed:\n" .. empty_tree, vim.log.levels.ERROR)
       return
     end
     empty_tree = vim.trim(empty_tree)
@@ -856,7 +869,7 @@ function M.init()
       "git", "-C", bare_path, "commit-tree", empty_tree, "-m", "Initial commit",
     })
     if cc ~= 0 then
-      notify("commit-tree failed:\n" .. commit, vim.log.levels.ERROR)
+      log("commit-tree failed:\n" .. commit, vim.log.levels.ERROR)
       return
     end
     commit = vim.trim(commit)
@@ -865,7 +878,7 @@ function M.init()
       "git", "-C", bare_path, "update-ref", "refs/heads/main", commit,
     })
     if uc ~= 0 then
-      notify("update-ref failed:\n" .. uout, vim.log.levels.ERROR)
+      log("update-ref failed:\n" .. uout, vim.log.levels.ERROR)
       return
     end
 
@@ -873,13 +886,13 @@ function M.init()
     if bare_dir ~= ".git" then
       local ok, err = write_gitfile(repo_dir, bare_dir)
       if not ok then
-        notify("failed to write .git gitfile: " .. err, vim.log.levels.ERROR)
+        log("failed to write .git gitfile: " .. err, vim.log.levels.ERROR)
         return
       end
     end
 
     if add_initial_worktree(bare_path, repo_dir, "main") then
-      notify(("initialized → %s (empty commit on main)"):format(
+      feedback(("initialized → %s (empty commit on main)"):format(
         relative_to_root(repo_dir)
       ))
     end

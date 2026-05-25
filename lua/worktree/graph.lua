@@ -70,12 +70,22 @@ local select_repo
 
 -- ── helpers ──────────────────────────────────────────────────
 
--- ADR 0021 §6 wrapper: route through `worktree.log` (component
--- `graph`) so every graph-dashboard toast lands in the auto-core
--- ring. The pre-existing "worktree.graph" title rendering is now
--- the wrapper's responsibility — level functions land via
--- `auto-core.log`'s default sink (ERROR/WARN toast, INFO+ silent).
-local function notify(msg, level)
+-- Two emission surfaces — pick by INTENT, not by severity.
+--
+-- `log(msg, level)` — severity-routed instrumentation. ERROR/WARN
+-- toast via auto-core.log's default sink; INFO/DEBUG/TRACE land in the
+-- ring only (silent). Use for diagnostics, status, internal events
+-- that should NOT spam the user.
+--
+-- `feedback(msg)` — force-toast user-action feedback (`log.notify` at
+-- INFO). Use when the user JUST initiated an action in the panel (fetch,
+-- pull, destroy, remote-branch op) and is waiting on the outcome.
+-- These are not noise — the user pressed the key and expects to see
+-- the result.
+--
+-- See shared/conventions/auto-family-logging.md row 5
+-- ("Interactive feedback on a user-initiated UI action").
+local function log(msg, level)
   local log = require("worktree.log")
   level = level or vim.log.levels.INFO
   if level == vim.log.levels.ERROR then return log.error("graph", msg)
@@ -83,6 +93,10 @@ local function notify(msg, level)
   elseif level == vim.log.levels.DEBUG then return log.debug("graph", msg)
   elseif level == vim.log.levels.TRACE then return log.trace("graph", msg)
   else return log.info("graph", msg) end
+end
+
+local function feedback(msg)
+  require("worktree.log").notify(msg, { level = "info", component = "graph" })
 end
 
 local function workspace_root()
@@ -268,7 +282,7 @@ local function draw_graph_for(repo)
   local prev_cwd
   local ok_cd = pcall(function() prev_cwd = vim.fn.chdir(target) end)
   if not ok_cd or not prev_cwd then
-    notify("failed to chdir to " .. target, vim.log.levels.ERROR)
+    log("failed to chdir to " .. target, vim.log.levels.ERROR)
     return
   end
   local draw_ok, draw_err = pcall(function()
@@ -279,7 +293,7 @@ local function draw_graph_for(repo)
   end)
   if prev_cwd and prev_cwd ~= "" then pcall(vim.fn.chdir, prev_cwd) end
   if not draw_ok then
-    notify("gitgraph draw failed: " .. tostring(draw_err), vim.log.levels.ERROR)
+    log("gitgraph draw failed: " .. tostring(draw_err), vim.log.levels.ERROR)
     return
   end
 
@@ -352,7 +366,7 @@ function M._show_commit_diff(repo, commit)
   if not (core and core.git and core.git.graph) then return end
   local lines = core.git.graph.show_diff(repo.common_dir, commit.hash)
   if not lines or #lines == 0 then
-    notify("git show -p produced no output", vim.log.levels.WARN)
+    log("git show -p produced no output", vim.log.levels.WARN)
     return
   end
   -- Use vim.api.nvim_open_win directly for the diff float; our
@@ -408,7 +422,7 @@ function M._show_range_diff(repo, from, to)
   }
   local lines = vim.fn.systemlist(cmd)
   if vim.v.shell_error ~= 0 then
-    notify("git diff range failed", vim.log.levels.ERROR)
+    log("git diff range failed", vim.log.levels.ERROR)
     return
   end
   M._show_commit_diff(repo, {
@@ -476,15 +490,15 @@ local function fetch_one(repo_idx)
   if not (core and core.git and core.git.fetch) then return end
   state.fetching[repo_idx] = true
   render_left()
-  notify("fetching " .. repo.label .. "…")
+  feedback("fetching " .. repo.label .. "…")
   core.git.fetch.fetch_one(repo, nil, function(ok, stderr)
     state.fetching[repo_idx] = nil
     render_left()
     if ok then
-      notify("fetched " .. repo.label)
+      feedback("fetched " .. repo.label)
       if state.selected == repo_idx then select_repo(repo_idx) end
     else
-      notify(string.format("fetch failed (%s): %s",
+      log(string.format("fetch failed (%s): %s",
         repo.label, (stderr or ""):gsub("\n+$", "")),
         vim.log.levels.ERROR)
     end
@@ -493,7 +507,7 @@ end
 
 local function fetch_selected()
   if not state.selected then
-    notify("no repo selected", vim.log.levels.WARN)
+    log("no repo selected", vim.log.levels.WARN)
     return
   end
   fetch_one(state.selected)
@@ -506,18 +520,18 @@ local function fetch_all_repos()
   if #repos == 0 then return end
   for i, _ in ipairs(repos) do state.fetching[i] = true end
   render_left()
-  notify("fetching all (" .. #repos .. ")…")
+  feedback("fetching all (" .. #repos .. ")…")
   core.git.fetch.fetch_all(repos, nil,
     function(idx, ok, repo)
       state.fetching[idx] = nil
       render_left()
       if not ok then
-        notify("fetch failed (" .. (repo.label or "?") .. ")",
+        log("fetch failed (" .. (repo.label or "?") .. ")",
           vim.log.levels.ERROR)
       end
     end,
     function()
-      notify("fetch all done (" .. #repos .. " repos)")
+      feedback("fetch all done (" .. #repos .. " repos)")
       if state.selected then select_repo(state.selected) end
     end)
 end
@@ -533,21 +547,21 @@ local function pull_one_post_fetch(wt, on_done)
   local core = _core()
   if not (core and core.git and core.git.pull) then return done() end
   if not wt.branch then
-    notify(wt.path .. " is detached — skipping pull", vim.log.levels.WARN)
+    log(wt.path .. " is detached — skipping pull", vim.log.levels.WARN)
     return done()
   end
   local s = core.git.pull.pull_status(wt)
   if s.state == "no_remote" then
-    notify("no remote ref " .. (s.remote_ref or "?") .. " for " .. wt.path,
+    log("no remote ref " .. (s.remote_ref or "?") .. " for " .. wt.path,
       vim.log.levels.WARN)
     return done()
   end
   if s.state == "uptodate" then
-    notify(s.branch .. " already at " .. s.remote_ref)
+    feedback(s.branch .. " already at " .. s.remote_ref)
     return done()
   end
   if s.state == "ahead" and not s.dirty then
-    notify(s.branch .. " is ahead of " .. s.remote_ref ..
+    feedback(s.branch .. " is ahead of " .. s.remote_ref ..
       " — nothing to pull")
     return done()
   end
@@ -555,10 +569,10 @@ local function pull_one_post_fetch(wt, on_done)
   if s.state == "ff" and not s.dirty then
     core.git.pull.pull_apply(wt, "ff", nil, function(ok, err)
       if ok then
-        notify("fast-forwarded " .. s.branch .. " → " .. s.remote_ref)
+        feedback("fast-forwarded " .. s.branch .. " → " .. s.remote_ref)
         if state.selected then select_repo(state.selected) end
       else
-        notify("ff failed for " .. s.branch .. ": " .. (err or ""),
+        log("ff failed for " .. s.branch .. ": " .. (err or ""),
           vim.log.levels.ERROR)
       end
       done()
@@ -585,10 +599,10 @@ local function pull_one_post_fetch(wt, on_done)
       if choice == "Force pull" then
         core.git.pull.pull_apply(wt, "reset", nil, function(ok, err)
           if ok then
-            notify("reset " .. s.branch .. " --hard " .. s.remote_ref)
+            feedback("reset " .. s.branch .. " --hard " .. s.remote_ref)
             if state.selected then select_repo(state.selected) end
           else
-            notify("force pull failed for " .. s.branch .. ": " ..
+            log("force pull failed for " .. s.branch .. ": " ..
               (err or ""), vim.log.levels.ERROR)
           end
           done()
@@ -612,7 +626,7 @@ local function pull_repo_at(repo_idx)
   if not repo then return end
   local wts = list_worktrees(repo.common_dir)
   if #wts == 0 then
-    notify("no worktrees to pull for " .. repo.label, vim.log.levels.WARN)
+    log("no worktrees to pull for " .. repo.label, vim.log.levels.WARN)
     return
   end
   local core = _core()
@@ -660,18 +674,18 @@ local function destroy_worktree_at(repo_idx, wt)
     core.git.worktree.destroy(repo, wt, { force = force },
       function(ok, err, branch_err)
         if not ok then
-          notify("destroy failed for " .. label .. ": " .. (err or ""),
+          log("destroy failed for " .. label .. ": " .. (err or ""),
             vim.log.levels.ERROR)
           return
         end
         if branch_err then
-          notify("worktree removed; branch delete failed: " .. branch_err,
+          log("worktree removed; branch delete failed: " .. branch_err,
             vim.log.levels.WARN)
         else
           local what = wt.branch
             and (wt.path .. " + branch " .. wt.branch)
             or  wt.path
-          notify("destroyed " .. what)
+          feedback("destroyed " .. what)
         end
         -- If the destroyed path was the sample_worktree, rebind it
         -- so a subsequent select_repo() doesn't chdir into a dead path.
@@ -709,7 +723,7 @@ local function destroy_at_cursor()
   if not state.mfloat then return end
   local left_win = state.mfloat:winid("left")
   if not left_win or vim.api.nvim_get_current_win() ~= left_win then
-    notify("move to a row in the repo pane to destroy",
+    log("move to a row in the repo pane to destroy",
       vim.log.levels.WARN)
     return
   end
@@ -735,19 +749,19 @@ local function destroy_at_cursor()
           or vim.fn.fnamemodify(repo.common_dir, ":h")
         git.delete_remote(path, remote, branch, function(res)
           if res.ok then
-            notify("deleted remote branch " .. remote_ref)
+            feedback("deleted remote branch " .. remote_ref)
             -- Prune local tracking ref so it disappears from UI
             vim.system({ "git", "-C", path, "fetch", "--prune", remote }):wait()
             render_left()
           else
-            notify("delete remote failed: " .. (res.stderr or ""),
+            log("delete remote failed: " .. (res.stderr or ""),
               vim.log.levels.ERROR)
           end
         end)
       end
     end)
   else
-    notify("D destroys a worktree or remote branch — select a valid row",
+    log("D destroys a worktree or remote branch — select a valid row",
       vim.log.levels.WARN)
   end
 end
@@ -756,14 +770,14 @@ local function checkout_at_cursor()
   if not state.mfloat then return end
   local left_win = state.mfloat:winid("left")
   if not left_win or vim.api.nvim_get_current_win() ~= left_win then
-    notify("move to a remote branch row in the repo pane to checkout",
+    log("move to a remote branch row in the repo pane to checkout",
       vim.log.levels.WARN)
     return
   end
   local row = vim.api.nvim_win_get_cursor(left_win)[1]
   local hit = row_to_hit(row)
   if not hit or hit.kind ~= "remote_branch" then
-    notify("C is for checking out remote branches — select a remote branch row",
+    log("C is for checking out remote branches — select a remote branch row",
       vim.log.levels.WARN)
     return
   end
@@ -791,10 +805,10 @@ local function checkout_at_cursor()
         target_path = vim.trim(target_path)
         git.track(repo, remote_ref, local_name, target_path, function(res)
           if res.ok then
-            notify("tracking " .. remote_ref .. " → " .. target_path)
+            feedback("tracking " .. remote_ref .. " → " .. target_path)
             render_left()
           else
-            notify("track failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+            log("track failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
           end
         end)
       end)
@@ -805,18 +819,18 @@ local function checkout_at_cursor()
     -- Must-fix 2: use checkout_status probe
     local status = git.checkout_status(root, branch_name)
     if not status.ok then
-      notify("refusing to checkout: " .. (status.reason or "?"),
+      log("refusing to checkout: " .. (status.reason or "?"),
         vim.log.levels.ERROR)
       return
     end
 
     git.checkout(root, branch_name, function(res)
       if res.ok then
-        notify("checked out " .. branch_name)
+        feedback("checked out " .. branch_name)
         render_left()
         if state.selected == hit.repo_idx then draw_graph_for(repo) end
       else
-        notify("checkout failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+        log("checkout failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
       end
     end)
   end
@@ -826,7 +840,7 @@ local function new_at_cursor()
   if not state.mfloat then return end
   local left_win = state.mfloat:winid("left")
   if not left_win or vim.api.nvim_get_current_win() ~= left_win then
-    notify("move to a row in the repo pane to create from",
+    log("move to a row in the repo pane to create from",
       vim.log.levels.WARN)
     return
   end
@@ -840,7 +854,7 @@ local function new_at_cursor()
   elseif hit.kind == "remote_branch" then
     base_ref = hit.remote_ref
   else
-    notify("W creates from a worktree or remote branch — select a valid row",
+    log("W creates from a worktree or remote branch — select a valid row",
       vim.log.levels.WARN)
     return
   end
@@ -865,27 +879,27 @@ local function new_at_cursor()
         target_path = vim.trim(target_path)
         git.create(repo, name, target_path, base_ref, function(res)
           if res.ok then
-            notify("+ " .. name .. " → " .. target_path)
+            feedback("+ " .. name .. " → " .. target_path)
             render_left()
           else
-            notify("create failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+            log("create failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
           end
         end)
       end)
     else
       local root = git.norm(vim.fn.fnamemodify(repo.common_dir, ":h"))
       if git.has_uncommitted(root) then
-        notify("refusing to create — uncommitted changes in " .. root,
+        log("refusing to create — uncommitted changes in " .. root,
           vim.log.levels.ERROR)
         return
       end
       git.create_branch(root, name, base_ref, function(res)
         if res.ok then
-          notify("+ branch " .. name .. " (from " .. base_ref .. ")")
+          feedback("+ branch " .. name .. " (from " .. base_ref .. ")")
           render_left()
           if state.selected == hit.repo_idx then draw_graph_for(repo) end
         else
-          notify("create branch failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+          log("create branch failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
         end
       end)
     end
@@ -980,7 +994,7 @@ function M.open()
   local core = _core()
   if not (core and core.git and core.git.graph and core.ui and core.ui.float
       and core.ui.float.multi) then
-    notify("auto-core not installed (need git.graph + ui.float.multi)",
+    log("auto-core not installed (need git.graph + ui.float.multi)",
       vim.log.levels.ERROR)
     return
   end
@@ -998,7 +1012,7 @@ function M.open()
   end
   state.repos = core.git.graph.fan_out(state.root, { max_depth = 3 })
   if #state.repos == 0 then
-    notify("no git repositories found under " .. state.root,
+    log("no git repositories found under " .. state.root,
       vim.log.levels.WARN)
     return
   end
