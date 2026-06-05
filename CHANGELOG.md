@@ -2,6 +2,40 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.8] — 2026-06-04 — workspace root pins a stable project identity
+
+**Need**: the session-start capture pinned `core.workspace_root` to
+the raw launch cwd (`getcwd(-1,-1)`). Per-project state keyed on
+`sha256(core.workspace_root)` — auto-finder panel composition,
+md-harpoon pins — therefore keyed DIFFERENTLY for every directory
+nvim was launched from, so per-project config "vanished" when launched
+from a sibling worktree or subdir.
+
+**Change**: the VimEnter capture (`plugin/worktree.lua`) and
+`M.ensure_root()` now resolve a stable project identity instead of
+pinning the raw cwd. Precedence:
+
+1. `WORKTREE_ROOT` env — explicit operator override (ignored unless a
+   real directory).
+2. `auto-core.fs.path.agent_workspace_root` — `.auto-agents/` →
+   `.bare` → repo root → cwd. Collapses every worktree/subdir of one
+   project to a single identity.
+3. raw cwd — legacy fallback when auto-core isn't installed.
+
+The live VimEnter path previously bypassed `ensure_root()` and pinned
+the raw cwd directly; it now routes through `ensure_root()` (which
+carries its own already-set guard, so the capture stays idempotent).
+
+**Requires** auto-core ≥ v0.1.56 for the `agent_workspace_root`
+resolver; older auto-core or no auto-core degrades cleanly to the
+raw-cwd fallback. Added `M._reset_root_for_tests()`.
+
+**Back-compat**: launched from a project root the result is unchanged
+(the root already equals the resolved identity); only subdir/worktree
+launches change — to the more correct project root. A non-project
+launch (e.g. `~/`) stays the raw cwd. Smoke `[ensure_root]` +3
+assertions; suite green at 45 passed, 0 failed.
+
 ## [v0.4.6] — 2026-05-16 — ADR 0021 Phase 2 wrapper
 
 Internal refactor. No user-facing behavior changes — every existing

@@ -449,6 +449,56 @@ vim.fn.delete(home_tmp, "rf")
 
 vim.notify = orig_notify
 
+-- ───────── ensure_root: stable workspace-root resolution ─────────
+print("\n[ensure_root] resolves a stable per-project identity from launch cwd")
+do
+  local fsp = require("auto-core.fs.path")
+  local saved_cwd = vim.fn.getcwd(-1, -1)
+
+  -- An `.auto-agents/` workspace holding a nested repo + deep subdir.
+  local awsroot = fsp.normalize(vim.fn.tempname() .. "_aws")
+  vim.fn.mkdir(awsroot .. "/.auto-agents", "p")
+  vim.fn.mkdir(awsroot .. "/repoY/.git", "p")
+  vim.fn.writefile({ "ref: refs/heads/main" }, awsroot .. "/repoY/.git/HEAD")
+  vim.fn.mkdir(awsroot .. "/repoY/sub/deep", "p")
+
+  -- Launched from a deep subdir → collapses to the `.auto-agents/` root,
+  -- NOT the raw cwd (the bug: each launch cwd hashed to its own key).
+  wt._reset_root_for_tests()
+  vim.fn.chdir(awsroot .. "/repoY/sub/deep")
+  wt.ensure_root()
+  ok("ensure_root: deep subdir under .auto-agents → the workspace marker dir",
+    wt.get_root() == awsroot, "got=" .. tostring(wt.get_root()))
+
+  -- WORKTREE_ROOT env wins over the resolver.
+  local envroot = fsp.normalize(vim.fn.tempname() .. "_envroot")
+  vim.fn.mkdir(envroot, "p")
+  vim.env.WORKTREE_ROOT = envroot
+  wt._reset_root_for_tests()
+  vim.fn.chdir(awsroot .. "/repoY/sub/deep")
+  wt.ensure_root()
+  ok("ensure_root: WORKTREE_ROOT env overrides the resolver",
+    wt.get_root() == envroot, "got=" .. tostring(wt.get_root()))
+  vim.env.WORKTREE_ROOT = nil
+
+  -- Marker-less cwd → keeps the raw cwd (parity with the legacy pin).
+  local plainparent = fsp.normalize(vim.fn.tempname() .. "_plain")
+  local plaindir = plainparent .. "/here"
+  vim.fn.mkdir(plaindir, "p")
+  wt._reset_root_for_tests()
+  vim.fn.chdir(plaindir)
+  wt.ensure_root()
+  ok("ensure_root: marker-less cwd stays the raw cwd",
+    wt.get_root() == plaindir, "got=" .. tostring(wt.get_root()))
+
+  -- Restore + clean up.
+  vim.fn.chdir(saved_cwd)
+  wt._reset_root_for_tests()
+  vim.fn.delete(awsroot, "rf")
+  vim.fn.delete(envroot, "rf")
+  vim.fn.delete(plainparent, "rf")
+end
+
 -- ───────────────────── summary ─────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then

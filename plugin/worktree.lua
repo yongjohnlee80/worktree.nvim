@@ -37,8 +37,14 @@ end, { desc = "Worktree: refresh graph view (drops caches)" })
 -- so we know our autocmd above will never trigger and capture now
 -- instead. ensure-root is idempotent (no-op if already set).
 local function _ensure_root_now()
-  local wt = require("worktree")
-  if not wt.get_root() then wt.set_root(vim.fn.getcwd(-1, -1)) end
+  -- Route through M.ensure_root so the workspace root is the RESOLVED
+  -- stable project identity (`.auto-agents/` → `.bare` → repo root →
+  -- cwd), not the raw launch cwd. Pinning the raw cwd made per-project
+  -- state (auto-finder panels, md-harpoon pins, both keyed on
+  -- sha256(core.workspace_root)) key differently for every directory
+  -- nvim was launched from. ensure_root() carries its own
+  -- already-set guard, so this stays idempotent.
+  require("worktree").ensure_root()
 end
 
 if vim.v.vim_did_enter == 1 then

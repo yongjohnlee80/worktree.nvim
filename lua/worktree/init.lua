@@ -93,18 +93,64 @@ function M.get_root()
   return captured_root
 end
 
--- Capture the startup cwd lazily. Called by plugin/worktree.lua on VimEnter
--- if the user hasn't already configured a root via setup().
+-- Capture the workspace root lazily. Called by plugin/worktree.lua on
+-- VimEnter if the user hasn't already configured a root via setup().
+--
+-- Resolves a STABLE project identity from the launch cwd rather than
+-- pinning the raw cwd. The old raw-cwd pin made per-project state —
+-- auto-finder panel composition and md-harpoon pins, both keyed on
+-- `sha256(core.workspace_root)` — hash DIFFERENTLY for every directory
+-- nvim happened to be launched from. A panel/pin added from one cwd
+-- "vanished" on the next launch from a sibling worktree or subdir.
+-- Precedence:
+--   1. WORKTREE_ROOT env — explicit operator override (ADR 0006's
+--      sticky-workspace escape hatch). Ignored unless it's a real dir.
+--   2. auto-core.fs.path.agent_workspace_root — `.auto-agents/` →
+--      `.bare` → repo root → cwd. Collapses every worktree/subdir of
+--      one project to a single identity.
+--   3. raw cwd — legacy fallback when auto-core isn't installed.
 function M.ensure_root()
   local existing = M.get_root()
   if existing then return existing end
-  M.set_root(vim.fn.getcwd(-1, -1))
+
+  local cwd = vim.fn.getcwd(-1, -1)
+
+  local env = os.getenv("WORKTREE_ROOT")
+  if type(env) == "string" and env ~= "" then
+    local expanded = vim.fn.expand(env)
+    if vim.fn.isdirectory(expanded) == 1 then
+      M.set_root(expanded)
+      return M.get_root()
+    end
+  end
+
+  local resolved
+  local ok, fs_path = pcall(require, "auto-core.fs.path")
+  if ok and type(fs_path) == "table"
+      and type(fs_path.agent_workspace_root) == "function" then
+    local r = fs_path.agent_workspace_root({ start = cwd })
+    if type(r) == "string" and r ~= "" then resolved = r end
+  end
+
+  M.set_root(resolved or cwd)
   return M.get_root()
 end
 
 function M.setup(opts)
   config.setup(opts)
   if config.options.root then M.set_root(config.options.root) end
+end
+
+-- Test-only: clear the captured workspace root (local mirror + the
+-- canonical auto-core value) so a smoke can exercise `ensure_root`'s
+-- resolution path from a clean slate. Production code never calls this.
+function M._reset_root_for_tests()
+  captured_root = nil
+  local core = _core()
+  if core and core.git and core.git.worktree
+      and type(core.git.worktree._reset_for_tests) == "function" then
+    pcall(core.git.worktree._reset_for_tests)
+  end
 end
 
 -- Per-cwd status cache for statusline consumers. Refreshing on every redraw
