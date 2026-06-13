@@ -10,6 +10,10 @@
 
 local M = {}
 
+-- ADR-0041 C5: `vim.uv` is nil on Neovim < 0.10 — the rest of the
+-- codebase uses this fallback; the legacy module was the one holdout.
+local uv = vim.uv or vim.loop
+
 function M.norm(path)
   return (vim.fn.fnamemodify(path, ":p"):gsub("/$", ""))
 end
@@ -54,11 +58,11 @@ end
 function M.collect_worktrees(dir)
   local seen, out = {}, {}
 
-  local handle = vim.uv.fs_scandir(dir)
+  local handle = uv.fs_scandir(dir)
   if not handle then return out end
 
   while true do
-    local name, t = vim.uv.fs_scandir_next(handle)
+    local name, t = uv.fs_scandir_next(handle)
     if not name then break end
     if (t == "directory" or t == "link") and not name:match("^%.") then
       local full = dir .. "/" .. name
@@ -110,10 +114,10 @@ end
 
 function M.list_child_repos(dir)
   local repos = {}
-  local handle = vim.uv.fs_scandir(dir)
+  local handle = uv.fs_scandir(dir)
   if not handle then return repos end
   while true do
-    local name, t = vim.uv.fs_scandir_next(handle)
+    local name, t = uv.fs_scandir_next(handle)
     if not name then break end
     if (t == "directory" or t == "link") and not name:match("^%.") then
       local full = dir .. "/" .. name

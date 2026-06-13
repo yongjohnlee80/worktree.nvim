@@ -499,6 +499,130 @@ do
   vim.fn.delete(plainparent, "rf")
 end
 
+-- ───────── [9] ADR-0041 A+B+C — async diff, durable writes, guards ─────────
+print("\n[9] ADR-0041 A+B+C — async diff path, atomic gitfile/session, scope-local float")
+do
+  local graph = require("worktree.graph")
+  local session = require("worktree.session")
+  local sdir = vim.fn.stdpath("state") .. "/worktree-sessions"
+  local function session_file_for(cwd)
+    local norm = require("worktree.git").norm(cwd)
+    return sdir .. "/" .. vim.fn.sha256(norm):sub(1, 16) .. ".json"
+  end
+
+  -- 9a. Batch B: write_gitfile is atomic — exact content, no strays.
+  local gdir = vim.fn.tempname() .. "_p9-gitfile"
+  vim.fn.mkdir(gdir, "p")
+  local g_ok, g_err = wt._write_gitfile(gdir, ".bare")
+  ok("9a: write_gitfile succeeds", g_ok == true, tostring(g_err))
+  local gf = io.open(gdir .. "/.git", "r")
+  local g_content = gf and gf:read("*a") or ""
+  if gf then gf:close() end
+  ok("9a: gitfile content exact", g_content == "gitdir: ./.bare\n",
+    vim.inspect(g_content))
+  local g_strays = vim.fn.glob(gdir .. "/.tmp-*", false, true)
+  ok("9a: no atomic-write temp strays", #g_strays == 0, vim.inspect(g_strays))
+
+  -- 9b. Batch B + E head-start: session save/load roundtrip (this
+  -- module had ZERO coverage), atomic on disk, malformed input
+  -- tolerated, C6 focused type-guard.
+  -- Resolve through symlinks so the cwd we pass matches the paths
+  -- nvim stores in buffer names (macOS /tmp → /private/tmp). This is
+  -- the known env class (task 2026-05-26-fix-macos-symlink-…), not an
+  -- ADR-0041 concern — the fixture just stays deterministic across it.
+  local scwd = vim.fn.resolve(vim.fn.tempname() .. "_p9-sess")
+  vim.fn.mkdir(scwd, "p")
+  for _, name in ipairs({ "one.txt", "two.txt" }) do
+    local fh = assert(io.open(scwd .. "/" .. name, "w"))
+    fh:write(name .. "\n")
+    fh:close()
+    -- :edit (not :badd) so the buffer is LOADED — session.save's
+    -- is_tracked filter (correctly) skips unloaded buffers.
+    vim.cmd("edit " .. vim.fn.fnameescape(scwd .. "/" .. name))
+  end
+  local s_ok, s_count = session.save(scwd)
+  ok("9b: session.save persists tracked buffers", s_ok == true and s_count == 2,
+    string.format("ok=%s count=%s", tostring(s_ok), tostring(s_count)))
+  ok("9b: session file exists at the hashed path",
+    vim.fn.filereadable(session_file_for(scwd)) == 1)
+  local s_strays = vim.fn.glob(sdir .. "/.tmp-*", false, true)
+  ok("9b: no temp strays in sessions dir", #s_strays == 0, vim.inspect(s_strays))
+  for _, name in ipairs({ "one.txt", "two.txt" }) do
+    local b = vim.fn.bufnr(scwd .. "/" .. name)
+    if b ~= -1 then pcall(vim.api.nvim_buf_delete, b, { force = true }) end
+  end
+  local l_ok, l_count = session.load(scwd)
+  ok("9b: session.load restores the buffer list", l_ok == true and l_count == 2,
+    string.format("ok=%s count=%s", tostring(l_ok), tostring(l_count)))
+
+  -- malformed JSON → (false, 0); C6: non-string `focused` tolerated.
+  local mcwd = vim.fn.resolve(vim.fn.tempname() .. "_p9-bad")
+  vim.fn.mkdir(mcwd, "p")
+  session.save(mcwd)
+  local mfile = session_file_for(mcwd)
+  local bh = assert(io.open(mfile, "w"))
+  bh:write("{ not json")
+  bh:close()
+  local bad_ok, bad_count = session.load(mcwd)
+  ok("9b: malformed session JSON tolerated", bad_ok == false and bad_count == 0,
+    string.format("ok=%s count=%s", tostring(bad_ok), tostring(bad_count)))
+  local ch = assert(io.open(mfile, "w"))
+  ch:write(vim.json.encode({ cwd = mcwd, buffers = {}, focused = 12345 }))
+  ch:close()
+  local c6_ok = pcall(session.load, mcwd)
+  ok("9b: C6 — non-string `focused` does not error", c6_ok == true)
+
+  -- 9c. Batch A/S2: diff float from pre-fetched lines; LOCAL window
+  -- options; global defaults survive.
+  local function gopt(name)
+    return vim.api.nvim_get_option_value(name, { scope = "global" })
+  end
+  local wrap_before = gopt("wrap")
+  graph._open_diff_float({ label = "p9" }, { hash = "deadbeefdead" },
+    { "diff --git a/x b/x", "+p9 line" })
+  local float_win = vim.api.nvim_get_current_win()
+  ok("9c: diff float opened with fetched lines",
+    vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "diff --git a/x b/x")
+  ok("9c: float wrap is LOCAL false",
+    vim.api.nvim_get_option_value("wrap", { win = float_win }) == false)
+  ok("9c: GLOBAL wrap default survived", gopt("wrap") == wrap_before)
+  pcall(vim.api.nvim_win_close, float_win, true)
+
+  -- 9d. Batch A: async commit diff end-to-end against a real repo —
+  -- the float arrives via show_diff_async's main-loop callback.
+  local arepo = vim.fn.tempname() .. "_p9-async"
+  vim.fn.mkdir(arepo, "p")
+  vim.system({ "git", "-C", arepo, "init", "-q" }):wait()
+  vim.system({ "git", "-C", arepo, "config", "user.email", "p9@test" }):wait()
+  vim.system({ "git", "-C", arepo, "config", "user.name", "p9" }):wait()
+  local af = assert(io.open(arepo .. "/f.txt", "w")); af:write("p9\n"); af:close()
+  vim.system({ "git", "-C", arepo, "add", "." }):wait()
+  vim.system({ "git", "-C", arepo, "commit", "-q", "-m", "p9 commit" }):wait()
+  local sha = vim.trim(vim.fn.system({ "git", "-C", arepo, "rev-parse", "HEAD" }))
+  local common = vim.trim(vim.fn.system({ "git", "-C", arepo,
+    "rev-parse", "--path-format=absolute", "--git-common-dir" }))
+  local ok_core = pcall(require, "auto-core")
+  if ok_core and sha ~= "" then
+    local before_win = vim.api.nvim_get_current_win()
+    graph._show_commit_diff({ common_dir = common, label = "p9" }, { hash = sha })
+    local opened = vim.wait(4000, function()
+      return vim.api.nvim_get_current_win() ~= before_win
+    end, 10)
+    ok("9d: async commit diff opens the float", opened)
+    if opened then
+      local first = vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] or ""
+      ok("9d: float carries the commit diff",
+        first:find("commit", 1, true) ~= nil or first:find("diff", 1, true) ~= nil,
+        first)
+      pcall(vim.api.nvim_win_close, vim.api.nvim_get_current_win(), true)
+    end
+    ok("9d: preview generation hook exported",
+      type(graph._preview_generation) == "number")
+  else
+    ok("9d: async path needs auto-core (skipped — soft-dep absent)", true)
+  end
+end
+
 -- ───────────────────── summary ─────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then

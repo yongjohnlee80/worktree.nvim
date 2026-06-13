@@ -73,9 +73,19 @@ function M.save(cwd)
 
   vim.fn.mkdir(sessions_dir(), "p")
   local path = session_path(cwd)
-  local f, err = io.open(path, "w")
+  local encoded = vim.json.encode({ cwd = cwd, buffers = files, focused = focused })
+  -- ADR-0041 Batch B: atomic when auto-core >= 0.1.58 is present —
+  -- a crash mid-write previously truncated the session file. Raw
+  -- write remains as the soft-dep fallback.
+  local ok_atomic, atomic = pcall(require, "auto-core.fs.atomic")
+  if ok_atomic and type(atomic.write) == "function" then
+    local wok = atomic.write(path, encoded)
+    if not wok then return false, 0 end
+    return true, #files
+  end
+  local f = io.open(path, "w")
   if not f then return false, 0 end
-  f:write(vim.json.encode({ cwd = cwd, buffers = files, focused = focused }))
+  f:write(encoded)
   f:close()
   return true, #files
 end
@@ -103,7 +113,9 @@ function M.load(cwd)
   -- lands us on when the new worktree has no buffers yet), upgrade it to
   -- the focused file so the user doesn't have to :bnext to see anything.
   local current_name = vim.api.nvim_buf_get_name(0)
-  if current_name == "" and data.focused
+  -- ADR-0041 C6: type-guard `focused` — a hand-edited or corrupted
+  -- session file with a non-string value reached filereadable raw.
+  if current_name == "" and type(data.focused) == "string"
     and vim.fn.filereadable(data.focused) == 1
   then
     pcall(vim.cmd, "silent! edit " .. vim.fn.fnameescape(data.focused))

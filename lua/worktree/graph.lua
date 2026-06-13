@@ -324,6 +324,17 @@ local function current_commit_hash()
   return commit.hash
 end
 
+-- ADR-0041 Batch A (redeems ADR-0038 D1): the preview previously
+-- called the SYNC show_stat here — on a cache miss that blocked the
+-- main loop 100-500ms per cursor move. Now placeholder-then-fill via
+-- show_stat_async (auto-core >= 0.1.58: vim.system off-thread, shared
+-- cache, same-key in-flight coalescing). The generation counter
+-- guards CROSS-key staleness: rapid cursor movement fires async
+-- requests for different commits, and a slow older response must not
+-- overwrite a newer preview (same-key dedup is auto-core's job).
+-- Test hook: M._preview_generation.
+M._preview_generation = 0
+
 local function update_preview_now(repo)
   if not state.mfloat then return end
   local pv_buf = state.mfloat:bufnr("preview")
@@ -338,12 +349,29 @@ local function update_preview_now(repo)
     set_buf_lines(pv_buf, { "(auto-core.git.graph not available)" })
     return
   end
-  local lines = core.git.graph.show_stat(repo.common_dir, hash)
-  set_buf_lines(pv_buf, lines)
-  -- git filetype highlighting on the stat output.
-  if vim.api.nvim_buf_is_valid(pv_buf) then
-    vim.bo[pv_buf].filetype = "git"
+  M._preview_generation = M._preview_generation + 1
+  local gen = M._preview_generation
+  if type(core.git.graph.show_stat_async) ~= "function" then
+    -- auto-core < 0.1.58 — keep the old sync behavior rather than
+    -- silently showing nothing (soft-dep version skew tolerance).
+    local lines = core.git.graph.show_stat(repo.common_dir, hash)
+    set_buf_lines(pv_buf, lines)
+    if vim.api.nvim_buf_is_valid(pv_buf) then
+      vim.bo[pv_buf].filetype = "git"
+    end
+    return
   end
+  set_buf_lines(pv_buf, { "(loading " .. hash:sub(1, 12) .. " …)" })
+  core.git.graph.show_stat_async(repo.common_dir, hash, function(lines)
+    -- stale-response guard: a newer cursor move owns the pane now.
+    if gen ~= M._preview_generation then return end
+    if not state.mfloat then return end
+    local buf_now = state.mfloat:bufnr("preview")
+    if not buf_now or not vim.api.nvim_buf_is_valid(buf_now) then return end
+    set_buf_lines(buf_now, lines)
+    -- git filetype highlighting on the stat output.
+    vim.bo[buf_now].filetype = "git"
+  end)
 end
 
 local function schedule_preview(repo)
@@ -361,14 +389,13 @@ end
 
 -- ── diff float (CR handler) ──────────────────────────────────
 
-function M._show_commit_diff(repo, commit)
-  local core = _core()
-  if not (core and core.git and core.git.graph) then return end
-  local lines = core.git.graph.show_diff(repo.common_dir, commit.hash)
-  if not lines or #lines == 0 then
-    log("git show -p produced no output", vim.log.levels.WARN)
-    return
-  end
+---Open the bespoke diff float for already-fetched lines. Split out
+---of M._show_commit_diff so the async fetch path (ADR-0041 Batch A)
+---and the range-diff path can share it.
+---@param repo table
+---@param commit table
+---@param lines string[]
+local function open_diff_float(repo, commit, lines)
   -- Use vim.api.nvim_open_win directly for the diff float; our
   -- single-float helper would also work but the title + zindex
   -- shape is bespoke enough that inline is clearer here.
@@ -398,8 +425,11 @@ function M._show_commit_diff(repo, commit)
     title_pos = "center",
     zindex    = 50,
   })
-  vim.wo[win].wrap = false
-  vim.wo[win].winhighlight = "Normal:NormalFloat,FloatBorder:FloatBorder"
+  -- ADR-0041 S2 (ADR-0028 hardening): explicit scope-local writes.
+  vim.api.nvim_set_option_value("wrap", false, { win = win, scope = "local" })
+  vim.api.nvim_set_option_value("winhighlight",
+    "Normal:NormalFloat,FloatBorder:FloatBorder",
+    { win = win, scope = "local" })
   pcall(vim.api.nvim_win_set_cursor, win, { 1, 0 })
   local function close()
     if vim.api.nvim_win_is_valid(win) then
@@ -409,13 +439,35 @@ function M._show_commit_diff(repo, commit)
   vim.keymap.set("n", "q",     close, { buffer = buf, silent = true })
   vim.keymap.set("n", "<Esc>", close, { buffer = buf, silent = true })
 end
+M._open_diff_float = open_diff_float -- test hook
+
+---ADR-0041 Batch A: fetch the commit diff OFF the UI thread, then
+---open the float when the lines arrive. Previously the sync
+---show_diff blocked the main loop on cache miss. Falls back to the
+---sync API when auto-core predates the async surface (< 0.1.58).
+function M._show_commit_diff(repo, commit)
+  local core = _core()
+  if not (core and core.git and core.git.graph) then return end
+  local function on_lines(lines)
+    if not lines or #lines == 0 then
+      log("git show -p produced no output", vim.log.levels.WARN)
+      return
+    end
+    open_diff_float(repo, commit, lines)
+  end
+  if type(core.git.graph.show_diff_async) == "function" then
+    core.git.graph.show_diff_async(repo.common_dir, commit.hash, on_lines)
+  else
+    on_lines(core.git.graph.show_diff(repo.common_dir, commit.hash))
+  end
+end
 
 function M._show_range_diff(repo, from, to)
   local core = _core()
   if not (core and core.git and core.git.graph) then return end
   -- Range diff: assemble manually via show_diff isn't ideal; fall
   -- back to a fresh git diff against a range. Cache key per (range)
-  -- is a separate concern — Phase 3 keeps it simple by re-running.
+  -- is a separate concern — kept simple by re-running.
   local cmd = {
     "git", "--git-dir=" .. repo.common_dir,
     "diff", "--no-color", from.hash .. "~1.." .. to.hash,
@@ -425,12 +477,14 @@ function M._show_range_diff(repo, from, to)
     log("git diff range failed", vim.log.levels.ERROR)
     return
   end
-  M._show_commit_diff(repo, {
+  -- ADR-0041 (P3): open the float with the lines we just fetched.
+  -- The old path discarded them and re-fetched through
+  -- _show_commit_diff with a pseudo range hash (the double git
+  -- invocation its own TODO admitted to — and the re-fetch ran
+  -- `git show` against a range label, not the diff we computed).
+  open_diff_float(repo, {
     hash = from.hash:sub(1, 8) .. ".." .. to.hash:sub(1, 8),
-  })
-  -- ... actually inline the full path so we don't double-fetch:
-  local _ = lines  -- TODO: reuse to avoid the double git invocation;
-                    -- left as-is for Phase 3 brevity.
+  }, lines)
 end
 
 -- ── select_repo ──────────────────────────────────────────────
@@ -448,11 +502,16 @@ select_repo = function(idx)
   render_left()
 
   -- Bind cursor-move preview on the middle pane.
+  -- ADR-0041 C3: explicit guard + captured autocmd id. Correctness
+  -- previously rested on clear-before-add plus the float teardown
+  -- deleting the augroup; now the id is owned in state and removed
+  -- deterministically in M.close().
   if state.mfloat and state.mfloat._augroup then
-    pcall(vim.api.nvim_clear_autocmds, {
-      group = state.mfloat._augroup, event = { "CursorMoved" },
-    })
-    vim.api.nvim_create_autocmd("CursorMoved", {
+    if state.preview_autocmd_id then
+      pcall(vim.api.nvim_del_autocmd, state.preview_autocmd_id)
+      state.preview_autocmd_id = nil
+    end
+    state.preview_autocmd_id = vim.api.nvim_create_autocmd("CursorMoved", {
       group = state.mfloat._augroup,
       callback = function()
         local mid = state.mfloat and state.mfloat:winid("middle")
@@ -1092,6 +1151,12 @@ function M.close()
       state.preview_timer:stop(); state.preview_timer:close()
     end)
     state.preview_timer = nil
+  end
+  -- ADR-0041 C3: deterministic autocmd teardown (the id is ours, the
+  -- augroup is the float's — don't rely on dispose order).
+  if state.preview_autocmd_id then
+    pcall(vim.api.nvim_del_autocmd, state.preview_autocmd_id)
+    state.preview_autocmd_id = nil
   end
   if state.mfloat then
     state.mfloat:dispose()

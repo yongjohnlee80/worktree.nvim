@@ -22,7 +22,11 @@ the same `vim.ui.select` prompt UX you know.
   parsers, the multi-pane float primitive, the workspace-root state
   surface, the tech-stack-aware LSP reset on switch, and the
   fetch/pull/destroy mutating ops. The legacy in-tree `git_legacy.lua`
-  fallback retires after one minor release.
+  fallback retires after one minor release. **≥ 0.1.58** additionally
+  powers the graph preview's non-blocking `show_stat_async` and the
+  crash-safe `fs.atomic.write` used for the gitfile/session writes
+  (v0.4.9 / ADR-0041); on older auto-core those paths fall back to the
+  prior synchronous / non-atomic behavior.
 - [`isakbm/gitgraph.nvim`](https://github.com/isakbm/gitgraph.nvim) —
   optional, only required for the graph view. The graph dashboard
   delegates to it for the actual character-art commit rendering.

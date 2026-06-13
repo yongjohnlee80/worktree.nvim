@@ -233,8 +233,17 @@ local function refresh_file_tree()
   end
 
   local cwd = vim.fn.fnameescape(vim.fn.getcwd())
+  -- ADR-0041 C4: a failed tree refresh was completely silent (both
+  -- the command and the fallback swallowed) — the user just saw a
+  -- stale tree with no diagnostic.
   local ok = pcall(vim.cmd, "Neotree dir=" .. cwd)
-  if not ok then pcall(manager.refresh, "filesystem") end
+  if not ok then
+    local fb_ok = pcall(manager.refresh, "filesystem")
+    if not fb_ok then
+      require("worktree.log").warn(
+        "file-tree refresh failed after worktree switch (Neotree dir + manager.refresh both errored)")
+    end
+  end
 end
 
 -- Stop workspace-rooted LSP clients and re-fire FileType on every loaded
@@ -292,7 +301,16 @@ local function restart_workspace_lsps()
   --      doubles the running LSP set.
   --   2. LSP attach events triggering neo-tree's `follow_current_file`
   --      to re-anchor the file tree back to the old worktree.
+  --
+  -- ADR-0041 C2: generation-stamp the deferred re-attach. Two
+  -- switches inside the 150ms window previously raced — the stale
+  -- timer re-fired FileType against the OLD worktree's cwd,
+  -- re-attaching LSPs to the workspace the user just left. Only the
+  -- newest scheduled re-attach may run.
+  M._lsp_reattach_generation = (M._lsp_reattach_generation or 0) + 1
+  local gen = M._lsp_reattach_generation
   vim.defer_fn(function()
+    if gen ~= M._lsp_reattach_generation then return end
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buftype == "" then
         if vim.bo[bufnr].filetype ~= "" then
@@ -779,14 +797,25 @@ end
 -- Write a gitfile at `<dir>/.git` pointing at `./<bare_rel>`. Makes
 -- `git -C <dir>` discover the bare repo automatically so the rest of the
 -- plugin (collect_worktrees, list_child_repos, etc.) finds it.
+--
+-- ADR-0041 Batch B: this is the single worst-consequence write in the
+-- plugin — a truncated gitfile means git can't resolve the repo at all.
+-- Delegate to auto-core's temp→fsync→rename primitive when available
+-- (>= 0.1.58); keep the raw write only as the soft-dep fallback.
 local function write_gitfile(dir, bare_rel)
   local path = dir .. "/.git"
+  local content = "gitdir: ./" .. bare_rel .. "\n"
+  local ok_atomic, atomic = pcall(require, "auto-core.fs.atomic")
+  if ok_atomic and type(atomic.write) == "function" then
+    return atomic.write(path, content)
+  end
   local f, err = io.open(path, "w")
   if not f then return false, err or "unknown error" end
-  f:write("gitdir: ./" .. bare_rel .. "\n")
+  f:write(content)
   f:close()
   return true
 end
+M._write_gitfile = write_gitfile -- ADR-0041 test hook
 
 -- Create the first worktree on `branch` under `<repo_dir>/<branch>` and
 -- `:cd` into it. Called after clone/init so the user lands in a usable

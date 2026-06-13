@@ -2,6 +2,62 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.9] — 2026-06-14 — ADR-0041 Batches A+B+C: async graph preview, durable writes, correctness sweep
+
+Implements the recommended batches from ADR-0041 (the worktree.nvim instalment
+of the family enhancement programme; audit in the KB at
+`shared/adrs/0041-worktree-structural-and-performance-enhancements.md`,
+lector-reviewed in parallel). Batch D (`git_legacy.lua` retirement via an
+auto-core hard dependency) is intentionally **not** in this release — it awaits
+an explicit dependency-policy decision. Public API unchanged.
+
+**Batch A — async commit-graph preview** *(redeems the deferred ADR-0038 D1
+migration)* *(UX change)*: the graph's right-pane stat preview previously
+called auto-core's **synchronous** `show_stat` on every (debounced) cursor
+move — a cache miss froze the editor 100–500ms per commit. It now uses
+`show_stat_async` (auto-core ≥ 0.1.58): a `(loading <hash> …)` placeholder
+appears immediately and the stat fills in from the off-thread callback. A
+generation counter guards cross-commit staleness (a slow response for an
+earlier commit can't overwrite a newer preview). The `<CR>` commit-diff and the
+range-diff float likewise moved to `show_diff_async`. Both fall back to the sync
+API when auto-core predates the async surface (soft-dep version skew). Fixed the
+range-diff's long-standing double-`git`-invocation (its own `TODO`): it now
+opens the float with the lines it already fetched instead of discarding them and
+re-running `git show` against a range label.
+
+**Batch B — durable writes** (delegate-when-available under the current
+soft-dep): `write_gitfile` — the `.git` pointer written during clone/init, whose
+truncation breaks a worktree outright — and the per-worktree session file now
+go through `auto-core.fs.atomic.write` (temp→fsync→rename) when auto-core ≥
+0.1.58 is present, with the raw write kept only as the fallback. Session load
+gained a type guard on the `focused` field (a corrupted/hand-edited non-string
+value previously reached `filereadable` raw).
+
+**Batch C — correctness sweep:**
+- LSP-restart re-attach is now generation-stamped — two worktree switches inside
+  the 150ms defer window previously raced, re-firing `FileType` (and thus LSP
+  attach) against the *old* worktree's cwd. Only the newest scheduled re-attach
+  runs.
+- The graph's per-selection `CursorMoved` autocmd id is captured in state and
+  deleted deterministically in `M.close()`, with an explicit augroup guard
+  (correctness no longer rests on clear-before-add plus float teardown order).
+- The file-tree refresh after a worktree switch logs a warning when both the
+  `Neotree dir=` command and the `manager.refresh` fallback fail (was fully
+  silent).
+- The two diff-float window-option writes are explicit `nvim_set_option_value`
+  scope-local (ADR-0028 hardening).
+- `git_legacy.lua` gained the `vim.uv or vim.loop` compatibility fallback the
+  rest of the codebase uses.
+
+**Tests.** New smoke section `[9]` (+15 assertions): atomic gitfile content +
+no temp strays; session save/load roundtrip (this module had **zero** coverage —
+a Batch E head-start), malformed-JSON tolerance, the `focused` type guard;
+scope-local diff-float options with global-default survival; and the async
+commit-diff end-to-end against a real repo (float arrives via the main-loop
+callback). Suite: **61 passed / 2 failed** — the 2 are the pre-existing
+`ensure_root` macOS `/private/tmp` symlink-class failures, unchanged from the
+v0.4.8 baseline of 46/2 (this release added 15 assertions, 0 regressions).
+
 ## [v0.4.8] — 2026-06-04 — workspace root pins a stable project identity
 
 **Need**: the session-start capture pinned `core.workspace_root` to
