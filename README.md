@@ -17,16 +17,18 @@ the same `vim.ui.select` prompt UX you know.
 ### Dependencies
 
 - **Neovim ≥ 0.10** (for `vim.system`) and `git`.
-- [`auto-core.nvim`](https://github.com/yongjohnlee80/auto-core.nvim) —
-  required as of v0.4.0. Provides the canonical `git.worktree`
-  parsers, the multi-pane float primitive, the workspace-root state
-  surface, the tech-stack-aware LSP reset on switch, and the
-  fetch/pull/destroy mutating ops. The legacy in-tree `git_legacy.lua`
-  fallback retires after one minor release. **≥ 0.1.58** additionally
-  powers the graph preview's non-blocking `show_stat_async` and the
-  crash-safe `fs.atomic.write` used for the gitfile/session writes
-  (v0.4.9 / ADR-0041); on older auto-core those paths fall back to the
-  prior synchronous / non-atomic behavior.
+- [`auto-core.nvim`](https://github.com/yongjohnlee80/auto-core.nvim)
+  **≥ 0.1.58** — a hard dependency (no fallback). Provides the
+  canonical `git.repo` / `git.worktree` implementations, the
+  multi-pane float primitive, the workspace-root state surface, the
+  tech-stack-aware LSP reset on switch, the fetch/pull/destroy
+  mutating ops, the graph preview's non-blocking `show_stat_async` /
+  `show_diff_async`, and the crash-safe `fs.atomic.write` used for the
+  gitfile/session writes. The in-tree `git_legacy.lua` fallback that
+  shipped during the v0.4.0 migration was **removed in v0.4.10**
+  (ADR-0041 Batch D) — auto-core has been the canonical implementation
+  since its v0.0.7, and standalone (no-auto-core) operation is no
+  longer supported.
 - [`isakbm/gitgraph.nvim`](https://github.com/isakbm/gitgraph.nvim) —
   optional, only required for the graph view. The graph dashboard
   delegates to it for the actual character-art commit rendering.

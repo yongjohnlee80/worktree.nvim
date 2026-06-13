@@ -64,20 +64,22 @@ for _, fn in ipairs({
 end
 
 -- ───────── 2. git.lua dispatcher: auto-core present and absent ─────────
-print("\n[2] git.lua dispatcher (auto-core soft-dep + legacy fallback)")
+print("\n[2] git.lua facade over auto-core (ADR-0041 Batch D — legacy fallback removed)")
 local git_mod = require("worktree.git")
 git_mod._reset_for_tests()
 
--- Sanity: a function that exists in BOTH auto-core and legacy returns
--- a value through the dispatcher.
+-- The 4 worktree-local helpers are now inlined (no auto-core
+-- equivalent); they must work and need no auto-core delegation.
 local norm = git_mod.norm("/tmp/foo/")
-ok("git.norm strips trailing slash",
+ok("git.norm strips trailing slash (inlined helper)",
   norm == "/tmp/foo", "got=" .. tostring(norm))
+local code, out = git_mod.run({ "git", "--version" })
+ok("git.run returns (code, output) — inlined helper",
+  code == 0 and type(out) == "string" and out:find("git version", 1, true) ~= nil,
+  "code=" .. tostring(code))
 
--- With auto-core on the runtimepath, parse_porcelain delegates to
--- auto-core (which has the canonical impl). We can't directly check
--- which path was taken, but the result should match the legacy
--- result on the same input.
+-- parse_porcelain now delegates UNCONDITIONALLY to auto-core's
+-- canonical impl. Same shape as before the migration.
 local sample = {
   "worktree /repos/proj/main",
   "HEAD aaa",
@@ -89,7 +91,7 @@ local sample = {
   "",
 }
 local parsed = git_mod.parse_porcelain(sample)
-ok("parse_porcelain returns a non-empty list", #parsed >= 2,
+ok("parse_porcelain delegates to auto-core (non-empty list)", #parsed >= 2,
   "len=" .. tostring(#parsed))
 ok("parse_porcelain entry 1 path",
   parsed[1] and parsed[1].path == "/repos/proj/main",
@@ -98,27 +100,9 @@ ok("parse_porcelain entry 2 branch",
   parsed[2] and parsed[2].branch == "feature",
   vim.inspect(parsed[2]))
 
--- Exercise the legacy-fallback path: mask auto-core temporarily,
--- re-arm the probe, run a delegate, confirm same shape.
-local saved_core = package.loaded["auto-core"]
-package.loaded["auto-core"] = nil
-package.preload["auto-core"] = function() error("auto-core unavailable") end
-git_mod._reset_for_tests()
-local parsed_legacy = git_mod.parse_porcelain(sample)
-ok("legacy fallback parse_porcelain works without auto-core",
-  parsed_legacy[1] and parsed_legacy[1].path == "/repos/proj/main")
--- Restore auto-core for subsequent tests.
-package.preload["auto-core"] = nil
-package.loaded["auto-core"] = saved_core
-git_mod._reset_for_tests()
--- worktree.log caches `core_log` at module-load time. Running the
--- legacy-fallback dance above forces `worktree.log` to load under the
--- no-auto-core preload (the git.lua probe emits a warn through it),
--- which freezes `core_log = nil` for the rest of the session. Drop
--- the loaded module so the next `require("worktree.log")` re-probes
--- and picks up the now-restored auto-core. Section [8] depends on
--- the live wrapper to assert routing.
-package.loaded["worktree.log"] = nil
+-- Batch D: the legacy module is gone — require must fail.
+local has_legacy = pcall(require, "worktree.git_legacy")
+ok("worktree.git_legacy is removed (require fails)", has_legacy == false)
 
 -- ───────── 3. set_root / get_root write-through ─────────
 print("\n[3] set_root / get_root write through to core.workspace_root")

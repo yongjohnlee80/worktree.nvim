@@ -2,6 +2,40 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.4.10] — 2026-06-14 — ADR-0041 Batch D: retire `git_legacy.lua`, auto-core is now a hard dependency
+
+**Breaking (dependency policy):** `auto-core.nvim ≥ 0.1.58` is now a **hard
+dependency**. The in-tree `git_legacy.lua` fallback (298 lines) — kept since
+the v0.4.0 migration "for one minor release" per ADR-0007, long lapsed — has
+been **removed**, and standalone (no-auto-core) operation is no longer
+supported. The README has declared auto-core "required as of v0.4.0" since that
+release and stated the fallback would retire; this completes that deprecation.
+auto-core has been the canonical implementation since its v0.0.7, so installs
+that already have it (every AutoVim setup) see **no behavior change**.
+
+**What changed:**
+- `git.lua` is now a thin facade: it delegates all 19 git APIs
+  **unconditionally** to `auto-core.git.repo` / `auto-core.git.worktree` (the
+  soft-dep probe + dispatcher indirection is gone), with a clear error if
+  auto-core's git subsystem is somehow absent.
+- The 4 worktree-local helpers that had no auto-core equivalent (`norm`,
+  `has_uncommitted`, `run`, `run_with_stdin`) are **inlined into `git.lua`**
+  verbatim — same signatures, same behavior. External
+  `require("worktree.git").*` callers see an identical public surface.
+- `lua/worktree/git_legacy.lua` deleted (−298 lines; net −~250 after the
+  inlined helpers).
+
+**Public API:** unchanged. `require("worktree.git").*` keeps every function and
+signature; only the (undocumented) internal dispatcher and the deleted
+`require("worktree.git_legacy")` module are gone.
+
+**Tests.** Smoke `[2]` rewritten: the legacy-fallback masking dance (and its
+`worktree.log` reload workaround) is removed; it now asserts the inlined
+helpers work, that `parse_porcelain` delegates to auto-core, and that
+`require("worktree.git_legacy")` fails. Suite: **62 passed / 2 failed** — the
+2 are the pre-existing `ensure_root` macOS `/private/tmp` symlink-class
+failures, unchanged.
+
 ## [v0.4.9] — 2026-06-14 — ADR-0041 Batches A+B+C: async graph preview, durable writes, correctness sweep
 
 Implements the recommended batches from ADR-0041 (the worktree.nvim instalment
