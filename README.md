@@ -18,7 +18,7 @@ the same `vim.ui.select` prompt UX you know.
 
 - **Neovim ≥ 0.10** (for `vim.system`) and `git`.
 - [`auto-core.nvim`](https://github.com/yongjohnlee80/auto-core.nvim)
-  **≥ 0.1.58** — a hard dependency (no fallback). Provides the
+  **≥ 0.1.70** — a hard dependency (no fallback). Provides the
   canonical `git.repo` / `git.worktree` implementations, the
   multi-pane float primitive, the workspace-root state surface, the
   tech-stack-aware LSP reset on switch, the fetch/pull/destroy

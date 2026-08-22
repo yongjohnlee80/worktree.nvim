@@ -1,0 +1,283 @@
+---worktree.repos — the repos-panel backend surface.
+---
+---ADR-0060 §2.1/§2.2. This is worktree.nvim's equivalent of `autodb.session`:
+---the ONE module a frontend consumes. auto-finder's repos view is a renderer
+---over this and holds no git knowledge of its own, exactly as its dbase view
+---holds no database knowledge.
+---
+---The tree it describes:
+---
+---    repo                       repos()
+---      worktree      ● watched  worktrees(repo)
+---        UNCOMMITTED            children(repo, worktree) -> kind="uncommitted"
+---          <changed file>       uncommitted(worktree)
+---        <commit>               children(...) -> kind="commit"
+---          <changed file>       commit_files(repo, sha)
+---          <review json>        reviews(repo, sha)
+---
+---Every git read is delegated to auto-core (`git.graph.fan_out`,
+---`git.worktree.parse_porcelain`, `git.log.*`) — this module owns the POLICY
+---(what a watch means, which base a branch is compared against, where reviews
+---live), never a git invocation of its own.
+---@module 'worktree.repos'
+
+local watch = require("worktree.watch")
+local review = require("worktree.review")
+local store = require("worktree.store")
+
+local M = {}
+
+---_core returns auto-core, or nil. auto-core is a hard dependency, but a
+---frontend probing availability must get nil rather than an error.
+local function _core()
+  local ok, core = pcall(require, "auto-core")
+  if not ok then return nil end
+  return core
+end
+
+---available reports whether this surface can serve a panel. A frontend calls
+---this to decide between the new view and its fallback, the same way
+---auto-finder's dbase view probes `autodb.session`.
+---@return boolean
+function M.available()
+  local core = _core()
+  return core ~= nil
+    and type(core.git) == "table"
+    and type(core.git.log) == "table"
+    and type(core.git.log.range) == "function"
+    and type(core.git.graph) == "table"
+    and type(core.git.graph.fan_out) == "function"
+end
+
+---@class WorktreeRepo
+---@field common_dir string
+---@field label string
+---@field is_bare boolean
+---@field sample_worktree string?
+---@field slug string          the review-store key
+---@field url string?          origin remote, when the repo has one
+
+---repos lists the repositories under `root` (defaults to the workspace root).
+---
+---Discovery is auto-core's `fan_out`, which already handles bare AND regular
+---repos and collapses a bare repo plus its N worktrees into one entry by
+---canonical common-dir — requirement 3's "most likely the baregit, but it can
+---also be the regular git repo".
+---@param root string?
+---@return WorktreeRepo[]
+function M.repos(root)
+  local core = _core()
+  if not core then return {} end
+  if not root or root == "" then
+    local ok, wt = pcall(require, "worktree")
+    root = ok and (wt.get_root() or wt.ensure_root()) or nil
+  end
+  if not root or root == "" then return {} end
+  local found = core.git.graph.fan_out(root, { max_depth = 3 }) or {}
+  local out = {}
+  for _, r in ipairs(found) do
+    local slug, url = store.remote_slug(r.common_dir)
+    out[#out + 1] = {
+      common_dir = r.common_dir, label = r.label,
+      is_bare = r.is_bare and true or false,
+      sample_worktree = r.sample_worktree,
+      slug = slug, url = url,
+    }
+  end
+  return out
+end
+
+---@class WorktreeWorktree
+---@field path string
+---@field branch string?
+---@field head string?
+---@field detached boolean
+---@field watched boolean
+---@field is_base boolean     this worktree holds the repo's base branch
+
+---worktrees lists a repo's worktrees, each stamped with its watch state.
+---
+---A regular (non-bare) repo yields its single checked-out branch, which is
+---requirement 6 — the caller needs no special case.
+---@param repo WorktreeRepo
+---@return WorktreeWorktree[]
+function M.worktrees(repo)
+  local core = _core()
+  if not core or not repo or not repo.common_dir then return {} end
+  local res = vim.system({
+    "git", "--git-dir=" .. repo.common_dir, "worktree", "list", "--porcelain",
+  }, {}):wait()
+  if res.code ~= 0 then return {} end
+  local entries = core.git.worktree.parse_porcelain(
+    vim.split(res.stdout or "", "\n", { plain = true })) or {}
+  local base = M.base_branch(repo)
+  local out = {}
+  for _, e in ipairs(entries) do
+    if not e.bare then
+      out[#out + 1] = {
+        path = e.path, branch = e.branch, head = e.head,
+        detached = e.detached and true or false,
+        watched = watch.is_watched(e.path),
+        is_base = (e.branch ~= nil and e.branch == base),
+      }
+    end
+  end
+  table.sort(out, function(a, b)
+    -- Base branch first, then alphabetical: the base is the reference point
+    -- every other worktree is compared against.
+    if a.is_base ~= b.is_base then return a.is_base end
+    return tostring(a.branch or a.path) < tostring(b.branch or b.path)
+  end)
+  return out
+end
+
+---base_branch resolves the branch a repo's work diverges FROM.
+---
+---Order: the remote's own default (`origin/HEAD`), then a local `main`, then
+---`master`. Cached per common-dir for the process — this shells git and the
+---answer changes only when someone re-points origin.
+---@param repo WorktreeRepo|string
+---@return string? branch
+local _base_cache = {}
+function M.base_branch(repo)
+  local common = type(repo) == "table" and repo.common_dir or repo
+  if not common or common == "" then return nil end
+  if _base_cache[common] ~= nil then
+    return _base_cache[common] ~= false and _base_cache[common] or nil
+  end
+  local core = _core()
+  -- worktree.git.default_branch delegates to auto-core and already knows the
+  -- origin/HEAD trick; prefer it so the answer matches the rest of the plugin.
+  local ok_git, wgit = pcall(require, "worktree.git")
+  if ok_git and type(wgit.default_branch) == "function" then
+    local ok, b = pcall(wgit.default_branch, common)
+    if ok and type(b) == "string" and b ~= "" then
+      _base_cache[common] = b
+      return b
+    end
+  end
+  if core and core.git and core.git.log then
+    for _, cand in ipairs({ "main", "master" }) do
+      if core.git.log.rev_exists(common, cand) then
+        _base_cache[common] = cand
+        return cand
+      end
+    end
+  end
+  _base_cache[common] = false
+  return nil
+end
+
+---@class WorktreeNode
+---@field kind string        "uncommitted" | "commit"
+---@field label string
+---@field sha string?        commit only
+---@field short string?      commit only
+---@field count integer?     uncommitted only: how many files changed
+---@field commit table?      the AutoCoreCommit, commit only
+
+---children lists a watched worktree's UNCOMMITTED node and commits.
+---
+---An UNWATCHED worktree returns nothing at all — that is the whole point of
+---§2.3: no `git log`, no `git status`, no cost. The caller renders a collapsed
+---row and the user opts in.
+---@param repo WorktreeRepo
+---@param wt WorktreeWorktree
+---@param opts { limit: integer?, skip: integer? }?
+---@return WorktreeNode[] nodes, table meta
+function M.children(repo, wt, opts)
+  opts = opts or {}
+  local core = _core()
+  if not core or not repo or not wt then return {}, { mode = "none" } end
+  if not watch.is_watched(wt.path) then
+    return {}, { mode = "unwatched" }
+  end
+
+  local nodes = {}
+
+  -- UNCOMMITTED sorts above the commits: it is the newest state of the tree.
+  local changes = core.git.log.working_changes(wt.path)
+  if #changes > 0 then
+    nodes[#nodes + 1] = {
+      kind = "uncommitted",
+      label = string.format("UNCOMMITTED (%d file%s)", #changes, #changes == 1 and "" or "s"),
+      count = #changes,
+    }
+  end
+
+  local base = M.base_branch(repo)
+  local rev = wt.branch or wt.head or "HEAD"
+  local commits, meta = core.git.log.range(repo.common_dir, {
+    rev = rev, base = base, limit = opts.limit, skip = opts.skip,
+  })
+  for _, c in ipairs(commits) do
+    nodes[#nodes + 1] = {
+      kind = "commit", sha = c.sha, short = c.short,
+      label = c.short .. "  " .. c.subject, commit = c,
+    }
+  end
+  meta.rev = rev
+  return nodes, meta
+end
+
+---uncommitted lists the working-tree changes for the UNCOMMITTED node.
+---@param wt WorktreeWorktree|string
+---@return table[] changes
+function M.uncommitted(wt)
+  local core = _core()
+  if not core then return {} end
+  local path = type(wt) == "table" and wt.path or wt
+  local changes = core.git.log.working_changes(path)
+  return changes
+end
+
+---commit_files lists a commit's changed files.
+---@param repo WorktreeRepo
+---@param sha string
+---@return table[] files
+function M.commit_files(repo, sha)
+  local core = _core()
+  if not core or not repo then return {} end
+  local files = core.git.log.commit_files(repo.common_dir, sha)
+  return files
+end
+
+---reviews lists the review files recorded for a commit — the review-JSON rows
+---the tree shows beside a commit's changed files (requirement 9).
+---@param repo WorktreeRepo
+---@param sha string
+---@return { revision: integer, path: string, name: string }[]
+function M.reviews(repo, sha)
+  if not repo or not repo.slug then return {} end
+  return review.list_for(repo.slug, sha)
+end
+
+---diff returns a commit's parsed diff, ready for the three-column view.
+---@param repo WorktreeRepo
+---@param sha string
+---@return table[] files
+function M.diff(repo, sha)
+  local core = _core()
+  if not core or not repo then return {} end
+  local raw = core.git.graph.show_diff(repo.common_dir, sha)
+  return core.git.diff.parse(raw)
+end
+
+---toggle_watch flips a worktree's watch. Re-exported here so a frontend needs
+---only this module.
+---@param path string
+---@return boolean watched, string? err
+function M.toggle_watch(path) return watch.toggle(path) end
+
+---is_watched is likewise re-exported for the renderer.
+---@param path string
+---@return boolean
+function M.is_watched(path) return watch.is_watched(path) end
+
+---TOPIC_WATCH lets a frontend subscribe without importing `worktree.watch`.
+M.TOPIC_WATCH = watch.TOPIC
+
+---_reset_for_tests clears the base-branch cache.
+function M._reset_for_tests() _base_cache = {} end
+
+return M

@@ -22,7 +22,7 @@ local function _resolve()
   local ok, core = pcall(require, "auto-core")
   assert(ok and type(core) == "table" and type(core.git) == "table"
       and type(core.git.repo) == "table" and type(core.git.worktree) == "table",
-    "worktree.nvim requires auto-core.nvim (>= 0.1.58) with its git "
+    "worktree.nvim requires auto-core.nvim (>= 0.1.70) with its git "
     .. "subsystem — install yongjohnlee80/auto-core.nvim")
   _core_repo = core.git.repo
   _core_wt   = core.git.worktree

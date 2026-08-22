@@ -607,6 +607,259 @@ do
   end
 end
 
+-- ───────────── [10] ADR-0060 P3 — store / watch / review / repos ─────────────
+print("\n[10] ADR-0060 P3 — store, watch registry, review store, repos surface")
+do
+  local store  = require("worktree.store")
+  local watch  = require("worktree.watch")
+  local review = require("worktree.review")
+  local repos  = require("worktree.repos")
+
+  -- Point the store at a temp root so the user's real state is untouched.
+  local sroot = vim.fn.tempname() .. "-p3store"
+  store._root_override = sroot
+  watch._reset_for_tests()
+  repos._reset_for_tests()
+
+  -- ── store: slugs are PATH SEGMENTS, so traversal must be impossible ──
+  ok("10a: ssh remote slug", store.slug("git@github.com:yongjohnlee80/autodb.git")
+    == "yongjohnlee80__autodb", store.slug("git@github.com:yongjohnlee80/autodb.git"))
+  ok("10a: https remote slug", store.slug("https://github.com/yongjohnlee80/autodb")
+    == "yongjohnlee80__autodb")
+  ok("10a: trailing slash + .git both stripped",
+    store.slug("https://github.com/o/r.git/") == "o__r", store.slug("https://github.com/o/r.git/"))
+  ok("10a: the SAME repo keys identically with or without a trailing slash",
+    store.slug("https://github.com/o/r.git/") == store.slug("https://github.com/o/r.git")
+    and store.slug("https://github.com/o/r.git") == store.slug("https://github.com/o/r"),
+    store.slug("https://github.com/o/r.git/") .. " vs " .. store.slug("https://github.com/o/r"))
+  ok("10a: a single-segment name is owner=local",
+    store.slug("autodb") == "local__autodb", store.slug("autodb"))
+  local evil = store.slug("git@h:../../etc/passwd")
+  ok("10a: a traversal attempt cannot produce dots or slashes",
+    evil:find("%.") == nil and evil:find("/") == nil, evil)
+  local evil2 = store.slug("../../../root")
+  ok("10a: a relative path likewise",
+    evil2:find("%.%.") == nil and evil2:find("/") == nil, evil2)
+
+  -- ── store: json round-trip, absent vs corrupt ──
+  local jp = sroot .. "/probe/x.json"
+  ok("10b: write_json creates its directory", select(1, store.write_json(jp, { a = 1 })) == true)
+  ok("10b: read_json round-trips", (store.read_json(jp) or {}).a == 1)
+  local absent, aerr = store.read_json(sroot .. "/nope.json")
+  ok("10b: an ABSENT file is nil with NO error", absent == nil and aerr == nil)
+  vim.fn.writefile({ "{not json" }, sroot .. "/broken.json")
+  local bad, berr = store.read_json(sroot .. "/broken.json")
+  ok("10b: a CORRUPT file is nil WITH an error (a fresh install must be distinguishable)",
+    bad == nil and berr ~= nil, tostring(berr))
+  ok("10b: write_json refuses an empty path", select(1, store.write_json("", {})) == false)
+
+  -- ── watch registry: persistence is the point ──
+  ok("10c: nothing is watched initially", #watch.list() == 0)
+  ok("10c: is_watched is false, not nil", watch.is_watched("/tmp/x") == false)
+  watch.set("/tmp/wt-a", true)
+  watch.set("/tmp/wt-b", true)
+  ok("10c: set() records both", #watch.list() == 2, vim.inspect(watch.list()))
+  ok("10c: is_watched sees them", watch.is_watched("/tmp/wt-a") == true)
+  ok("10c: a trailing slash is the same key", watch.is_watched("/tmp/wt-a/") == true)
+  watch.set("/tmp/wt-a", false)
+  ok("10c: set(false) removes it", watch.is_watched("/tmp/wt-a") == false and #watch.list() == 1)
+  ok("10c: toggle() flips and returns the new state", watch.toggle("/tmp/wt-a") == true)
+  ok("10c: toggle() again flips back", watch.toggle("/tmp/wt-a") == false)
+
+  -- The whole reason this is a file: a restart must remember.
+  watch.set("/tmp/wt-persist", true)
+  watch._reset_for_tests()                     -- simulate a fresh nvim
+  ok("10c: a watch SURVIVES a reload (persisted, ADR-0060 §2.3)",
+    watch.is_watched("/tmp/wt-persist") == true, vim.inspect(watch.list()))
+  ok("10c: the registry file exists on disk",
+    vim.fn.filereadable(store.watches_path()) == 1, store.watches_path())
+
+  -- A corrupt registry must not stop the panel rendering.
+  vim.fn.writefile({ "garbage" }, store.watches_path())
+  watch._reset_for_tests()
+  ok("10c: a CORRUPT registry degrades to empty rather than throwing",
+    (function() local okc, r = pcall(watch.list); return okc and #r == 0 end)())
+  watch._reset_for_tests()
+  watch.set("/tmp/wt-keep", true)
+
+  -- prune drops entries whose worktree is gone.
+  local live = vim.fn.tempname() .. "-live"; vim.fn.mkdir(live, "p")
+  watch.set(live, true)
+  local pruned = watch.prune()
+  ok("10c: prune() drops dead paths and keeps live ones",
+    pruned >= 1 and watch.is_watched(live) == true, tostring(pruned))
+  vim.fn.delete(live, "rf")
+
+  -- ── review store: filename grammar + validation ──
+  ok("10d: filename grammar", review.filename("o__r", "ff24bc5fcc759de", 3)
+    == "o__r@ff24bc5.r3.review.json", review.filename("o__r", "ff24bc5fcc759de", 3))
+  local fs_, fsh, frev = review.parse_filename("o__r@ff24bc5.r3.review.json")
+  ok("10d: parse_filename round-trips", fs_ == "o__r" and fsh == "ff24bc5" and frev == 3)
+  ok("10d: parse_filename rejects a foreign name",
+    select(1, review.parse_filename("notes.md")) == nil)
+
+  local r = review.new({ commit = "ff24bc5fcc759dec047bec7794e4704582696caa",
+    base = "2377bdb", revision = 1, reviewer = "lector",
+    owner = "yongjohnlee80", name = "autodb", verdict = "change_requested",
+    summary = "one must-fix" })
+  ok("10d: new() is valid and stamped", select(1, review.validate(r)) == true
+    and r.schema == review.SCHEMA and r.created ~= nil)
+  r.comments = {
+    { path = "core/auth/sessions.go", line = 134, start_line = 128,
+      side = "RIGHT", start_side = "RIGHT", severity = "must-fix",
+      body = "unix-socket login bypasses the allowlist" },
+    { path = "core/auth/sessions.go", line = 90, side = "RIGHT",
+      severity = "nit", body = "typo", resolved = true },
+    { path = "rpc/server.go", line = 250, side = "RIGHT",
+      severity = "question", body = "why here?" },
+  }
+  ok("10d: validate() accepts a full review", select(1, review.validate(r)) == true,
+    vim.inspect(select(2, review.validate(r))))
+
+  -- The 1-based rule is ENFORCED: a 0 means someone wrote extmark rows into a
+  -- GitHub-native field and every comment would land one line off.
+  local zero = vim.deepcopy(r); zero.comments[1].line = 0
+  local zok, zprob = review.validate(zero)
+  ok("10d: a 0-based line is REJECTED (the ClaudeCodeMention trap)",
+    zok == false and table.concat(zprob, ";"):find("1%-based") ~= nil, vim.inspect(zprob))
+  local badside = vim.deepcopy(r); badside.comments[1].side = "MIDDLE"
+  ok("10d: an unknown side is rejected", select(1, review.validate(badside)) == false)
+  local badsev = vim.deepcopy(r); badsev.comments[1].severity = "meh"
+  ok("10d: a severity outside the ladder is rejected", select(1, review.validate(badsev)) == false)
+  local badschema = vim.deepcopy(r); badschema.schema = "other/9"
+  ok("10d: a foreign schema is rejected", select(1, review.validate(badschema)) == false)
+
+  -- save/load/list
+  local path, serr = review.save("yongjohnlee80__autodb", r)
+  ok("10d: save() writes the file", path ~= nil and vim.fn.filereadable(path) == 1, tostring(serr))
+  ok("10d: save() REFUSES an invalid review (a broken file is worse than none)",
+    select(1, review.save("x__y", { schema = "nope" })) == nil)
+  local back = review.load("yongjohnlee80__autodb", r.commit, 1)
+  ok("10d: load() returns it", back ~= nil and #back.comments == 3)
+  ok("10d: load() of an absent review is nil with no error",
+    (function() local v, e = review.load("yongjohnlee80__autodb", "0000000", 9); return v == nil and e == nil end)())
+
+  local r2 = vim.deepcopy(r); r2.revision = 2
+  review.save("yongjohnlee80__autodb", r2)
+  local listed = review.list_for("yongjohnlee80__autodb", r.commit)
+  ok("10d: list_for() finds both revisions, newest first",
+    #listed == 2 and listed[1].revision == 2, vim.inspect(vim.tbl_map(function(x) return x.revision end, listed)))
+  ok("10d: latest_revision()", review.latest_revision("yongjohnlee80__autodb", r.commit) == 2)
+  ok("10d: latest_revision() is 0 when none exist",
+    review.latest_revision("yongjohnlee80__autodb", "abc1234") == 0)
+
+  local grouped = review.by_path(r)
+  ok("10d: by_path() groups and line-sorts",
+    #grouped["core/auth/sessions.go"] == 2
+    and grouped["core/auth/sessions.go"][1].line == 90,
+    vim.inspect(vim.tbl_keys(grouped)))
+
+  -- github projection
+  local gp = review.github_payload(r)
+  ok("10e: verdict maps to a GitHub event", gp.review_event == "REQUEST_CHANGES", gp.review_event)
+  ok("10e: the summary becomes the body", gp.body == "one must-fix")
+  ok("10e: RESOLVED comments are excluded from the upload", #gp.comments == 2,
+    tostring(#gp.comments))
+  ok("10e: path/line/body are the established /review-pr fields",
+    gp.comments[1].path ~= nil and gp.comments[1].line ~= nil and gp.comments[1].body ~= nil)
+  ok("10e: severity is folded into the body (GitHub has no field for it)",
+    gp.comments[1].body:find("must%-fix") ~= nil, gp.comments[1].body)
+  ok("10e: a range passes through with start_line + start_side",
+    gp.comments[1].start_line == 128 and gp.comments[1].start_side == "RIGHT")
+  ok("10e: an approved verdict maps to APPROVE",
+    review.github_payload({ verdict = "approved" }).review_event == "APPROVE")
+  ok("10e: an unknown verdict degrades to COMMENT",
+    review.github_payload({ verdict = "???" }).review_event == "COMMENT")
+
+  -- ── repos surface over a REAL bare + worktree layout ──
+  ok("10f: available() is true with auto-core >= 0.1.70 present", repos.available() == true)
+
+  local lab = vim.fn.tempname() .. "-p3repo"
+  vim.fn.mkdir(lab, "p")
+  local function G(dir, ...)
+    local argv = { "git", "-C", dir, "-c", "user.email=t@t", "-c", "user.name=t" }
+    for _, a in ipairs({ ... }) do argv[#argv + 1] = a end
+    local res = vim.system(argv, {}):wait()
+    return res.code
+  end
+  -- a plain repo with a base branch and a diverged feature worktree
+  local proj = lab .. "/proj"
+  vim.fn.mkdir(proj, "p")
+  G(proj, "init", "-q", "-b", "main")
+  vim.fn.writefile({ "base" }, proj .. "/a.txt")
+  G(proj, "add", "."); G(proj, "commit", "-q", "-m", "base one")
+  G(proj, "worktree", "add", "-q", "-b", "feature", lab .. "/feature")
+  vim.fn.writefile({ "f" }, lab .. "/feature/f.txt")
+  G(lab .. "/feature", "add", "."); G(lab .. "/feature", "commit", "-q", "-m", "feature work")
+  vim.fn.writefile({ "dirty" }, lab .. "/feature/dirty.txt")
+
+  local found = repos.repos(lab)
+  ok("10f: repos() discovers the repository", #found >= 1, vim.inspect(vim.tbl_map(function(x) return x.label end, found)))
+  local repo = found[1]
+  ok("10f: a repo carries common_dir + slug", repo and repo.common_dir ~= nil and repo.slug ~= nil,
+    vim.inspect(repo and { repo.label, repo.slug }))
+
+  local wts = repos.worktrees(repo)
+  ok("10f: worktrees() lists both", #wts == 2, vim.inspect(vim.tbl_map(function(w) return w.branch end, wts)))
+  ok("10f: the base branch sorts first", wts[1] and wts[1].is_base == true,
+    vim.inspect(vim.tbl_map(function(w) return { w.branch, w.is_base } end, wts)))
+  ok("10f: base_branch() resolves main", repos.base_branch(repo) == "main", tostring(repos.base_branch(repo)))
+
+  local feat
+  for _, w in ipairs(wts) do if w.branch == "feature" then feat = w end end
+  ok("10f: the feature worktree is found and UNWATCHED", feat ~= nil and feat.watched == false)
+
+  -- THE performance contract: an unwatched worktree costs nothing.
+  local nodes, meta = repos.children(repo, feat)
+  ok("10g: an UNWATCHED worktree yields no children at all (§2.3)",
+    #nodes == 0 and meta.mode == "unwatched", vim.inspect(meta))
+
+  repos.toggle_watch(feat.path)
+  ok("10g: toggle_watch() marks it watched", repos.is_watched(feat.path) == true)
+  nodes, meta = repos.children(repo, feat)
+  ok("10g: a WATCHED worktree yields UNCOMMITTED first, then its commits",
+    #nodes >= 2 and nodes[1].kind == "uncommitted" and nodes[2].kind == "commit",
+    vim.inspect(vim.tbl_map(function(n) return n.kind end, nodes)))
+  ok("10g: UNCOMMITTED is labelled with a file count",
+    nodes[1].label:find("UNCOMMITTED") ~= nil and nodes[1].count >= 1, nodes[1].label)
+  ok("10g: the range resolves as since_divergence against main",
+    meta.mode == "since_divergence" and meta.base == "main", vim.inspect(meta))
+  ok("10g: and lists ONLY the feature commit, not the base's",
+    #nodes == 2 and nodes[2].commit.subject == "feature work",
+    vim.inspect(vim.tbl_map(function(n) return n.label end, nodes)))
+
+  local ch = repos.uncommitted(feat)
+  ok("10h: uncommitted() lists the dirty file with a kind",
+    #ch >= 1 and ch[1].kind ~= nil, vim.inspect(ch))
+  local cf = repos.commit_files(repo, nodes[2].sha)
+  ok("10h: commit_files() lists what the commit touched",
+    #cf == 1 and cf[1].path == "f.txt", vim.inspect(cf))
+  local dfiles = repos.diff(repo, nodes[2].sha)
+  ok("10h: diff() returns PARSED files (not raw text)",
+    #dfiles == 1 and dfiles[1].hunks ~= nil, vim.inspect(#dfiles))
+
+  -- reviews attach to a commit by repo slug
+  local rr = review.new({ commit = nodes[2].sha, revision = 1, reviewer = "lector" })
+  rr.comments = { { path = "f.txt", line = 1, side = "RIGHT", severity = "nit", body = "ok" } }
+  review.save(repo.slug, rr)
+  ok("10h: reviews() finds a review recorded for that commit",
+    #repos.reviews(repo, nodes[2].sha) == 1, vim.inspect(repos.reviews(repo, nodes[2].sha)))
+
+  -- the base worktree itself falls back to a window
+  local basewt
+  for _, w in ipairs(wts) do if w.branch == "main" then basewt = w end end
+  repos.toggle_watch(basewt.path)
+  local bnodes, bmeta = repos.children(repo, basewt)
+  ok("10i: the base worktree resolves as a window of 15 (§2.4/§6.1)",
+    bmeta.mode == "window" and bmeta.limit == 15, vim.inspect(bmeta))
+  ok("10i: and still lists its own commits", #bnodes >= 1)
+
+  vim.fn.delete(lab, "rf")
+  vim.fn.delete(sroot, "rf")
+  store._root_override = nil
+  watch._reset_for_tests()
+end
+
 -- ───────────────────── summary ─────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then

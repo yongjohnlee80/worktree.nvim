@@ -21,6 +21,21 @@ M.graph = setmetatable({}, {
   end,
 })
 
+-- ADR-0060 §2.1: the repos-panel backend surface. `repos` is the ONE module a
+-- frontend consumes (worktree.nvim's `autodb.session` equivalent); `watch` and
+-- `review` are exposed for the skill/CLI paths that write reviews without a
+-- panel. Lazy-required for the same reason as `graph` — a consumer that never
+-- opens the panel pays nothing.
+M.repos = setmetatable({}, {
+  __index = function(_, key) return require("worktree.repos")[key] end,
+})
+M.watch = setmetatable({}, {
+  __index = function(_, key) return require("worktree.watch")[key] end,
+})
+M.review = setmetatable({}, {
+  __index = function(_, key) return require("worktree.review")[key] end,
+})
+
 -- Local mirror of the workspace root. Per ADR 0007 §1.3 the
 -- canonical source-of-truth is `auto-core.git.worktree.{set,get}_workspace_root`
 -- when auto-core is available; this mirror is kept in sync so
