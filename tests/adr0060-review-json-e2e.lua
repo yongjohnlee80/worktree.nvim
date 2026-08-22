@@ -1,0 +1,101 @@
+-- Exercise the review-json skill's documented flow verbatim.
+local PR = "/home/johno/Source/Projects/nvim-plugins"
+for _, p in ipairs({ PR .. "/auto-core.nvim/main", PR .. "/worktree.nvim/main" }) do
+  vim.opt.runtimepath:prepend(p)
+end
+local sb = vim.fn.tempname() .. "-skill"
+vim.env.XDG_STATE_HOME = sb .. "/state"
+local pass, fail = 0, 0
+local function ok(n, c, d)
+  if c then pass = pass + 1; print("  PASS  " .. n)
+  else fail = fail + 1; print("  FAIL  " .. n .. (d and ("  — " .. tostring(d)) or "")) end
+end
+
+-- a repo with a reviewable commit
+local lab = sb .. "/lab"; vim.fn.mkdir(lab, "p")
+local function G(...) local a={"git","-C",lab,"-c","user.email=t@t","-c","user.name=t"}
+  for _,x in ipairs({...}) do a[#a+1]=x end return vim.system(a,{}):wait() end
+G("init","-q","-b","main")
+vim.fn.writefile({ "one", "two", "three" }, lab .. "/auth.go")
+G("add","."); G("commit","-qm","base")
+G("config","remote.origin.url","git@github.com:yongjohnlee80/autodb.git")
+vim.fn.writefile({ "one", "TWO-changed", "three", "four" }, lab .. "/auth.go")
+G("add","."); G("commit","-qm","fix: the guard")
+local sha = vim.trim(G("rev-parse","HEAD").stdout or "")
+local base = vim.trim(G("rev-parse","HEAD~1").stdout or "")
+
+local store  = require("worktree.store")
+local review = require("worktree.review")
+local repos  = require("worktree.repos")
+store._root_override = sb .. "/wtstore"
+require("worktree.watch")._reset_for_tests(); repos._reset_for_tests()
+
+-- Step 2: the skill says resolve the slug via remote_slug, not by guessing
+local slug, url = store.remote_slug(lab .. "/.git")
+ok("skill step 2: remote_slug resolves owner__repo from the remote",
+  slug == "yongjohnlee80__autodb", slug .. " / " .. tostring(url))
+
+-- Step 3: claim the next revision
+local next_rev = review.latest_revision(slug, sha) + 1
+ok("skill step 3: first revision is 1", next_rev == 1, tostring(next_rev))
+
+-- Step 4: build + save exactly as documented
+local doc = review.new({
+  owner = "yongjohnlee80", name = "autodb", url = url,
+  commit = sha, base = base, revision = next_rev, reviewer = "lector",
+  verdict = "change_requested",
+  summary = "One must-fix. Also: this module has no tests (unplaceable).",
+})
+doc.comments = {
+  { path = "auth.go", line = 2, side = "RIGHT", severity = "must-fix",
+    body = "the guard is inverted here" },
+  { path = "auth.go", line = 2, side = "LEFT", severity = "nit",
+    body = "the old form read better" },
+  { path = "auth.go", line = 900, side = "RIGHT", severity = "question",
+    body = "not a line in this diff" },
+}
+local path, err = review.save(slug, doc)
+ok("skill step 4: save() writes the file", path ~= nil and vim.fn.filereadable(path) == 1, tostring(err))
+ok("skill step 4: the filename matches the documented grammar",
+  vim.fn.fnamemodify(path or "", ":t") == slug .. "@" .. sha:sub(1,7) .. ".r1.review.json",
+  vim.fn.fnamemodify(path or "", ":t"))
+
+-- non-negotiable #2: a 0-based line must be REJECTED
+local bad = vim.deepcopy(doc); bad.comments[1].line = 0
+ok("non-negotiable 2: a 0-based line is refused, not shifted",
+  select(1, review.save(slug, bad)) == nil)
+
+-- non-negotiable 4: a re-review is a NEW revision
+local doc2 = vim.deepcopy(doc); doc2.revision = review.latest_revision(slug, sha) + 1
+review.save(slug, doc2)
+ok("non-negotiable 4: a re-review claims r2, leaving r1 intact",
+  review.latest_revision(slug, sha) == 2 and #review.list_for(slug, sha) == 2,
+  tostring(review.latest_revision(slug, sha)))
+
+-- Step 6: name the unplaceable
+local found = repos.repos(lab)
+local repo
+for _, r in ipairs(found) do if r.common_dir:find(lab, 1, true) then repo = r end end
+ok("skill step 6: the repo resolves", repo ~= nil, vim.inspect(found and #found))
+local files = repos.diff(repo, sha)
+ok("skill step 6: diff() returns parsed files", #files == 1 and files[1].path == "auth.go",
+  vim.inspect(#files))
+local lost = require("auto-core.ui.diffview").unplaced_for(files, review.by_path(doc))
+ok("skill step 6: unplaced_for names the comment on line 900",
+  #lost == 1 and lost[1].line == 900, vim.inspect(lost))
+ok("skill step 6: and the two placeable comments are NOT reported lost", #lost == 1)
+
+-- Upload projection
+local payload = review.github_payload(doc)
+ok("upload: event maps to REQUEST_CHANGES", payload.review_event == "REQUEST_CHANGES")
+ok("upload: the unplaceable finding still reaches GitHub via the body",
+  payload.body:find("no tests", 1, true) ~= nil, payload.body)
+ok("upload: severity is folded into each comment body",
+  payload.comments[1].body:find("must%-fix") ~= nil, payload.comments[1].body)
+ok("upload: comments carry GitHub's own field names",
+  payload.comments[1].path ~= nil and payload.comments[1].line ~= nil
+  and payload.comments[1].side ~= nil)
+
+vim.fn.delete(sb, "rf")
+print(string.format("\n%d passed, %d failed", pass, fail))
+vim.cmd(fail > 0 and "cq" or "qa!")
