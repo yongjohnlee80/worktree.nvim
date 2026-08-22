@@ -116,4 +116,11 @@ ok("upload: comments carry GitHub's own field names",
 
 vim.fn.delete(sb, "rf")
 print(string.format("\n%d passed, %d failed", pass, fail))
-vim.cmd(fail > 0 and "cq" or "qa!")
+-- Exit via os.exit, matching tests/smoke.lua. This used `vim.cmd("cq")` /
+-- `"qa!"`; both convey the right status, but two conventions in one repo mean
+-- any runner has to handle both, and `cq`'s exit code is `:cquit`'s (1 by
+-- default) rather than one we state outright. One convention, stated plainly.
+if fail > 0 then
+  os.exit(1)
+end
+os.exit(0)

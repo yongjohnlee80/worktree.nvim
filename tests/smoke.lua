@@ -634,6 +634,68 @@ do
       false, ("auto-core=%s sha=%q — harness precondition missing")
         :format(tostring(ok_core), tostring(sha)))
   end
+
+  -- ── 9e: the two test-shaped seams with ZERO references (test-health) ──
+  -- `_show_range_diff` and `_bind_middle_action_keys` are underscore-prefixed
+  -- (i.e. exposed FOR tests) and were referenced by no suite at all. A seam
+  -- built for a test that was never written is the same signal md-harpoon's
+  -- unused `_reset_for_tests` gave: intent that ran out.
+  ok("9e: _show_range_diff is exported as a seam",
+    type(graph._show_range_diff) == "function")
+  ok("9e: _bind_middle_action_keys is exported as a seam",
+    type(graph._bind_middle_action_keys) == "function")
+
+  -- _show_range_diff must not throw on a real range, and must open the float
+  -- with the diff it ALREADY fetched rather than re-running git (ADR-0041 P3
+  -- fixed a double invocation here; nothing pinned it).
+  if ok_core and sha ~= "" then
+    -- The [9] fixture is deliberately single-commit for the assertions above,
+    -- so a RANGE needs more history. Add TWO commits rather than reshaping a
+    -- fixture other assertions depend on.
+    --
+    -- Three commits are required, not two: production builds the range as
+    -- `from.hash .. "~1.." .. to.hash`, so `from` must itself HAVE a parent.
+    -- Passing the fixture's initial commit as `from` makes git fail on
+    -- `<root>~1`, the function logs and returns, and no float opens — which is
+    -- exactly how an earlier version of this test mis-blamed the production
+    -- code for its own bad fixture.
+    for _, msg in ipairs({ "p9 second", "p9 third" }) do
+      local fh = assert(io.open(arepo .. "/f.txt", "a")); fh:write(msg .. "\n"); fh:close()
+      vim.system({ "git", "-C", arepo, "add", "." }):wait()
+      vim.system({ "git", "-C", arepo, "commit", "-q", "-m", msg }):wait()
+    end
+    local c3 = vim.trim(vim.fn.system({ "git", "-C", arepo, "rev-parse", "HEAD" }))
+    local c2 = vim.trim(vim.fn.system({ "git", "-C", arepo, "rev-parse", "HEAD~1" }))
+    if c2 ~= "" and c3 ~= "" and c2 ~= c3 and c2 ~= sha then
+      local win_before = vim.api.nvim_get_current_win()
+      -- from = c2 (its parent is the initial commit), to = c3.
+      local okr = pcall(graph._show_range_diff,
+        { common_dir = common, label = "p9" },
+        { hash = c2 }, { hash = c3 })
+      ok("9e: _show_range_diff runs on a real two-commit range", okr)
+      local opened_r = vim.wait(4000, function()
+        return vim.api.nvim_get_current_win() ~= win_before
+      end, 10)
+      if opened_r then
+        local hdr = vim.api.nvim_buf_get_lines(0, 0, 3, false)
+        local joined = table.concat(hdr, "\n")
+        ok("9e: the float is titled with the RANGE, not a single commit",
+          joined:find("%.%.") ~= nil or joined:find("diff", 1, true) ~= nil, joined)
+        pcall(vim.api.nvim_win_close, vim.api.nvim_get_current_win(), true)
+      else
+        ok("9e: _show_range_diff opened a float", false, "no new window appeared")
+      end
+    else
+      ok("9e: FAIL-LOUD — the fixture needs two commits for a range diff",
+        false, "rev-parse HEAD~1 -> " .. vim.inspect(second))
+    end
+  end
+
+  -- _bind_middle_action_keys must be a safe no-op with no float open, which is
+  -- the state every caller can hit. It guards on state.mfloat internally.
+  graph.close()
+  ok("9e: _bind_middle_action_keys is a safe no-op with no float open",
+    (pcall(graph._bind_middle_action_keys)))
 end
 
 -- ───────────── [10] ADR-0060 P3 — store / watch / review / repos ─────────────
