@@ -690,6 +690,55 @@ do
     pruned >= 1 and watch.is_watched(live) == true, tostring(pruned))
   vim.fn.delete(live, "rf")
 
+  -- ── [10c-r1] MULTI-INSTANCE LOST UPDATE (ADR-0060 r1 MF1) ──
+  -- The registry is shared by every nvim on this machine, so a mutation must
+  -- not rewrite the whole file from a mirror loaded minutes ago. Atomic rename
+  -- keeps the file WHOLE; it does nothing about a lost update. Reproduced
+  -- against two real processes during r1 verification — the loss is silent, and
+  -- the write that causes it returns err=nil.
+  --
+  -- "Instance A" here is a direct disk write, which is exactly what another
+  -- nvim's _flush() looks like from this process's point of view.
+  watch._reset_for_tests()
+  store.write_json(store.watches_path(), { paths = { "/tmp/wt-base" } })
+  ok("10c-r1: instance B loads the shared registry",
+    watch.is_watched("/tmp/wt-base") == true)
+
+  store.write_json(store.watches_path(),                    -- instance A adds one
+    { paths = { "/tmp/wt-base", "/tmp/wt-from-a" } })
+  local _, serr = watch.set("/tmp/wt-from-b", true)         -- B mutates while stale
+  ok("10c-r1: B's write reports no error", serr == nil, tostring(serr))
+
+  local disk = store.read_json(store.watches_path()) or {}
+  local on_disk = {}
+  for _, p in ipairs(disk.paths or {}) do on_disk[p] = true end
+  ok("10c-r1: *** B's toggle does NOT erase instance A's watch ***",
+    on_disk["/tmp/wt-from-a"] == true, vim.inspect(disk.paths))
+  ok("10c-r1: and B's own watch landed", on_disk["/tmp/wt-from-b"] == true)
+  ok("10c-r1: and the pre-existing one survived", on_disk["/tmp/wt-base"] == true)
+  ok("10c-r1: the stale mirror is refreshed, so is_watched sees A's write too",
+    watch.is_watched("/tmp/wt-from-a") == true, vim.inspect(watch.list()))
+
+  -- prune() had the same defect and worse: it iterates the mirror and flushes
+  -- the lot, so a prune from a stale instance deletes watches it never saw —
+  -- with no user action beyond whatever triggers prune.
+  local plive = vim.fn.tempname() .. "-prune-live"; vim.fn.mkdir(plive, "p")
+  watch._reset_for_tests()
+  watch.set(plive, true)                                    -- B loads + caches
+  store.write_json(store.watches_path(),                    -- A adds a live path
+    { paths = { plive, "/tmp/wt-dead-x", plive .. "-other" } })
+  vim.fn.mkdir(plive .. "-other", "p")
+  local npruned = watch.prune()
+  local pdisk = store.read_json(store.watches_path()) or {}
+  local pset = {}
+  for _, p in ipairs(pdisk.paths or {}) do pset[p] = true end
+  ok("10c-r1: *** prune() keeps a live path added by ANOTHER instance ***",
+    pset[plive .. "-other"] == true, vim.inspect(pdisk.paths))
+  ok("10c-r1: prune() still drops the genuinely dead one",
+    pset["/tmp/wt-dead-x"] ~= true and npruned >= 1, tostring(npruned))
+  vim.fn.delete(plive, "rf"); vim.fn.delete(plive .. "-other", "rf")
+  watch._reset_for_tests()
+
   -- ── review store: filename grammar + validation ──
   ok("10d: filename grammar", review.filename("o__r", "ff24bc5fcc759de", 3)
     == "o__r@ff24bc5.r3.review.json", review.filename("o__r", "ff24bc5fcc759de", 3))
@@ -747,6 +796,78 @@ do
   ok("10d: latest_revision()", review.latest_revision("yongjohnlee80__autodb", r.commit) == 2)
   ok("10d: latest_revision() is 0 when none exist",
     review.latest_revision("yongjohnlee80__autodb", "abc1234") == 0)
+
+  -- ── [10d-r1] REVIEW HISTORY IS IMMUTABLE (ADR-0060 r1 MF2) ──
+  -- The convention says a re-review is a NEW revision, never an edit, but
+  -- nothing enforced it: save() wrote the canonical path unconditionally and
+  -- fs_rename replaces, so saving r1 twice destroyed the first review with no
+  -- error to either writer. Reproduced across two real processes in r1.
+  local imm = vim.deepcopy(r); imm.revision = 1
+  imm.summary = "FIRST summary"
+  local ip1 = review.save("immut__repo", imm)
+  local imm2 = vim.deepcopy(imm); imm2.summary = "SECOND summary"
+  local ip2, ierr = review.save("immut__repo", imm2)
+  ok("10d-r1: *** re-saving an existing revision is REFUSED ***",
+    ip2 == nil and ierr ~= nil, tostring(ip2) .. " / " .. tostring(ierr))
+  local kept = review.load("immut__repo", imm.commit, 1)
+  ok("10d-r1: and the ORIGINAL review is still on disk, unmodified",
+    kept ~= nil and kept.summary == "FIRST summary", kept and kept.summary)
+  ok("10d-r1: the refusal names the revision so the caller can bump",
+    tostring(ierr):match("r1") ~= nil or tostring(ierr):match("revision") ~= nil, tostring(ierr))
+  ok("10d-r1: an explicit overwrite is still possible for a deliberate amend",
+    review.save("immut__repo", imm2, { overwrite = true }) ~= nil)
+
+  -- save_next claims atomically, so two agents cannot both take rN.
+  local nx = vim.deepcopy(r); nx.commit = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
+  local np1, nr1 = review.save_next("claim__repo", nx)
+  local np2, nr2 = review.save_next("claim__repo", vim.deepcopy(nx))
+  ok("10d-r1: save_next() claims r1 then r2, never colliding",
+    nr1 == 1 and nr2 == 2, tostring(nr1) .. "/" .. tostring(nr2))
+  ok("10d-r1: both claims produced distinct files",
+    np1 ~= nil and np2 ~= nil and np1 ~= np2)
+  ok("10d-r1: and the first claim is intact after the second",
+    (review.load("claim__repo", nx.commit, 1)) ~= nil)
+
+  -- ── [10d-r1] validate() enforces the WHOLE wire schema (r1 MF3) ──
+  -- Previously `comments[].line` was the only field with range/base
+  -- enforcement and `side` the only enumeration; commit/revision/start_line
+  -- were unchecked, so save() could emit a file the renderer misplaces and
+  -- GitHub rejects with a 422.
+  local function bad(mut)
+    local c = vim.deepcopy(r); mut(c); return select(1, review.validate(c)) == false
+  end
+  ok("10d-r1: a SHORT commit sha is rejected (payload carries the full 40)",
+    bad(function(c) c.commit = "abc1234" end))
+  ok("10d-r1: a non-hex commit is rejected",
+    bad(function(c) c.commit = string.rep("z", 40) end))
+  ok("10d-r1: revision 0 is rejected (integer >= 1)",
+    bad(function(c) c.revision = 0 end))
+  ok("10d-r1: a negative revision is rejected",
+    bad(function(c) c.revision = -3 end))
+  ok("10d-r1: a non-integer revision is rejected",
+    bad(function(c) c.revision = 1.5 end))
+  ok("10d-r1: a non-integer line is rejected",
+    bad(function(c) c.comments[1].line = 10.5 end))
+  ok("10d-r1: start_line = 0 is rejected, like line",
+    bad(function(c) c.comments[1].start_line = 0 end))
+  ok("10d-r1: a non-number start_line is rejected",
+    bad(function(c) c.comments[1].start_line = "seven" end))
+  ok("10d-r1: an INVERTED range (start_line > line) is rejected",
+    bad(function(c) c.comments[1].start_line = 99; c.comments[1].line = 10 end))
+  ok("10d-r1: an unknown start_side is rejected (MIDDLE is not a side)",
+    bad(function(c) c.comments[1].start_side = "MIDDLE" end))
+  ok("10d-r1: a non-boolean resolved is rejected",
+    bad(function(c) c.comments[1].resolved = "yes" end))
+  -- The instrument is not simply rejecting everything: the untouched review,
+  -- and a LEGITIMATE range, must both still pass.
+  ok("10d-r1: CONTROL — the conformant review still validates",
+    select(1, review.validate(r)) == true, vim.inspect(select(2, review.validate(r))))
+  local okrange = vim.deepcopy(r)
+  okrange.comments[1].start_line = 88; okrange.comments[1].line = 90
+  okrange.comments[1].start_side = "RIGHT"
+  ok("10d-r1: CONTROL — a valid 88..90 range still validates",
+    select(1, review.validate(okrange)) == true,
+    vim.inspect(select(2, review.validate(okrange))))
 
   local grouped = review.by_path(r)
   ok("10d: by_path() groups and line-sorts",
@@ -809,6 +930,30 @@ do
   for _, w in ipairs(wts) do if w.branch == "feature" then feat = w end end
   ok("10f: the feature worktree is found and UNWATCHED", feat ~= nil and feat.watched == false)
 
+  -- ── [10f-r1] available() probes EVERY surface repos uses (r1 SF2) ──
+  -- It checked git.log.range and git.graph.fan_out only, so against an
+  -- auto-core with the P1 surface but not P2's diff module it advertised
+  -- availability and then `o` errored in the user's face instead of falling
+  -- back. A version floor cannot fix this: auto-core's own M.version was stale
+  -- at 0.1.62 across three releases, so capability probing is the only option.
+  local core_live = require("auto-core")
+  ok("10f-r1: REQUIRED names every auto-core symbol repos calls",
+    type(repos.REQUIRED) == "table" and #repos.REQUIRED >= 8, vim.inspect(repos.REQUIRED))
+  for _, dotted in ipairs({ "git.diff.parse", "git.worktree.parse_porcelain",
+                            "git.log.working_changes", "git.log.commit_files",
+                            "git.log.rev_exists", "git.graph.show_diff" }) do
+    ok("10f-r1: REQUIRED includes " .. dotted,
+      vim.tbl_contains(repos.REQUIRED, dotted), vim.inspect(repos.REQUIRED))
+  end
+  -- Behavioural: remove ONE required symbol and availability must go false.
+  local saved_diff = core_live.git.diff
+  core_live.git.diff = nil
+  ok("10f-r1: *** available() is FALSE when git.diff is missing (was true) ***",
+    repos.available() == false)
+  core_live.git.diff = saved_diff
+  ok("10f-r1: CONTROL — and TRUE again once restored (probe is not stuck)",
+    repos.available() == true)
+
   -- THE performance contract: an unwatched worktree costs nothing.
   local nodes, meta = repos.children(repo, feat)
   ok("10g: an UNWATCHED worktree yields no children at all (§2.3)",
@@ -837,6 +982,53 @@ do
   local dfiles = repos.diff(repo, nodes[2].sha)
   ok("10h: diff() returns PARSED files (not raw text)",
     #dfiles == 1 and dfiles[1].hunks ~= nil, vim.inspect(#dfiles))
+
+  -- ── [10h-r1] A FAILED GIT READ IS NOT A CLEAN TREE (r1 SF3) ──
+  -- children() discarded the errors from working_changes and range, so a failed
+  -- status/log became `(no commits, clean tree)` in the panel — the panel
+  -- asserting, by omission, that the user has no uncommitted work. The
+  -- reachable case is not a corrupt repo: it is a worktree whose directory
+  -- disappeared (deleted outside nvim, unmounted path, permissions), which
+  -- worktrees() STILL lists.
+  local gone = vim.fn.tempname() .. "-vanished"
+  vim.fn.mkdir(gone, "p")
+  watch.set(gone, true)
+  local ghost = { path = gone, branch = "ghost", head = "deadbee", detached = false,
+                  watched = true, is_base = false }
+  vim.fn.delete(gone, "rf")                       -- the tree vanishes underneath us
+  local gnodes, gmeta = repos.children(repo, ghost)
+  ok("10h-r1: *** a failed status read is REPORTED, not rendered as clean ***",
+    (gmeta.status_err ~= nil or gmeta.log_err ~= nil), vim.inspect(gmeta))
+  ok("10h-r1: and meta carries enough for the frontend to show an error row",
+    type(gmeta.status_err or gmeta.log_err) == "string",
+    vim.inspect({ status_err = gmeta.status_err, log_err = gmeta.log_err }))
+  ok("10h-r1: no UNCOMMITTED node is fabricated from a failed read",
+    (function() for _, n in ipairs(gnodes) do
+       if n.kind == "uncommitted" then return false end end return true end)())
+  -- CONTROL: the healthy worktree must NOT report an error, or the assertion
+  -- above would pass for the wrong reason.
+  local hnodes, hmeta = repos.children(repo, feat)
+  ok("10h-r1: CONTROL — a healthy worktree reports NO error",
+    hmeta.status_err == nil and hmeta.log_err == nil, vim.inspect(hmeta))
+  ok("10h-r1: CONTROL — and still yields its nodes", #hnodes >= 1, tostring(#hnodes))
+  watch.set(gone, false)
+
+  -- ── [10h-r1] the backend delegates git to auto-core (r1 SF4) ──
+  -- repos.lua's own docstring says it owns POLICY and "never a git invocation
+  -- of its own", while worktrees() shelled out to `git worktree list` directly,
+  -- duplicating auto-core.git.worktree.list byte-for-byte.
+  local src = table.concat(
+    vim.fn.readfile(plugin_root .. "/lua/worktree/repos.lua"), "\n")
+  -- Matches the ARGV form only. A prose mention of the command in a comment is
+  -- not a shell-out, and an earlier version of this assertion failed on its own
+  -- explanatory comment.
+  ok("10h-r1: repos.lua no longer shells out to `git worktree list` itself",
+    src:match('"worktree",%s*"list"') == nil,
+    "a direct { \"worktree\", \"list\" } argv is still present")
+  ok("10h-r1: and it routes through core.git.worktree.list",
+    src:match("git%.worktree%.list") ~= nil)
+  ok("10h-r1: CONTROL — worktrees() still returns both entries, unchanged",
+    #repos.worktrees(repo) == 2, vim.inspect(#repos.worktrees(repo)))
 
   -- reviews attach to a commit by repo slug
   local rr = review.new({ commit = nodes[2].sha, revision = 1, reviewer = "lector" })

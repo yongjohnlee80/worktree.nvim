@@ -142,6 +142,110 @@ function M.read_json(path)
   return value, nil
 end
 
+---mtime returns a file's modification time in nanoseconds, or nil if absent.
+---Used to invalidate an in-memory mirror when ANOTHER process has written the
+---file — atomic rename keeps the content whole but says nothing about staleness.
+---@param path string
+---@return integer? mtime_ns
+function M.mtime(path)
+  local st = path and path ~= "" and uv.fs_stat(path) or nil
+  if not st or not st.mtime then return nil end
+  return st.mtime.sec * 1000000000 + (st.mtime.nsec or 0)
+end
+
+---LOCK_STALE_MS is how long a lock may be held before another process may break
+---it. A crashed nvim must not wedge the registry forever, and every critical
+---section here is a read-decode-encode-write of a small file.
+M.LOCK_STALE_MS = 10000
+
+---with_lock runs `fn` while holding an exclusive lock on `path`.
+---
+---Needed because atomic rename prevents a TORN file but not a LOST UPDATE:
+---two processes can each read, each modify their own copy, and the second
+---rename silently discards the first's change (ADR-0060 r1 MF1/MF2). Any
+---read-modify-write of a shared store file must run in here.
+---
+---The lock is a sibling `<path>.lock` created with O_EXCL, which is atomic on
+---every filesystem we target. A lock older than `LOCK_STALE_MS` is assumed
+---orphaned by a crash and broken, because refusing forever is worse than
+---racing once.
+---Returns at most TWO values from `fn`, which is all any caller here needs
+---(`value, err`). Kept deliberately narrow: threading true varargs out would
+---need `table.maxn`/`unpack`, whose availability differs across the Lua
+---versions Neovim has shipped, for no benefit at these call sites.
+---@param path string          the file being guarded (NOT the lock path)
+---@param fn fun():any,any?    critical section; runs at most once
+---@return any? value, string? err
+function M.with_lock(path, fn)
+  if not path or path == "" then return nil, "with_lock: no path" end
+  if not M.ensure_dir(vim.fn.fnamemodify(path, ":h")) then
+    return nil, "with_lock: could not create " .. vim.fn.fnamemodify(path, ":h")
+  end
+  local lock = path .. ".lock"
+  local fd
+
+  for _ = 1, 50 do -- ~500ms of contention before we give up
+    fd = uv.fs_open(lock, "wx", tonumber("600", 8))
+    if fd then break end
+    -- Held. Break it only if it is provably stale; otherwise wait and retry.
+    -- Wall clock is the right clock here: the holder may be another PROCESS,
+    -- so a monotonic in-process timer says nothing about its age.
+    local st = uv.fs_stat(lock)
+    local held_secs = st and st.mtime and st.mtime.sec or nil
+    if held_secs and (os.time() - held_secs) * 1000 > M.LOCK_STALE_MS then
+      pcall(uv.fs_unlink, lock)
+    end
+    vim.wait(10)
+  end
+  if not fd then return nil, "with_lock: could not acquire " .. lock end
+
+  -- Release on EVERY path, including a throw: a leaked lock would wedge the
+  -- registry for LOCK_STALE_MS and make the next writer look broken.
+  local ok, value, err = pcall(fn)
+  pcall(uv.fs_close, fd)
+  pcall(uv.fs_unlink, lock)
+
+  if not ok then return nil, "with_lock: " .. tostring(value) end
+  return value, err
+end
+
+---create_exclusive writes `content` to `path` only if `path` does not exist,
+---atomically, and reports whether the claim succeeded.
+---
+---`rename` cannot do this — it overwrites. So the content is written to a
+---sibling temp file in full and then hard-LINKED into place: `link` fails with
+---EEXIST when the target is taken, which makes "claim this name" a single
+---atomic step that can never publish a partially-written file. Used to claim a
+---review revision so two agents cannot both take rN (r1 MF2).
+---@param path string
+---@param content string
+---@return boolean claimed, string? err   claimed=false with err=nil means taken
+function M.create_exclusive(path, content)
+  if not path or path == "" then return false, "no path" end
+  if not M.ensure_dir(vim.fn.fnamemodify(path, ":h")) then
+    return false, "could not create " .. vim.fn.fnamemodify(path, ":h")
+  end
+  if uv.fs_stat(path) then return false, nil end -- cheap pre-check; link is the real gate
+
+  local tmp = path .. ".claim." .. tostring(uv.os_getpid and uv.os_getpid() or 0)
+  local fd, oerr = uv.fs_open(tmp, "w", tonumber("600", 8))
+  if not fd then return false, "temp open failed: " .. tostring(oerr) end
+  local wrote = uv.fs_write(fd, content, 0)
+  pcall(uv.fs_fsync, fd)
+  pcall(uv.fs_close, fd)
+  if not wrote then
+    pcall(uv.fs_unlink, tmp)
+    return false, "temp write failed"
+  end
+
+  local linked, lerr = uv.fs_link(tmp, path)
+  pcall(uv.fs_unlink, tmp)
+  if linked then return true, nil end
+  -- EEXIST is the expected "someone else claimed it" outcome, not a failure.
+  if tostring(lerr):match("EEXIST") then return false, nil end
+  return false, "link failed: " .. tostring(lerr)
+end
+
 ---reviews_dir is where a repo's review files live.
 ---@param slug string
 ---@return string

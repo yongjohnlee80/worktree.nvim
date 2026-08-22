@@ -35,18 +35,53 @@ local function _core()
   return core
 end
 
+---REQUIRED is every auto-core function this module calls, as a dotted path.
+---
+---`available()` must probe the WHOLE surface, not a sample. It previously
+---checked `git.log.range` and `git.graph.fan_out` only, so an auto-core with
+---P1's log module but not P2's diff module advertised availability and then
+---`diff()` errored the moment the user pressed `o` (r1 SF2). A semver floor
+---cannot substitute for this: auto-core's self-reported `M.version` sat stale
+---at 0.1.62 across v0.1.68/69/70, so the declared ">= 0.1.70" floor is
+---documentation, not something code can test.
+---
+---Anything added to this module that reaches into auto-core belongs here too.
+M.REQUIRED = {
+  "git.log.range",
+  "git.log.rev_exists",
+  "git.log.working_changes",
+  "git.log.commit_files",
+  "git.graph.fan_out",
+  "git.graph.show_diff",
+  "git.worktree.parse_porcelain",
+  "git.worktree.list",
+  "git.diff.parse",
+}
+
+---_resolve walks a dotted path from a root table, returning nil at the first
+---missing or non-table link rather than throwing.
+local function _resolve(root, dotted)
+  local node = root
+  for part in dotted:gmatch("[^.]+") do
+    if type(node) ~= "table" then return nil end
+    node = node[part]
+  end
+  return node
+end
+
 ---available reports whether this surface can serve a panel. A frontend calls
 ---this to decide between the new view and its fallback, the same way
 ---auto-finder's dbase view probes `autodb.session`.
----@return boolean
+---@return boolean available, string? missing   the first absent capability
 function M.available()
   local core = _core()
-  return core ~= nil
-    and type(core.git) == "table"
-    and type(core.git.log) == "table"
-    and type(core.git.log.range) == "function"
-    and type(core.git.graph) == "table"
-    and type(core.git.graph.fan_out) == "function"
+  if core == nil then return false, "auto-core" end
+  for _, dotted in ipairs(M.REQUIRED) do
+    if type(_resolve(core, dotted)) ~= "function" then
+      return false, "auto-core." .. dotted
+    end
+  end
+  return true, nil
 end
 
 ---@class WorktreeRepo
@@ -100,16 +135,18 @@ end
 ---A regular (non-bare) repo yields its single checked-out branch, which is
 ---requirement 6 — the caller needs no special case.
 ---@param repo WorktreeRepo
----@return WorktreeWorktree[]
+---@return WorktreeWorktree[] worktrees, string? err
 function M.worktrees(repo)
   local core = _core()
-  if not core or not repo or not repo.common_dir then return {} end
-  local res = vim.system({
-    "git", "--git-dir=" .. repo.common_dir, "worktree", "list", "--porcelain",
-  }, {}):wait()
-  if res.code ~= 0 then return {} end
-  local entries = core.git.worktree.parse_porcelain(
-    vim.split(res.stdout or "", "\n", { plain = true })) or {}
+  if not core or not repo or not repo.common_dir then return {}, "no repo" end
+  -- Delegated to auto-core rather than shelling out here (r1 SF4). This module
+  -- owns POLICY — what a watch means, which base a branch compares against —
+  -- and `git worktree list` is a primitive auto-core already owns. `git -C
+  -- <bare-common-dir>` and `git --git-dir=<bare-common-dir>` were verified to
+  -- produce byte-identical porcelain, so this is a pure de-duplication with one
+  -- error policy instead of a swallowed exit code.
+  local entries, err = core.git.worktree.list(repo.common_dir)
+  if not entries then return {}, err end
   local base = M.base_branch(repo)
   local out = {}
   for _, e in ipairs(entries) do
@@ -131,6 +168,8 @@ function M.worktrees(repo)
   return out
 end
 
+local _base_cache = {}
+
 ---base_branch resolves the branch a repo's work diverges FROM.
 ---
 ---Order: the remote's own default (`origin/HEAD`), then a local `main`, then
@@ -138,7 +177,6 @@ end
 ---answer changes only when someone re-points origin.
 ---@param repo WorktreeRepo|string
 ---@return string? branch
-local _base_cache = {}
 function M.base_branch(repo)
   local common = type(repo) == "table" and repo.common_dir or repo
   if not common or common == "" then return nil end
@@ -195,8 +233,16 @@ function M.children(repo, wt, opts)
 
   local nodes = {}
 
+  -- Both reads below return `{}` PLUS an error on failure, and discarding the
+  -- error turned a failed git call into `(no commits, clean tree)` — the panel
+  -- asserting by omission that there is no uncommitted work (r1 SF3). The
+  -- errors are threaded into `meta` so the frontend renders an error row; an
+  -- empty result and a failed read must never look the same.
+  local status_err, log_err
+
   -- UNCOMMITTED sorts above the commits: it is the newest state of the tree.
-  local changes = core.git.log.working_changes(wt.path)
+  local changes, cerr = core.git.log.working_changes(wt.path)
+  status_err = cerr
   if #changes > 0 then
     nodes[#nodes + 1] = {
       kind = "uncommitted",
@@ -207,9 +253,10 @@ function M.children(repo, wt, opts)
 
   local base = M.base_branch(repo)
   local rev = wt.branch or wt.head or "HEAD"
-  local commits, meta = core.git.log.range(repo.common_dir, {
+  local commits, meta, rerr = core.git.log.range(repo.common_dir, {
     rev = rev, base = base, limit = opts.limit, skip = opts.skip,
   })
+  log_err = rerr
   for _, c in ipairs(commits) do
     nodes[#nodes + 1] = {
       kind = "commit", sha = c.sha, short = c.short,
@@ -217,6 +264,8 @@ function M.children(repo, wt, opts)
     }
   end
   meta.rev = rev
+  meta.status_err = status_err
+  meta.log_err = log_err
   return nodes, meta
 end
 

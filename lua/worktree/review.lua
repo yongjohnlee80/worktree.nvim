@@ -94,11 +94,17 @@ function M.validate(review)
     problems[#problems + 1] =
       "schema is " .. tostring(review.schema) .. ", expected " .. M.SCHEMA
   end
-  if type(review.commit) ~= "string" or review.commit == "" then
-    problems[#problems + 1] = "commit missing"
+  -- The payload carries the FULL sha (`review-json` §3); the filename carries
+  -- the short form. A 7-char value here means someone wrote the abbreviation
+  -- into the wrong field, and the review would not be reproducible.
+  if type(review.commit) ~= "string" or not review.commit:match("^%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$") then
+    problems[#problems + 1] = "commit must be a full 40-character hex sha"
   end
-  if type(review.revision) ~= "number" then
-    problems[#problems + 1] = "revision missing or not a number"
+  if type(review.revision) ~= "number" or review.revision % 1 ~= 0
+    or review.revision < 1 then
+    -- Integer >= 1. Revision 0 would write a real `…r0.review.json`, which
+    -- collides with latest_revision()'s "none exist" sentinel of 0.
+    problems[#problems + 1] = "revision must be an integer >= 1"
   end
   if review.verdict and not M.VERDICTS[review.verdict] then
     problems[#problems + 1] = "unknown verdict " .. tostring(review.verdict)
@@ -111,17 +117,36 @@ function M.validate(review)
       if type(c.path) ~= "string" or c.path == "" then
         problems[#problems + 1] = where .. ".path missing"
       end
-      if type(c.line) ~= "number" or c.line < 1 then
+      if type(c.line) ~= "number" or c.line < 1 or c.line % 1 ~= 0 then
         -- The 1-based rule is enforced, not assumed: a 0 here means someone
         -- wrote 0-indexed rows into a GitHub-native field, and every comment
         -- in the file would land one line off.
-        problems[#problems + 1] = where .. ".line must be a 1-based number"
+        problems[#problems + 1] = where .. ".line must be a 1-based integer"
       end
       if type(c.body) ~= "string" or c.body == "" then
         problems[#problems + 1] = where .. ".body missing"
       end
       if c.side and c.side ~= "LEFT" and c.side ~= "RIGHT" then
         problems[#problems + 1] = where .. ".side must be LEFT or RIGHT"
+      end
+      -- The range endpoints get the SAME rules as `line`. §4 states the
+      -- 1-based rule for both, but only `line` was enforced — so an
+      -- unchecked start_line reached both the renderer and `github_payload`,
+      -- which forwards it verbatim into a request GitHub rejects (r1 MF3).
+      if c.start_line ~= nil then
+        if type(c.start_line) ~= "number" or c.start_line < 1
+          or c.start_line % 1 ~= 0 then
+          problems[#problems + 1] = where .. ".start_line must be a 1-based integer"
+        elseif type(c.line) == "number" and c.start_line > c.line then
+          problems[#problems + 1] = where .. ".start_line must be <= .line "
+            .. "(it is the START of the range; .line is the END)"
+        end
+      end
+      if c.start_side and c.start_side ~= "LEFT" and c.start_side ~= "RIGHT" then
+        problems[#problems + 1] = where .. ".start_side must be LEFT or RIGHT"
+      end
+      if c.resolved ~= nil and type(c.resolved) ~= "boolean" then
+        problems[#problems + 1] = where .. ".resolved must be a boolean"
       end
       if c.severity and not vim.tbl_contains(M.SEVERITIES, c.severity) then
         problems[#problems + 1] = where .. ".severity is not in the ladder"
@@ -153,19 +178,62 @@ end
 
 ---save writes a review, refusing an invalid one. Writing a malformed review
 ---would leave a file the panel cannot render and the uploader cannot use.
+---
+---A review already on disk is IMMUTABLE. `review-json` §3 says a re-review is
+---a new revision, never an edit, but nothing enforced that: this wrote the
+---canonical path unconditionally and `fs_rename` replaces, so saving r1 twice
+---destroyed the first review and returned success to both writers (r1 MF2).
+---Pass `{ overwrite = true }` for a deliberate amend of your own file.
 ---@param slug string
 ---@param review WorktreeReview
+---@param opts { overwrite: boolean? }?
 ---@return string? path, string? err
-function M.save(slug, review)
+function M.save(slug, review, opts)
   local ok, problems = M.validate(review)
   if not ok then
     return nil, "invalid review: " .. table.concat(problems, "; ")
   end
   local dir = store.reviews_dir(slug)
-  local path = dir .. "/" .. M.filename(slug, review.commit, review.revision)
+  local name = M.filename(slug, review.commit, review.revision)
+  local path = dir .. "/" .. name
+  if not (opts and opts.overwrite) and (vim.uv or vim.loop).fs_stat(path) then
+    return nil, ("revision r%d already exists for this commit — a re-review is a "
+      .. "new revision, never an edit; claim the next one with save_next() "
+      .. "(or pass overwrite=true to amend deliberately): %s")
+      :format(review.revision, name)
+  end
   local wok, werr = store.write_json(path, review)
   if not wok then return nil, werr end
   return path, nil
+end
+
+---save_next claims the next free revision for this commit and writes it,
+---atomically, so two reviewers running concurrently land on rN and rN+1 rather
+---than both taking rN and one silently winning (r1 MF2).
+---
+---`latest_revision() + 1` alone is a check-then-write race. The claim is the
+---exclusive CREATE of the target file itself, so losing the race is observable
+---(the name is taken) rather than silent, and we simply try the next number.
+---@param slug string
+---@param review WorktreeReview
+---@return string? path, integer|string? revision_or_err
+function M.save_next(slug, review)
+  local start = M.latest_revision(slug, review.commit) + 1
+  for rev = start, start + 24 do
+    review.revision = rev
+    local ok, problems = M.validate(review)
+    if not ok then return nil, "invalid review: " .. table.concat(problems, "; ") end
+
+    local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, review.commit, rev)
+    local ok_enc, encoded = pcall(vim.json.encode, review)
+    if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
+
+    local claimed, err = store.create_exclusive(path, encoded)
+    if claimed then return path, rev end
+    if err then return nil, err end
+    -- Taken by another writer between our scan and our claim: take the next.
+  end
+  return nil, "save_next: could not claim a revision after 25 attempts"
 end
 
 ---load reads one review by `(slug, sha, revision)`.
