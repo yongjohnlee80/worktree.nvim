@@ -137,25 +137,42 @@ core.events.subscribe("worktree:switched", function(payload, _topic)
   got_event = payload
 end)
 
--- We can't easily drive M.pick/M.home headless (they need real git
--- worktrees). Instead, verify the helper publishes correctly by
--- exercising the publish path through M.set_root (which doesn't
--- itself publish — but if we wire a fake switch, the helper does).
--- Easiest: simulate by calling the internal helper through the
--- existing public surface. We use M.home indirectly via a fake
--- workspace that has root == cwd, which short-circuits without
--- publishing. So instead we just verify the events bus works for
--- this topic by publishing manually (the real wiring is exercised
--- in live nvim during the user's :gw flow).
+-- REIMPLEMENTED (test-health): this section used to publish the event ITSELF
+-- and then assert its own subscriber received it — which tests auto-core's
+-- event bus, not worktree's wiring, and would stay green if worktree stopped
+-- publishing altogether. Driving the real switch headlessly needs a full
+-- worktree fixture, so the invariant that IS worktree's own is asserted at
+-- source: this plugin must publish `worktree:switched`, with the payload
+-- shape its consumers destructure.
+local init_src = table.concat(
+  vim.fn.readfile(plugin_root .. "/lua/worktree/init.lua"), "\n")
+ok("[4] worktree PUBLISHES worktree:switched (its own responsibility)",
+  init_src:match('publish,%s*"worktree:switched"') ~= nil
+    or init_src:match('publish%("worktree:switched"') ~= nil,
+  "no publish of worktree:switched found in lua/worktree/init.lua")
+ok("[4] and the publish is pcall-guarded (auto-core is a soft edge here)",
+  init_src:match('pcall%(core%.events%.publish,%s*"worktree:switched"') ~= nil)
+ok("[4] the payload carries from/to/cwd, which consumers destructure",
+  init_src:match('worktree:switched".-from%s*=') ~= nil
+    and init_src:match('worktree:switched".-to%s*=') ~= nil,
+  "payload keys not found next to the publish call")
+
+-- The bus round-trip itself, honestly labelled as a CONTRACT check on the
+-- payload shape rather than as evidence that worktree publishes.
 core.events.publish("worktree:switched",
   { from = "/a", to = "/b", cwd = "/b" })
 vim.wait(20)
-ok("subscriber receives worktree:switched payload",
+ok("[4] CONTRACT: a worktree:switched payload round-trips to a subscriber",
   got_event ~= nil and got_event.from == "/a" and got_event.to == "/b",
   vim.inspect(got_event))
 
 -- ───────── 5. restart_workspace_lsps → auto-core.lsp.reset ─────────
-print("\n[5] restart_workspace_lsps routes through auto-core.lsp.reset")
+-- RETITLED (test-health): the old title claimed this verified routing
+-- through auto-core.lsp.reset, but both assertions only probe auto-core's
+-- reachability and detect_stack — restart_workspace_lsps is local to
+-- init.lua and is never called here. The routing itself is covered by
+-- auto-core's own smoke [42]; this checks the dependency worktree needs.
+print("\n[5] auto-core.lsp.reset is present and detects a stack (dependency probe)")
 ok("auto-core.lsp.reset reachable",
   type(core.lsp) == "table"
     and type(core.lsp.reset) == "table"
@@ -349,7 +366,13 @@ if remote_branch_row then
   -- Test C (checkout branch)
   vim.api.nvim_feedkeys("C", "xt", false)
   local checked_out = vim.trim(vim.fn.system({ "git", "-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD" }))
-  ok("C (checkout) ran successfully (or attempted)", true)
+  -- Was a hardcoded `true`, which asserted nothing while DISCARDING the
+  -- `checked_out` value it had just computed. Assert on that value: git must
+  -- answer with a real ref name, not an error or an empty string.
+  ok("C (checkout) leaves the repo on a resolvable branch",
+    checked_out ~= "" and checked_out:match("^%S+$") ~= nil
+      and checked_out:lower():find("error") == nil,
+    "rev-parse --abbrev-ref HEAD -> " .. vim.inspect(checked_out))
 
   -- Test D (delete remote branch)
   vim.api.nvim_feedkeys("D", "xt", false)
@@ -603,7 +626,13 @@ do
     ok("9d: preview generation hook exported",
       type(graph._preview_generation) == "number")
   else
-    ok("9d: async path needs auto-core (skipped — soft-dep absent)", true)
+    -- Was `true` (a skip masquerading as a pass). auto-core is a HARD
+    -- dependency — worktree/git.lua asserts it at load — so reaching this
+    -- branch means the harness is broken, not that a soft dep is missing.
+    -- Fail loudly and say which precondition was absent.
+    ok("9d: FAIL-LOUD — auto-core and a commit sha are both required here",
+      false, ("auto-core=%s sha=%q — harness precondition missing")
+        :format(tostring(ok_core), tostring(sha)))
   end
 end
 
@@ -1050,6 +1079,205 @@ do
   vim.fn.delete(sroot, "rf")
   store._root_override = nil
   watch._reset_for_tests()
+end
+
+-- ───── [11] buffers — the unsaved-work guard for a DESTRUCTIVE command ─────
+-- 116 lines at ZERO assertions before this, while being wired at five sites in
+-- init.lua including the only thing that warns before `:WorktreeRemove`
+-- destroys unsaved edits (init.lua:739 modified_under) and a force-delete
+-- (init.lua:764 wipe_under). Coverage was inverted: the newest 875 lines of
+-- ADR-0060 had ~81 assertions and this had none.
+print("\n[11] worktree.buffers — unsaved-work guard + switch cleanup")
+;(function()
+  local buffers = require("worktree.buffers")
+  local root = vim.fn.tempname() .. "-bufs"
+  local wt_a = root .. "/feat"
+  local wt_b = root .. "/other"
+  -- A SIBLING sharing a prefix with wt_a. `/feat` must never match `/feature`.
+  local sibling = root .. "/feature"
+  for _, d in ipairs({ wt_a, wt_b, sibling, wt_a .. "/sub" }) do vim.fn.mkdir(d, "p") end
+
+  local function mkbuf(path, opts)
+    opts = opts or {}
+    vim.fn.writefile({ "x" }, path)
+    local b = vim.fn.bufadd(path)
+    vim.fn.bufload(b)
+    if opts.modified then
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, { "dirty" })
+    end
+    return b
+  end
+  local function alive(b) return vim.api.nvim_buf_is_valid(b) end
+
+  -- ── each_under: the path-matching contract everything else rests on ──
+  local b_exact  = mkbuf(wt_a .. "/top.txt")
+  local b_nested = mkbuf(wt_a .. "/sub/deep.txt")
+  local b_sib    = mkbuf(sibling .. "/other.txt")
+  local b_out    = mkbuf(wt_b .. "/elsewhere.txt")
+
+  local seen = {}
+  buffers.each_under(wt_a, function(_, abs) seen[abs] = true end)
+  ok("11a: each_under sees a file directly inside the worktree",
+    seen[wt_a .. "/top.txt"] == true, vim.inspect(vim.tbl_keys(seen)))
+  ok("11a: and one nested deeper", seen[wt_a .. "/sub/deep.txt"] == true)
+  ok("11a: *** a SIBLING sharing a prefix is NOT matched (/feat vs /feature) ***",
+    seen[sibling .. "/other.txt"] ~= true, vim.inspect(vim.tbl_keys(seen)))
+  ok("11a: an unrelated worktree is not matched", seen[wt_b .. "/elsewhere.txt"] ~= true)
+
+  -- ── modified_under: THE data-loss guard ──
+  ok("11b: modified_under is empty when nothing is dirty",
+    #buffers.modified_under(wt_a) == 0, vim.inspect(buffers.modified_under(wt_a)))
+  vim.api.nvim_buf_set_lines(b_nested, 0, -1, false, { "unsaved edit" })
+  local dirty = buffers.modified_under(wt_a)
+  ok("11b: *** an unsaved edit under the worktree IS reported (WorktreeRemove's only warning) ***",
+    #dirty == 1 and dirty[1] == wt_a .. "/sub/deep.txt", vim.inspect(dirty))
+  ok("11b: a dirty buffer OUTSIDE the worktree is not reported",
+    (function()
+      vim.api.nvim_buf_set_lines(b_out, 0, -1, false, { "dirty elsewhere" })
+      local d = buffers.modified_under(wt_a)
+      return #d == 1
+    end)(), vim.inspect(buffers.modified_under(wt_a)))
+  -- CONTROL: the guard must see a dirty buffer in the OTHER worktree too, or
+  -- the assertion above would pass simply because it never sees anything.
+  ok("11b: CONTROL — the same guard DOES report the other worktree's dirty buffer",
+    #buffers.modified_under(wt_b) == 1, vim.inspect(buffers.modified_under(wt_b)))
+  vim.bo[b_nested].modified = false
+  vim.bo[b_out].modified = false
+
+  -- ── wipe_under: force-close, and what it counts ──
+  local n_wiped = buffers.wipe_under(wt_a)
+  ok("11c: wipe_under closes the buffers under the worktree",
+    n_wiped >= 2 and not alive(b_exact) and not alive(b_nested), tostring(n_wiped))
+  ok("11c: and leaves the sibling + unrelated worktree alone",
+    alive(b_sib) and alive(b_out))
+
+  -- ── first_under: the landing spot when the current buffer is closed ──
+  local b_land = mkbuf(wt_b .. "/land.txt")
+  ok("11d: first_under finds a loaded file buffer inside the path",
+    buffers.first_under(wt_b) ~= nil)
+  ok("11d: first_under is nil when nothing lives there",
+    buffers.first_under(wt_a) == nil)
+  -- A non-file buffer (terminal, panel, scratch) must never be a landing spot.
+  local scratch = vim.api.nvim_create_buf(false, true)
+  pcall(vim.api.nvim_buf_set_name, scratch, wt_a .. "/scratch-panel")
+  ok("11d: *** a non-file buffer is NOT offered as a landing spot ***",
+    buffers.first_under(wt_a) == nil, tostring(buffers.first_under(wt_a)))
+
+  -- ── close_between: the switch cleanup, and the dirty-skip contract ──
+  local old_wt, new_wt = wt_b, wt_a
+  local b_keep  = mkbuf(new_wt .. "/keep.txt")          -- under NEW: must survive
+  local b_stale = mkbuf(old_wt .. "/stale.txt")         -- under OLD only: closes
+  local b_dirty = mkbuf(old_wt .. "/dirty.txt", { modified = true })
+  local closed, skipped = buffers.close_between(old_wt, new_wt)
+  ok("11e: close_between closes an unmodified buffer left behind",
+    not alive(b_stale), tostring(closed))
+  ok("11e: *** it REFUSES to close a modified buffer and reports it ***",
+    alive(b_dirty) and #skipped == 1 and skipped[1] == old_wt .. "/dirty.txt",
+    vim.inspect(skipped))
+  ok("11e: a buffer under the NEW worktree is untouched", alive(b_keep))
+  ok("11e: old == new is a no-op (0 closed, nothing reported)",
+    (function() local c, d = buffers.close_between(new_wt, new_wt)
+       return c == 0 and #d == 0 end)())
+  -- The nested case the comment calls out: new_path INSIDE old_path must not
+  -- nuke buffers that still belong to the new one.
+  local nested_new = old_wt .. "/nested"
+  vim.fn.mkdir(nested_new, "p")
+  local b_nested_keep = mkbuf(nested_new .. "/still-mine.txt")
+  buffers.close_between(old_wt, nested_new)
+  ok("11e: *** a nested switch keeps buffers under the NEW (inner) path ***",
+    alive(b_nested_keep))
+
+  -- ── win_is_stale: redirect focus BEFORE deletion ──
+  local win = vim.api.nvim_get_current_win()
+  local b_win = mkbuf(old_wt .. "/in-window.txt")
+  vim.api.nvim_win_set_buf(win, b_win)
+  ok("11f: win_is_stale is TRUE for a window showing an about-to-close buffer",
+    buffers.win_is_stale(win, old_wt, new_wt) == true)
+  vim.api.nvim_win_set_buf(win, b_keep)
+  ok("11f: and FALSE when the window's buffer belongs to the new worktree",
+    buffers.win_is_stale(win, old_wt, new_wt) == false)
+  ok("11f: an invalid window is not stale (no throw)",
+    buffers.win_is_stale(99999, old_wt, new_wt) == false)
+  local sbuf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(win, sbuf)
+  ok("11f: a non-file buffer in the window is never stale",
+    buffers.win_is_stale(win, old_wt, new_wt) == false)
+
+  -- cleanup
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    local nm = vim.api.nvim_buf_get_name(b)
+    if nm ~= "" and nm:sub(1, #root) == root then
+      pcall(vim.api.nvim_buf_delete, b, { force = true })
+    end
+  end
+  vim.fn.delete(root, "rf")
+end)()
+
+-- ───── [12] config — 68 lines feeding 13 branch points, ZERO assertions ─────
+print("\n[12] worktree.config — defaults and the nested deep-merge")
+;(function()
+  local config = require("worktree.config")
+  local saved = vim.deepcopy(config.options)
+
+  ok("12a: defaults exist and are a table", type(config.defaults) == "table")
+  ok("12a: options starts as a COPY of defaults, not the same table",
+    config.options ~= config.defaults)
+
+  -- The load-bearing property: `integrations` is nested, so a caller setting one
+  -- integration must not wipe the others. `tbl_deep_extend` is what makes that
+  -- true and nothing pinned it.
+  local before = vim.deepcopy(config.defaults.integrations or {})
+  local keys = vim.tbl_keys(before)
+  ok("12b: defaults carry a nested integrations table", #keys > 0, vim.inspect(keys))
+  config.setup({ integrations = { neotree = false } })
+  ok("12b: *** setting ONE integration preserves the others (deep merge) ***",
+    (function()
+      for k in pairs(before) do
+        if k ~= "neotree" and config.options.integrations[k] == nil then return false end
+      end
+      return config.options.integrations.neotree == false
+    end)(), vim.inspect(config.options.integrations))
+
+  config.options = vim.deepcopy(config.defaults)
+  config.setup(nil)
+  ok("12c: setup(nil) leaves the defaults intact",
+    vim.deep_equal(config.options, config.defaults), vim.inspect(config.options))
+
+  config.setup({ notify_title = "T1" })
+  config.setup({ bare_dir = ".bare2" })
+  ok("12d: a second setup() re-merges from DEFAULTS (does not accumulate)",
+    config.options.bare_dir == ".bare2" and config.options.notify_title ~= "T1",
+    vim.inspect({ config.options.bare_dir, config.options.notify_title }))
+  ok("12d: and an unspecified key falls back to its default",
+    config.options.notify_title == config.defaults.notify_title)
+
+  config.options = saved
+end)()
+
+-- ───────────── assertion-count floor (silent-drop guard) ─────────────
+-- Three blocks in this file are conditional on a runtime precondition:
+--   * `if mfloat then`            (responsive-geometry assertions)
+--   * `if remote_branch_row then` (remote-branch action assertions)
+--   * `if ok_core and sha ~= ""`  (async commit-diff assertions)
+-- If a precondition silently stops holding, their assertions simply do not
+-- run: the totals drop and NOTHING fails. That is the same class of defect as
+-- an aborting suite — coverage disappearing without a signal — reachable here
+-- without any crash at all.
+--
+-- A floor catches it while still allowing new tests to be added freely: raise
+-- MIN_ASSERTIONS when you add coverage, and a drop below it is a hard failure.
+local MIN_ASSERTIONS = 209
+local total_asserts = pass_count + fail_count
+if total_asserts < MIN_ASSERTIONS then
+  fail_count = fail_count + 1
+  print(string.format(
+    "  FAIL  assertion-count floor: ran %d, expected >= %d — a conditional "
+    .. "block was silently skipped (coverage vanished with no failure)",
+    total_asserts, MIN_ASSERTIONS))
+else
+  print(string.format("  PASS  assertion-count floor (%d >= %d)",
+    total_asserts, MIN_ASSERTIONS))
+  pass_count = pass_count + 1
 end
 
 -- ───────────────────── summary ─────────────────────

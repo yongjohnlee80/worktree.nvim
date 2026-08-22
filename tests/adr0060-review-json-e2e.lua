@@ -1,7 +1,25 @@
--- Exercise the review-json skill's documented flow verbatim.
-local PR = "/home/johno/Source/Projects/nvim-plugins"
-for _, p in ipairs({ PR .. "/auto-core.nvim/main", PR .. "/worktree.nvim/main" }) do
-  vim.opt.runtimepath:prepend(p)
+-- tests/adr0060-review-json-e2e.lua — exercise the review-json skill's
+-- documented flow verbatim (ADR-0060 P7).
+--
+-- Run:  nvim --headless -u NONE -l tests/adr0060-review-json-e2e.lua
+--
+-- The plugin root is DERIVED, not hardcoded. An absolute workspace path was
+-- baked in here originally, which meant this suite ran on exactly one machine
+-- and from exactly one worktree — breaking the family convention
+-- (`lua-nvim-plugin-development.md` rule 2) that tests/smoke.lua in this very
+-- repo already follows.
+local plugin_root = vim.fn.fnamemodify(
+  vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"), ":h:h")
+local plugins = vim.fn.fnamemodify(plugin_root, ":h:h")
+local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
+-- Installed copies FIRST, development worktrees LAST: `prepend` pushes to the
+-- front, so the last existing entry wins and this suite tests THIS checkout.
+for _, p in ipairs({
+  LAZY .. "/auto-core.nvim",
+  plugins .. "/auto-core.nvim/main",
+  plugin_root,
+}) do
+  if vim.fn.isdirectory(p) == 1 then vim.opt.runtimepath:prepend(p) end
 end
 local sb = vim.fn.tempname() .. "-skill"
 vim.env.XDG_STATE_HOME = sb .. "/state"
