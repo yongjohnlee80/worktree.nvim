@@ -216,8 +216,17 @@ local function _owner_dead(rec)
   if not (uv.kill and uv.os_getpid) then return false end
   if rec.pid == uv.os_getpid() then return false end -- ourselves, re-entering
 
-  local ok_sig = uv.kill(rec.pid, 0)
-  if ok_sig == 0 then
+  local ok_sig, sig_err = uv.kill(rec.pid, 0)
+  if ok_sig ~= 0 then
+    -- Only "no such process" proves death. EPERM means the process EXISTS and
+    -- this user may not signal it — treating that as dead was a direct
+    -- contradiction of this function's own contract (r3 #1). Anything we cannot
+    -- positively read as ESRCH is alive.
+    local msg = tostring(sig_err or "")
+    if msg:find("ESRCH") or msg:find("no such process") then return true end
+    return false
+  end
+  do
     -- The pid is live. Is it still the SAME process, or a reused pid?
     local now_start = M._proc_start(rec.pid)
     if rec.start and now_start and rec.start ~= now_start then
@@ -225,9 +234,6 @@ local function _owner_dead(rec)
     end
     return false  -- genuinely alive; never break it
   end
-  -- kill(pid, 0) failed. EPERM means it exists but is not ours to signal, so
-  -- only a "no such process" answer counts as dead.
-  return true
 end
 
 ---with_lock runs `fn` while holding an exclusive lock on `path`.
@@ -245,6 +251,23 @@ end
 ---(`value, err`). Kept deliberately narrow: threading true varargs out would
 ---need `table.maxn`/`unpack`, whose availability differs across the Lua
 ---versions Neovim has shipped, for no benefit at these call sites.
+---_break_stale removes `lock` ONLY if it is still the inode we judged.
+---
+---An unconditional unlink here was a takeover race (r3 #1): two contenders read
+---the same dead owner, A unlinked and acquired, then B executed the unlink its
+---now-STALE read had justified and deleted A's LIVE successor, admitting a
+---second writer. The release path was already inode-checked; acquisition was
+---not, and a release-time check cannot undo an unlink that already happened.
+---@param lock string
+---@param seen_ino integer?   the inode the caller's decision was based on
+---@return boolean removed
+local function _break_stale(lock, seen_ino)
+  local st = uv.fs_stat(lock)
+  if not st then return false end                 -- already gone
+  if seen_ino and st.ino ~= seen_ino then return false end  -- a successor: not ours
+  return (pcall(uv.fs_unlink, lock))
+end
+
 ---@param path string          the file being guarded (NOT the lock path)
 ---@param fn fun():any,any?    critical section; runs at most once
 ---@return any? value, string? err
@@ -267,19 +290,36 @@ function M.with_lock(path, fn)
     -- (ADR-0060 r2 #1). A heartbeat would not help either: a process stalled
     -- in fsync cannot refresh its own mtime, which is precisely when the old
     -- age check fired.
+    -- Capture the inode our decision is based on, so the unlink below cannot
+    -- act on a lock that was replaced in the meantime (r3 #1).
+    local seen = uv.fs_stat(lock)
+    local seen_ino = seen and seen.ino or nil
     local rec = select(1, M.read_json(lock))
     if _owner_dead(rec) then
-      pcall(uv.fs_unlink, lock)
+      _break_stale(lock, seen_ino)
     elseif rec == nil then
       -- No parseable owner (a legacy zero-byte lock, or a torn write). We
       -- cannot judge it, so fall back to age at a MUCH longer horizon — this
       -- is a backstop against a permanently wedged registry, not a routine
       -- path. Nothing on the system garbage-collects this file, so refusing
       -- forever would turn one SIGKILL into an unrecoverable failure.
-      local st = uv.fs_stat(lock)
-      local secs = st and st.mtime and st.mtime.sec or nil
+      local secs = seen and seen.mtime and seen.mtime.sec or nil
       if secs and (os.time() - secs) * 1000 > M.LOCK_ABANDONED_MS then
-        pcall(uv.fs_unlink, lock)
+        -- DOCUMENTED RESIDUAL RISK (r3 #1). This is the one path where age
+        -- still decides, and it is therefore a LEASE, not strict mutual
+        -- exclusion: a live holder whose owner record was torn mid-write and
+        -- which then stalls past the horizon can still be broken. Accepted
+        -- deliberately — the alternative is a permanently wedged registry that
+        -- only manual removal of a dotfile can clear — but it is logged, so a
+        -- forced break is never silent.
+        if _break_stale(lock, seen_ino) then
+          local ok_log, log = pcall(require, "worktree.log")
+          if ok_log then
+            log.warn("store", ("force-broke an unreadable lock after %d minutes: %s"
+              .. " — if this recurs, a writer is failing mid-write")
+              :format(M.LOCK_ABANDONED_MS / 60000, lock))
+          end
+        end
       end
     end
     vim.wait(10)
@@ -345,6 +385,10 @@ function M.create_exclusive(path, content)
   if tostring(lerr):match("EEXIST") then return false, nil end
   return false, "link failed: " .. tostring(lerr)
 end
+
+---Test seams for the takeover protocol and the liveness model (r3 #1).
+M._break_stale_for_tests = _break_stale
+M._owner_dead_for_tests = _owner_dead
 
 ---reviews_dir is where a repo's review files live.
 ---@param slug string

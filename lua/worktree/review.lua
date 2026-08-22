@@ -124,11 +124,27 @@ function M.validate(review)
   if review.verdict and not M.VERDICTS[review.verdict] then
     problems[#problems + 1] = "unknown verdict " .. tostring(review.verdict)
   end
-  -- `repo` is the review's self-description. The slug comes from the remote, not
-  -- from this field, so a bad value cannot misfile anything — but a wrong TYPE
-  -- is still a malformed artifact (r2 #4e).
-  if review.repo ~= nil and type(review.repo) ~= "table" then
-    problems[#problems + 1] = "repo must be a table when present"
+  -- The artifact must NAME its repository (r3 #3). A type check alone let
+  -- `repo = nil` and `repo = {}` through, and an empty Lua table serialises as
+  -- `"repo":[]` — a JSON ARRAY, not the identity object the schema declares.
+  -- Either a url or an owner/name pair is enough; both is better.
+  if type(review.repo) ~= "table" then
+    problems[#problems + 1] = "repo must be an identity table (url, or owner+name)"
+  else
+    local url = review.repo.url
+    local owner, name = review.repo.owner, review.repo.name
+    for field, v in pairs({ url = url, owner = owner, name = name }) do
+      if v ~= nil and type(v) ~= "string" then
+        problems[#problems + 1] = "repo." .. field .. " must be a string"
+      end
+    end
+    local has_url = type(url) == "string" and url ~= ""
+    local has_pair = type(owner) == "string" and owner ~= ""
+      and type(name) == "string" and name ~= ""
+    if not (has_url or has_pair) then
+      problems[#problems + 1] =
+        "repo carries no identity — needs a non-empty url, or owner AND name"
+    end
   end
   if type(review.comments) ~= "table" then
     problems[#problems + 1] = "comments missing"
@@ -364,10 +380,19 @@ function M.github_payload(review)
       local body = c.body or ""
       if c.severity then body = "**" .. c.severity .. "** — " .. body end
       local entry = { path = c.path, line = c.line, body = body }
-      if c.side then entry.side = c.side end
+      -- MATERIALISE the default (r3 #2). The artifact may omit `side` — the
+      -- convention says omitted means RIGHT — but GitHub does NOT supply that
+      -- default: its REST contract wants `side` on a line comment and
+      -- `start_side` on a multiline one. Emitting only what the artifact
+      -- happened to carry produced `{path, line, body}` for a perfectly valid
+      -- review, which GitHub rejects. The default belongs here, at the
+      -- boundary, not in the reader.
+      entry.side = c.side or "RIGHT"
       if c.start_line then
         entry.start_line = c.start_line
-        entry.start_side = c.start_side or c.side
+        -- Cross-side ranges are preserved rather than normalised: GitHub models
+        -- the two sides independently and the convention does not forbid it.
+        entry.start_side = c.start_side or c.side or "RIGHT"
       end
       comments[#comments + 1] = entry
     end

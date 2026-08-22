@@ -413,6 +413,37 @@ vim.notify = function(msg, level, opts)
   notify_captured[#notify_captured + 1] = { msg = msg, level = level, opts = opts }
 end
 
+---_captured_toast searches the WHOLE capture for a message, rather than
+---indexing [1].
+---
+---Indexing the first entry made these assertions order-dependent: any unrelated
+---toast landing in the window — a scheduled auto-core warning, a deferred
+---notification from an earlier section — failed the assertion even though the
+---expected toast WAS captured, just not first. Lector observed 7 failures in 8
+---runs where I saw 8 clean ones, which is exactly the shape of a race whose
+---outcome depends on machine timing. A test that passes on the author's box and
+---fails on the reviewer's is worse than one that fails everywhere.
+---@param pattern string
+---@return boolean
+local function _captured_toast(pattern)
+  for _, t in ipairs(notify_captured) do
+    if type(t.msg) == "string" and t.msg:match(pattern) then return true end
+  end
+  return false
+end
+
+---_captured_count counts only toasts matching `pattern`, so an absence
+---assertion cannot be broken by an unrelated toast arriving.
+---@param pattern string
+---@return integer
+local function _captured_count(pattern)
+  local n = 0
+  for _, t in ipairs(notify_captured) do
+    if type(t.msg) == "string" and t.msg:match(pattern) then n = n + 1 end
+  end
+  return n
+end
+
 -- 8a. Wrapper contract — worktree.log.notify always toasts (force-toast
 -- surface). This is the foundation feedback() depends on. If
 -- auto-core.log.notify's routing ever flips to silent, this catches it.
@@ -421,7 +452,7 @@ require("worktree.log").notify("smoke: forced INFO toast",
   { level = "info", component = "smoke" })
 vim.wait(20)
 ok("worktree.log.notify surfaces a toast at INFO",
-  #notify_captured > 0 and notify_captured[1].msg:match("smoke: forced INFO toast"),
+  _captured_toast("smoke: forced INFO toast"),
   "captured=" .. vim.inspect(notify_captured))
 
 -- 8b. Inverse contract — worktree.log.info stays silent at default
@@ -432,7 +463,7 @@ notify_captured = {}
 require("worktree.log").info("smoke", "smoke: silent INFO log")
 vim.wait(20)
 ok("worktree.log.info stays silent at default routing",
-  #notify_captured == 0,
+  _captured_count("smoke: silent INFO log") == 0,
   "captured=" .. vim.inspect(notify_captured))
 
 -- 8c. init.lua integration — M.home() always emits via feedback()
@@ -449,8 +480,12 @@ wt.set_root(home_tmp)
 notify_captured = {}
 wt.home()
 vim.wait(20)
+-- Matched against the two messages `feedback()` can actually emit, not against
+-- "any toast at all": a bare `#notify_captured > 0` would pass on an unrelated
+-- toast arriving in the window — the mirror of the ordering bug in 8a, failing
+-- open instead of closed.
 ok("init.feedback() surfaces a toast on M.home()",
-  #notify_captured > 0,
+  _captured_toast("already at root") or _captured_toast("worktree ."),
   "captured=" .. vim.inspect(notify_captured))
 vim.fn.delete(home_tmp, "rf")
 
@@ -1123,7 +1158,11 @@ do
     #repos.worktrees(repo) == 2, vim.inspect(#repos.worktrees(repo)))
 
   -- reviews attach to a commit by repo slug
-  local rr = review.new({ commit = nodes[2].sha, revision = 1, reviewer = "lector" })
+  -- Identity is required (r3 #3): a review must name its repository, and an
+  -- empty `repo` serialises as `[]` rather than the declared object. The fix
+  -- belongs in callers like this one, not in a weaker schema.
+  local rr = review.new({ commit = nodes[2].sha, revision = 1, reviewer = "lector",
+                          owner = "smoke", name = "fixture" })
   rr.comments = { { path = "f.txt", line = 1, side = "RIGHT", severity = "nit", body = "ok" } }
   review.save(repo.slug, rr)
   ok("10h: reviews() finds a review recorded for that commit",
@@ -1433,6 +1472,141 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   ok("14c: CONTROL — and the live path survives", watch.is_watched(live) == true)
   vim.fn.delete(live, "rf")
   watch._reset_for_tests()
+
+  store._root_override = nil
+  vim.fn.delete(root, "rf")
+end)()
+
+-- ───── [15] r3 — takeover race, GitHub side projection, repo identity ─────
+print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identity")
+;(function()
+  local store = require("worktree.store")
+  local review = require("worktree.review")
+  local uv = vim.uv or vim.loop
+  local root = vim.fn.tempname() .. "-r3"
+  vim.fn.mkdir(root, "p")
+  store._root_override = root
+
+  -- ── #1a: STALE TAKEOVER must not delete a live successor ──
+  -- Release was inode-checked, but TAKEOVER was not: two contenders both read
+  -- the same dead owner, A unlinked and acquired, then B executed the unlink
+  -- justified by its now-stale read and deleted A's LIVE successor.
+  local target = root .. "/takeover.json"
+  local lock = target .. ".lock"
+  local dead = uv.fs_open(lock, "wx", tonumber("600", 8))
+  uv.fs_write(dead, vim.json.encode({ pid = 2147480000,
+    host = uv.os_gethostname(), start = 1 }), 0)
+  uv.fs_close(dead)
+  local dead_ino = (uv.fs_stat(lock) or {}).ino
+
+  -- Simulate A winning the race between B's read and B's unlink: replace the
+  -- dead lock with a LIVE one under a different inode.
+  vim.fn.delete(lock)
+  local live = uv.fs_open(lock, "wx", tonumber("600", 8))
+  uv.fs_write(live, vim.json.encode({ pid = uv.os_getpid(),
+    host = uv.os_gethostname(), start = store._proc_start(uv.os_getpid()) }), 0)
+  uv.fs_close(live)
+  local live_ino = (uv.fs_stat(lock) or {}).ino
+  ok("15a: the successor lock has a different inode", live_ino ~= dead_ino)
+
+  -- B now attempts, holding a stale belief that the lock is dead.
+  local entered = false
+  store._break_stale_for_tests(lock, dead_ino)   -- B's stale-justified unlink
+  ok("15a: *** a stale takeover does NOT delete the live successor ***",
+    uv.fs_stat(lock) ~= nil and (uv.fs_stat(lock) or {}).ino == live_ino,
+    "successor still present=" .. tostring(uv.fs_stat(lock) ~= nil))
+  store.with_lock(target, function() entered = true; return true end)
+  ok("15a: and B does not enter while the live holder is in place",
+    entered == false, "entered=" .. tostring(entered))
+  -- CONTROL: a takeover justified by a CURRENT read does remove the lock.
+  ok("15a: CONTROL — a takeover matching the observed inode DOES break it",
+    (function()
+      local ino = (uv.fs_stat(lock) or {}).ino
+      store._break_stale_for_tests(lock, ino)
+      return uv.fs_stat(lock) == nil
+    end)())
+
+  -- ── #1b: EPERM is not death ──
+  -- pid 1 exists and cannot be signalled by a normal user: kill(1,0) yields
+  -- EPERM. My code returned true for every non-success, while its own comment
+  -- said only ESRCH counts — the same comment/code contradiction as before.
+  ok("15b: *** an EPERM signal result is NOT treated as death ***",
+    store._owner_dead_for_tests({ pid = 1, host = uv.os_gethostname() }) == false)
+  ok("15b: CONTROL — an impossible pid IS treated as death",
+    store._owner_dead_for_tests({ pid = 2147480000,
+      host = uv.os_gethostname() }) == true)
+
+  -- ── #2: github_payload must MATERIALISE the side default ──
+  -- The internal artifact may omit side (review-json §3), but GitHub's REST
+  -- contract requires `side` for a line comment and `start_side` for a
+  -- multiline one. The projection assigned neither when both were omitted, so
+  -- a perfectly valid artifact uploaded as {path,line,body} and was rejected.
+  local r = review.new({ owner = "o", name = "rp", url = "git@h:o/rp.git",
+                         commit = string.rep("b", 40), revision = 1,
+                         reviewer = "probe", verdict = "comment", summary = "s" })
+  r.comments = {
+    { path = "f.go", line = 9, body = "single, no side" },
+    { path = "f.go", line = 9, start_line = 7, body = "range, no sides" },
+  }
+  ok("15c: the omitted-side artifact still VALIDATES (internal default stands)",
+    select(1, review.validate(r)) == true,
+    vim.inspect(select(2, review.validate(r))))
+  local gp = review.github_payload(r)
+  ok("15c: *** the projection materialises side=RIGHT for a line comment ***",
+    gp.comments[1] and gp.comments[1].side == "RIGHT",
+    vim.inspect(gp.comments[1]))
+  ok("15c: *** and start_side for a multiline comment ***",
+    gp.comments[2] and gp.comments[2].side == "RIGHT"
+      and gp.comments[2].start_side == "RIGHT", vim.inspect(gp.comments[2]))
+  ok("15c: CONTROL — an EXPLICIT side is passed through unchanged",
+    (function()
+      local e = review.new({ owner = "o", name = "rp", url = "u",
+        commit = string.rep("c", 40), revision = 1 })
+      e.comments = { { path = "f.go", line = 4, side = "LEFT", body = "b" } }
+      return (review.github_payload(e).comments[1] or {}).side == "LEFT"
+    end)())
+  ok("15c: CONTROL — an explicit cross-side range is preserved, not normalised",
+    (function()
+      local e = review.new({ owner = "o", name = "rp", url = "u",
+        commit = string.rep("d", 40), revision = 1 })
+      e.comments = { { path = "f.go", line = 9, start_line = 7,
+                       side = "RIGHT", start_side = "LEFT", body = "b" } }
+      local c = review.github_payload(e).comments[1] or {}
+      return c.side == "RIGHT" and c.start_side == "LEFT"
+    end)())
+
+  -- ── #3: repo IDENTITY, not merely a table ──
+  local function bad_repo(mut)
+    local c = review.new({ owner = "o", name = "rp", url = "u",
+                           commit = string.rep("e", 40), revision = 1 })
+    c.comments = {}
+    mut(c)
+    return select(1, review.validate(c)) == false
+  end
+  ok("15d: *** an ABSENT repo is rejected ***", bad_repo(function(c) c.repo = nil end))
+  ok("15d: *** an EMPTY repo is rejected (it serialises as [] , not an object) ***",
+    bad_repo(function(c) c.repo = {} end))
+  ok("15d: a repo with no usable identity is rejected",
+    bad_repo(function(c) c.repo = { owner = "", name = "" } end))
+  ok("15d: a wrong-typed identity field is rejected",
+    bad_repo(function(c) c.repo = { owner = 42, name = false } end))
+  ok("15d: CONTROL — owner+name alone is sufficient identity",
+    (function()
+      local c = review.new({ owner = "o", name = "rp",
+        commit = string.rep("f", 40), revision = 1 })
+      c.comments = {}
+      return select(1, review.validate(c)) == true
+    end)())
+  ok("15d: CONTROL — a url alone is sufficient identity",
+    (function()
+      local c = review.new({ url = "git@h:o/rp.git",
+        commit = string.rep("1", 40), revision = 1 })
+      c.comments = {}
+      return select(1, review.validate(c)) == true
+    end)(), vim.inspect(select(2, review.validate((function()
+      local c = review.new({ url = "git@h:o/rp.git",
+        commit = string.rep("1", 40), revision = 1 })
+      c.comments = {}; return c end)()))))
 
   store._root_override = nil
   vim.fn.delete(root, "rf")

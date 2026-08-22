@@ -53,14 +53,19 @@ local slug, url = store.remote_slug(lab .. "/.git")
 ok("skill step 2: remote_slug resolves owner__repo from the remote",
   slug == "yongjohnlee80__autodb", slug .. " / " .. tostring(url))
 
--- Step 3: claim the next revision
-local next_rev = review.latest_revision(slug, sha) + 1
-ok("skill step 3: first revision is 1", next_rev == 1, tostring(next_rev))
+-- Step 3: no revision is computed here — save_next() claims it.
+-- This suite claims to exercise the skill VERBATIM, so it must track the skill.
+-- It previously computed `latest_revision() + 1` and called `save()`, which is
+-- the exact check-then-write race the skill was changed to avoid; a suite
+-- running the old flow cannot catch a regression in the real caller (r3 SF1).
+ok("skill step 3: nothing is recorded for this commit yet",
+  review.latest_revision(slug, sha) == 0,
+  tostring(review.latest_revision(slug, sha)))
 
 -- Step 4: build + save exactly as documented
 local doc = review.new({
   owner = "yongjohnlee80", name = "autodb", url = url,
-  commit = sha, base = base, revision = next_rev, reviewer = "lector",
+  commit = sha, base = base, reviewer = "lector",
   verdict = "change_requested",
   summary = "One must-fix. Also: this module has no tests (unplaceable).",
 })
@@ -72,8 +77,10 @@ doc.comments = {
   { path = "auth.go", line = 900, side = "RIGHT", severity = "question",
     body = "not a line in this diff" },
 }
-local path, err = review.save(slug, doc)
-ok("skill step 4: save() writes the file", path ~= nil and vim.fn.filereadable(path) == 1, tostring(err))
+local path, rev = review.save_next(slug, doc)
+ok("skill step 4: save_next() writes the file",
+  path ~= nil and vim.fn.filereadable(path) == 1, tostring(rev))
+ok("skill step 4: and REPORTS the revision it claimed", rev == 1, tostring(rev))
 ok("skill step 4: the filename matches the documented grammar",
   vim.fn.fnamemodify(path or "", ":t") == slug .. "@" .. sha:sub(1,7) .. ".r1.review.json",
   vim.fn.fnamemodify(path or "", ":t"))
@@ -81,14 +88,18 @@ ok("skill step 4: the filename matches the documented grammar",
 -- non-negotiable #2: a 0-based line must be REJECTED
 local bad = vim.deepcopy(doc); bad.comments[1].line = 0
 ok("non-negotiable 2: a 0-based line is refused, not shifted",
-  select(1, review.save(slug, bad)) == nil)
+  select(1, review.save_next(slug, bad)) == nil)
 
--- non-negotiable 4: a re-review is a NEW revision
-local doc2 = vim.deepcopy(doc); doc2.revision = review.latest_revision(slug, sha) + 1
-review.save(slug, doc2)
+-- non-negotiable 4: a re-review is a NEW revision, and save_next assigns it
+-- rather than the caller guessing.
+local doc2 = vim.deepcopy(doc)
+local p2, rev2 = review.save_next(slug, doc2)
 ok("non-negotiable 4: a re-review claims r2, leaving r1 intact",
-  review.latest_revision(slug, sha) == 2 and #review.list_for(slug, sha) == 2,
-  tostring(review.latest_revision(slug, sha)))
+  rev2 == 2 and review.latest_revision(slug, sha) == 2
+    and #review.list_for(slug, sha) == 2,
+  tostring(rev2) .. " / " .. tostring(review.latest_revision(slug, sha)))
+ok("non-negotiable 4: and r1's content is untouched",
+  (review.load(slug, sha, 1) or {}).reviewer == "lector", tostring(p2))
 
 -- Step 6: name the unplaceable
 local found = repos.repos(lab)
