@@ -1317,6 +1317,127 @@ print("\n[12] worktree.config — defaults and the nested deep-merge")
   config.options = saved
 end)()
 
+-- ───── [14] r2 #2/#4/#5 — atomic save, whole-schema validate, loud prune ─────
+print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
+;(function()
+  local store = require("worktree.store")
+  local review = require("worktree.review")
+  local watch = require("worktree.watch")
+  local uv = vim.uv or vim.loop
+  local root = vim.fn.tempname() .. "-r2"
+  vim.fn.mkdir(root, "p")
+  store._root_override = root
+
+  local function mkreview(rev)
+    local r = review.new({ owner = "o", name = "r", commit = string.rep("a", 40),
+                           revision = rev or 1, reviewer = "probe",
+                           summary = "S" .. tostring(rev or 1) })
+    r.comments = { { path = "f.go", line = 3, side = "RIGHT",
+                     severity = "nit", body = "b" } }
+    return r
+  end
+
+  -- ── #2: save() must CLAIM, not check-then-write ──
+  -- r1 said a pre-write fs_stat is not enough; I put create_exclusive only in
+  -- save_next and left save() as stat-then-replacing-write. A real second
+  -- process committing r1 inside that gap destroyed the first review with both
+  -- writers getting err=nil.
+  local p1 = review.save("toctou__repo", mkreview(1))
+  ok("14a: save() writes a new revision", p1 ~= nil)
+  -- Blind ONLY the pre-check, exactly as the TOCTOU does, and confirm the
+  -- write is still refused — proving the claim (not the stat) is the gate.
+  local real_stat = uv.fs_stat
+  local blinded = false
+  uv.fs_stat = function(p)
+    if not blinded and p == p1 then blinded = true; return nil end
+    return real_stat(p)
+  end
+  local p2, e2 = review.save("toctou__repo", mkreview(1))
+  uv.fs_stat = real_stat
+  ok("14a: *** with the pre-check blinded, save() STILL refuses (atomic claim) ***",
+    p2 == nil and e2 ~= nil, tostring(p2) .. " / " .. tostring(e2))
+  local kept = review.load("toctou__repo", string.rep("a", 40), 1)
+  ok("14a: and the original review is intact",
+    kept ~= nil and kept.summary == "S1", kept and kept.summary)
+  ok("14a: CONTROL — an explicit overwrite still replaces deliberately",
+    review.save("toctou__repo", (function()
+      local r = mkreview(1); r.summary = "AMENDED"; return r
+    end)(), { overwrite = true }) ~= nil)
+  ok("14a: CONTROL — and the amend is what is now on disk",
+    (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "AMENDED")
+
+  -- ── #4: the validation gaps r1 asked for and I did not deliver ──
+  local function bad(mut)
+    local c = mkreview(1); mut(c); return select(1, review.validate(c)) == false
+  end
+  ok("14b: *** a NON-ARRAY comments table is rejected (uploaded 0 comments) ***",
+    bad(function(c) c.comments = { first = { path = "f.go", line = 1, body = "x" } } end))
+  ok("14b: a comments table with an index hole is rejected",
+    bad(function(c) c.comments = { [2] = { path = "f.go", line = 1, body = "x" } } end))
+  ok("14b: *** a scalar comment element is REPORTED, not thrown ***",
+    (function()
+      local c = mkreview(1); c.comments = { 42 }
+      local okc, res = pcall(review.validate, c)
+      return okc and res == false
+    end)())
+  ok("14b: a boolean element is reported too",
+    (function()
+      local c = mkreview(1); c.comments = { true }
+      local okc, res = pcall(review.validate, c)
+      return okc and res == false
+    end)())
+  ok("14b: a malformed repo field is rejected",
+    bad(function(c) c.repo = "not a table" end))
+  -- CONTROLS: the permissive cases the CONVENTION mandates must stay valid.
+  ok("14b: CONTROL — an EMPTY comments array is still valid",
+    (function() local c = mkreview(1); c.comments = {}
+      return select(1, review.validate(c)) == true end)())
+  ok("14b: CONTROL — a range with NEITHER side nor start_side is still valid "
+    .. "(review-json §3: omitted means RIGHT, as GitHub does)",
+    (function()
+      local c = mkreview(1)
+      c.comments = { { path = "f.go", line = 9, start_line = 7, body = "b" } }
+      return select(1, review.validate(c)) == true
+    end)(), vim.inspect(select(2, review.validate((function()
+      local c = mkreview(1)
+      c.comments = { { path = "f.go", line = 9, start_line = 7, body = "b" } }
+      return c end)()))))
+  ok("14b: CONTROL — the conformant review still validates",
+    select(1, review.validate(mkreview(1))) == true)
+
+  -- ── #5: prune() must not claim removals it never committed ──
+  watch._reset_for_tests()
+  local live = vim.fn.tempname() .. "-alive"; vim.fn.mkdir(live, "p")
+  watch.set(live, true)
+  watch.set("/tmp/wt-r2-dead-a", true)
+  watch.set("/tmp/wt-r2-dead-b", true)
+  local before = table.concat(vim.fn.readfile(store.watches_path()), "")
+  -- Make the COMMIT fail while the lock and the read both succeed — the exact
+  -- window where prune used to report phantom removals.
+  local real_write = store.write_json
+  store.write_json = function(p) if p == store.watches_path() then
+    return false, "injected ENOSPC" end return real_write(p) end
+  local removed, perr = watch.prune()
+  store.write_json = real_write
+  local after = table.concat(vim.fn.readfile(store.watches_path()), "")
+  ok("14c: *** prune() reports 0 removals when the write FAILED ***",
+    removed == 0, "removed=" .. tostring(removed))
+  ok("14c: and returns the error rather than swallowing it",
+    perr ~= nil and tostring(perr):find("ENOSPC") ~= nil, tostring(perr))
+  ok("14c: the registry really is unchanged", after == before,
+    "before=" .. before .. " after=" .. after)
+  -- CONTROL: with a working store, prune removes AND persists.
+  local removed2, perr2 = watch.prune()
+  ok("14c: CONTROL — prune() removes the dead paths when the write succeeds",
+    removed2 >= 2 and perr2 == nil, tostring(removed2) .. " / " .. tostring(perr2))
+  ok("14c: CONTROL — and the live path survives", watch.is_watched(live) == true)
+  vim.fn.delete(live, "rf")
+  watch._reset_for_tests()
+
+  store._root_override = nil
+  vim.fn.delete(root, "rf")
+end)()
+
 -- ───── [13] store.with_lock — mutual exclusion (ADR-0060 r2 #1) ─────
 -- Had ZERO test coverage while being the mechanism r1 MF1 added to prevent
 -- lost updates. It decided a lock was orphaned from AGE ALONE and unlinked it,

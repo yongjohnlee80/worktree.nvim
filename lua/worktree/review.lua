@@ -81,6 +81,21 @@ function M.parse_filename(name)
   return slug, short, tonumber(rev)
 end
 
+---_is_array reports whether `t` is a proper JSON array: contiguous integer keys
+---from 1, and nothing else. A JSON OBJECT decodes to a table `ipairs` walks
+---zero times, which is why an object of comments silently validated and then
+---uploaded nothing (r2 #4c).
+---@param t table
+---@return boolean
+local function _is_array(t)
+  local n = 0
+  for k in pairs(t) do
+    if type(k) ~= "number" or k % 1 ~= 0 or k < 1 then return false end
+    n = n + 1
+  end
+  return n == #t
+end
+
 ---validate checks a review's shape and returns the problems it found, so a
 ---malformed file is reported precisely rather than rendering as a blank pane.
 ---@param review any
@@ -109,11 +124,30 @@ function M.validate(review)
   if review.verdict and not M.VERDICTS[review.verdict] then
     problems[#problems + 1] = "unknown verdict " .. tostring(review.verdict)
   end
+  -- `repo` is the review's self-description. The slug comes from the remote, not
+  -- from this field, so a bad value cannot misfile anything — but a wrong TYPE
+  -- is still a malformed artifact (r2 #4e).
+  if review.repo ~= nil and type(review.repo) ~= "table" then
+    problems[#problems + 1] = "repo must be a table when present"
+  end
   if type(review.comments) ~= "table" then
     problems[#problems + 1] = "comments missing"
+  elseif not _is_array(review.comments) then
+    -- review-json §3 specifies an array and §7 forbids silent loss. `ipairs`
+    -- walks a JSON object zero times, so EVERY per-comment check was skipped
+    -- and `github_payload` uploaded ZERO comments (r2 #4c).
+    problems[#problems + 1] =
+      "comments must be a JSON array (an object or an indexed hole uploads nothing)"
   else
     for i, c in ipairs(review.comments) do
       local where = "comments[" .. i .. "]"
+      if type(c) ~= "table" then
+        -- Indexing a number or boolean THREW, breaking validate's declared
+        -- `@return boolean ok, string[] problems` — and via `review.load` it
+        -- turned one malformed file into a raw traceback in the panel (r2 #4d).
+        problems[#problems + 1] = where .. " is not a table (got " .. type(c) .. ")"
+        goto continue
+      end
       if type(c.path) ~= "string" or c.path == "" then
         problems[#problems + 1] = where .. ".path missing"
       end
@@ -151,6 +185,7 @@ function M.validate(review)
       if c.severity and not vim.tbl_contains(M.SEVERITIES, c.severity) then
         problems[#problems + 1] = where .. ".severity is not in the ladder"
       end
+      ::continue::
     end
   end
   return #problems == 0, problems
@@ -196,12 +231,26 @@ function M.save(slug, review, opts)
   local dir = store.reviews_dir(slug)
   local name = M.filename(slug, review.commit, review.revision)
   local path = dir .. "/" .. name
-  if not (opts and opts.overwrite) and (vim.uv or vim.loop).fs_stat(path) then
-    return nil, ("revision r%d already exists for this commit — a re-review is a "
-      .. "new revision, never an edit; claim the next one with save_next() "
-      .. "(or pass overwrite=true to amend deliberately): %s")
-      :format(review.revision, name)
+  local taken_msg = ("revision r%d already exists for this commit — a re-review "
+    .. "is a new revision, never an edit; claim the next one with save_next() "
+    .. "(or pass overwrite=true to amend deliberately): %s")
+    :format(review.revision, name)
+
+  if not (opts and opts.overwrite) then
+    -- CLAIM, not check-then-write (r2 #2). r1 said a pre-write `fs_stat` was
+    -- not enough; I acted on that only in `save_next` and left this path as
+    -- stat-then-replacing-write, so two writers that both observed absence both
+    -- returned success and the later rename destroyed the earlier review.
+    -- Reproduced with a real second process. The exclusive create IS the gate.
+    local ok_enc, encoded = pcall(vim.json.encode, review)
+    if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
+    local claimed, cerr = store.create_exclusive(path, encoded)
+    if claimed then return path, nil end
+    if cerr then return nil, cerr end
+    return nil, taken_msg          -- claimed=false with no err means "taken"
   end
+
+  -- An explicit amend IS a replace, so the replacing write belongs here.
   local wok, werr = store.write_json(path, review)
   if not wok then return nil, werr end
   return path, nil

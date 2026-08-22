@@ -174,11 +174,16 @@ end
 ---the worst instance of r1 MF1: prune both removes entries and rewrites the
 ---whole file, so a stale mirror deleted every watch another instance had added,
 ---triggered by no user action at all.
+---@return integer removed, string? err
 function M.prune()
   local uv = vim.uv or vim.loop
   local removed = 0
 
-  store.with_lock(store.watches_path(), function()
+  -- The result is BOUND, not discarded (r2 #5). This used to call with_lock as
+  -- a statement and return a local count incremented before `_commit` was even
+  -- attempted, so a failed write reported phantom removals while the registry
+  -- stayed byte-identical and `list()` still returned the dead paths.
+  local wok, werr = store.with_lock(store.watches_path(), function()
     local set = _read_disk()
     for p in pairs(set) do
       if not uv.fs_stat(p) then set[p] = nil; removed = removed + 1 end
@@ -190,7 +195,12 @@ function M.prune()
     return true
   end)
 
-  return removed
+  if not wok then
+    -- Nothing was committed, so claim nothing. Reporting a count we did not
+    -- persist is worse than reporting the failure.
+    return 0, werr or "watch: prune did not commit"
+  end
+  return removed, nil
 end
 
 ---_reset_for_tests drops the in-memory mirror so the next read re-reads disk.
