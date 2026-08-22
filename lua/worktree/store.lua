@@ -153,10 +153,82 @@ function M.mtime(path)
   return st.mtime.sec * 1000000000 + (st.mtime.nsec or 0)
 end
 
----LOCK_STALE_MS is how long a lock may be held before another process may break
----it. A crashed nvim must not wedge the registry forever, and every critical
----section here is a read-decode-encode-write of a small file.
+---LOCK_STALE_MS is the contention window before `with_lock` gives up. It is NOT
+---a staleness proof: age cannot establish that a holder is dead (ADR-0060 r2
+---#1). Liveness is decided by `_owner_dead` below.
 M.LOCK_STALE_MS = 10000
+
+---LOCK_ABANDONED_MS is the LAST-RESORT backstop for a lock we cannot judge —
+---one with no parseable owner record (a legacy zero-byte lock, or a truncated
+---write). Deliberately far longer than any plausible critical section here,
+---because breaking on age is exactly the mistake this module made before.
+M.LOCK_ABANDONED_MS = 15 * 60 * 1000
+
+---_proc_start returns a process's start time, used to defeat PID REUSE: a pid
+---alone is not an identity, because the OS reuses pids and a recycled one would
+---make a dead owner look alive (or worse, a live stranger look like our
+---holder).
+---
+---Linux exposes it as field 22 of /proc/<pid>/stat. Elsewhere this returns nil
+---and the liveness check degrades to pid-only, which is still strictly better
+---than age.
+---@param pid integer
+---@return integer? starttime
+function M._proc_start(pid)
+  if type(pid) ~= "number" then return nil end
+  local fd = io.open("/proc/" .. pid .. "/stat", "r")
+  if not fd then return nil end
+  local line = fd:read("*l") or ""
+  fd:close()
+  -- The comm field can contain spaces and parentheses, so count from the LAST
+  -- ")" rather than splitting the whole line.
+  local tail = line:match("%)%s+(.*)$")
+  if not tail then return nil end
+  local n, i = nil, 0
+  for word in tail:gmatch("%S+") do
+    i = i + 1
+    if i == 20 then n = tonumber(word) break end -- field 22 overall
+  end
+  return n
+end
+
+---_owner_record describes THIS process as the lock's owner.
+local function _owner_record()
+  return {
+    pid = uv.os_getpid and uv.os_getpid() or nil,
+    host = uv.os_gethostname and uv.os_gethostname() or nil,
+    start = M._proc_start(uv.os_getpid and uv.os_getpid() or -1),
+  }
+end
+
+---_owner_dead reports whether a lock's owner is PROVABLY gone.
+---
+---Conservative by design: every uncertain answer is "not dead", because
+---breaking a live holder's lock lets two writers into the same
+---read-modify-write — the lost update this lock exists to prevent.
+---@param rec table?   decoded owner record
+---@return boolean
+local function _owner_dead(rec)
+  if type(rec) ~= "table" or type(rec.pid) ~= "number" then return false end
+  -- Another machine's lock is not ours to judge: its pids mean nothing here.
+  local host = uv.os_gethostname and uv.os_gethostname() or nil
+  if rec.host and host and rec.host ~= host then return false end
+  if not (uv.kill and uv.os_getpid) then return false end
+  if rec.pid == uv.os_getpid() then return false end -- ourselves, re-entering
+
+  local ok_sig = uv.kill(rec.pid, 0)
+  if ok_sig == 0 then
+    -- The pid is live. Is it still the SAME process, or a reused pid?
+    local now_start = M._proc_start(rec.pid)
+    if rec.start and now_start and rec.start ~= now_start then
+      return true -- pid reused: the original owner is gone
+    end
+    return false  -- genuinely alive; never break it
+  end
+  -- kill(pid, 0) failed. EPERM means it exists but is not ours to signal, so
+  -- only a "no such process" answer counts as dead.
+  return true
+end
 
 ---with_lock runs `fn` while holding an exclusive lock on `path`.
 ---
@@ -187,23 +259,51 @@ function M.with_lock(path, fn)
   for _ = 1, 50 do -- ~500ms of contention before we give up
     fd = uv.fs_open(lock, "wx", tonumber("600", 8))
     if fd then break end
-    -- Held. Break it only if it is provably stale; otherwise wait and retry.
-    -- Wall clock is the right clock here: the holder may be another PROCESS,
-    -- so a monotonic in-process timer says nothing about its age.
-    local st = uv.fs_stat(lock)
-    local held_secs = st and st.mtime and st.mtime.sec or nil
-    if held_secs and (os.time() - held_secs) * 1000 > M.LOCK_STALE_MS then
+
+    -- Held. Break it ONLY on proven death of the owner. Age is not liveness: a
+    -- live holder can exceed any window on a filesystem stall, a scheduler
+    -- suspension or a debugger, and breaking it admits a second writer to the
+    -- same read-modify-write — the lost update this lock exists to prevent
+    -- (ADR-0060 r2 #1). A heartbeat would not help either: a process stalled
+    -- in fsync cannot refresh its own mtime, which is precisely when the old
+    -- age check fired.
+    local rec = select(1, M.read_json(lock))
+    if _owner_dead(rec) then
       pcall(uv.fs_unlink, lock)
+    elseif rec == nil then
+      -- No parseable owner (a legacy zero-byte lock, or a torn write). We
+      -- cannot judge it, so fall back to age at a MUCH longer horizon — this
+      -- is a backstop against a permanently wedged registry, not a routine
+      -- path. Nothing on the system garbage-collects this file, so refusing
+      -- forever would turn one SIGKILL into an unrecoverable failure.
+      local st = uv.fs_stat(lock)
+      local secs = st and st.mtime and st.mtime.sec or nil
+      if secs and (os.time() - secs) * 1000 > M.LOCK_ABANDONED_MS then
+        pcall(uv.fs_unlink, lock)
+      end
     end
     vim.wait(10)
   end
   if not fd then return nil, "with_lock: could not acquire " .. lock end
 
-  -- Release on EVERY path, including a throw: a leaked lock would wedge the
-  -- registry for LOCK_STALE_MS and make the next writer look broken.
+  -- Stamp ownership INTO the lock so a contender can judge us the same way.
+  -- The file used to be created and never written — zero bytes, no identity.
+  local ok_enc, encoded = pcall(vim.json.encode, _owner_record())
+  if ok_enc then pcall(uv.fs_write, fd, encoded, 0) end
+  local mine = uv.fs_fstat(fd)
+
+  -- Release on EVERY path, including a throw: a leaked lock would block the
+  -- next writer until the abandoned-lock backstop expires.
   local ok, value, err = pcall(fn)
   pcall(uv.fs_close, fd)
-  pcall(uv.fs_unlink, lock)
+
+  -- Unlink only if the pathname STILL refers to the file we created. After any
+  -- break — including a legitimate one — a straggler reaching this line would
+  -- otherwise delete the SUCCESSOR's lock by pathname and admit a third writer.
+  local now = uv.fs_stat(lock)
+  if now and mine and now.ino == mine.ino then
+    pcall(uv.fs_unlink, lock)
+  end
 
   if not ok then return nil, "with_lock: " .. tostring(value) end
   return value, err

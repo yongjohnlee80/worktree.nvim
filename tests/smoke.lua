@@ -686,8 +686,9 @@ do
         ok("9e: _show_range_diff opened a float", false, "no new window appeared")
       end
     else
-      ok("9e: FAIL-LOUD — the fixture needs two commits for a range diff",
-        false, "rev-parse HEAD~1 -> " .. vim.inspect(second))
+      ok("9e: FAIL-LOUD — the fixture needs three commits for a range diff",
+        false, ("c2=%s c3=%s (from.hash~1 needs from to HAVE a parent)")
+          :format(vim.inspect(c2), vim.inspect(c3)))
     end
   end
 
@@ -1314,6 +1315,146 @@ print("\n[12] worktree.config — defaults and the nested deep-merge")
     config.options.notify_title == config.defaults.notify_title)
 
   config.options = saved
+end)()
+
+-- ───── [13] store.with_lock — mutual exclusion (ADR-0060 r2 #1) ─────
+-- Had ZERO test coverage while being the mechanism r1 MF1 added to prevent
+-- lost updates. It decided a lock was orphaned from AGE ALONE and unlinked it,
+-- so a live holder stalled past the window (slow fsync, scheduler suspension, a
+-- debugger) got its lock broken and BOTH writers entered — reintroducing the
+-- very condition it exists to prevent. Reproduced across two real nvim
+-- processes with an actual lost update on watches.json.
+print("\n[13] store.with_lock — liveness, not age; ownership-checked release")
+;(function()
+  local store = require("worktree.store")
+  local uv = vim.uv or vim.loop
+  local root = vim.fn.tempname() .. "-lock"
+  vim.fn.mkdir(root, "p")
+  store._root_override = root
+  local target = root .. "/guarded.json"
+  local lock = target .. ".lock"
+
+  -- ── the lock must carry an owner record, not be an empty file ──
+  local seen_payload
+  local okrun = store.with_lock(target, function()
+    local fd = uv.fs_open(lock, "r", tonumber("600", 8))
+    if fd then
+      local st = uv.fs_fstat(fd)
+      seen_payload = st and st.size and st.size > 0
+        and uv.fs_read(fd, st.size, 0) or nil
+      uv.fs_close(fd)
+    end
+    return true
+  end)
+  ok("13a: with_lock runs its critical section", okrun == true)
+  ok("13a: *** the lock file carries an owner record (was zero bytes) ***",
+    type(seen_payload) == "string" and seen_payload ~= "", tostring(seen_payload))
+  local owner = seen_payload and (pcall(vim.json.decode, seen_payload)
+    and vim.json.decode(seen_payload)) or nil
+  ok("13a: the record names the owning pid", owner and type(owner.pid) == "number",
+    vim.inspect(owner))
+  ok("13a: and the host, so a foreign-host lock is never judged by us",
+    owner and type(owner.host) == "string", vim.inspect(owner))
+  ok("13a: the lock is released when the section completes",
+    uv.fs_stat(lock) == nil)
+
+  -- ── a LIVE holder is never broken, however old its mtime ──
+  -- This is the r2 finding: age is not liveness.
+  local held = uv.fs_open(lock, "wx", tonumber("600", 8))
+  ok("13b: acquired a lock by hand", held ~= nil)
+  local rec = vim.json.encode({ pid = uv.os_getpid(), host = uv.os_gethostname(),
+                                start = store._proc_start(uv.os_getpid()) })
+  uv.fs_write(held, rec, 0)
+  -- Age it far past any threshold. THIS process is alive and owns it.
+  local ancient = os.time() - (store.LOCK_STALE_MS / 1000) * 100
+  uv.fs_utime(lock, ancient, ancient)
+  local entered = false
+  local v2, e2 = store.with_lock(target, function() entered = true; return true end)
+  ok("13b: *** a LIVE owner's lock is NOT broken, even aged past the window ***",
+    entered == false, "critical section entered=" .. tostring(entered))
+  ok("13b: and the caller is told it could not acquire",
+    v2 == nil and tostring(e2):find("acquire") ~= nil, tostring(e2))
+  ok("13b: the live holder's lock is still on disk", uv.fs_stat(lock) ~= nil)
+
+  -- ── a DEAD owner's lock IS broken (else a crash wedges the registry) ──
+  -- Nothing on the system garbage-collects this file, so refusing forever would
+  -- turn one SIGKILL into a permanent, user-unrecoverable failure.
+  uv.fs_close(held)
+  -- Recreate rather than overwrite in place: writing a SHORTER record at offset
+  -- 0 leaves trailing bytes from the longer one, which is a torn write, not a
+  -- crashed owner. (That mistake is why an earlier run of this test failed —
+  -- and it exercised the "cannot judge" backstop instead of the dead-owner
+  -- path, which is worth knowing the difference between.)
+  vim.fn.delete(lock)
+  local dead = uv.fs_open(lock, "wx", tonumber("600", 8))
+  uv.fs_write(dead, vim.json.encode({
+    pid = 2147480000,                        -- a pid that cannot be running
+    host = uv.os_gethostname(), start = 1,
+  }), 0)
+  uv.fs_close(dead)
+  local entered2 = false
+  local v3 = store.with_lock(target, function() entered2 = true; return true end)
+  ok("13c: *** a DEAD owner's lock IS broken, so a crash cannot wedge it ***",
+    entered2 == true and v3 == true, "entered=" .. tostring(entered2))
+
+  -- A lock we cannot JUDGE (no parseable owner) is not broken on sight — only
+  -- after the much longer abandoned-lock horizon.
+  vim.fn.delete(lock)
+  local torn = uv.fs_open(lock, "wx", tonumber("600", 8))
+  uv.fs_write(torn, '{"pid":123,"ho', 0)   -- truncated write
+  uv.fs_close(torn)
+  local entered_torn = false
+  store.with_lock(target, function() entered_torn = true; return true end)
+  ok("13c: an UNJUDGEABLE lock is not broken on sight",
+    entered_torn == false, "entered=" .. tostring(entered_torn))
+  local long_ago = os.time() - (store.LOCK_ABANDONED_MS / 1000) - 60
+  uv.fs_utime(lock, long_ago, long_ago)
+  local entered_old = false
+  store.with_lock(target, function() entered_old = true; return true end)
+  ok("13c: but IS broken past the abandoned-lock horizon (no permanent wedge)",
+    entered_old == true, "entered=" .. tostring(entered_old))
+
+  -- ── a foreign HOST's lock is not ours to judge ──
+  local held2 = uv.fs_open(lock, "wx", tonumber("600", 8))
+  uv.fs_write(held2, vim.json.encode({
+    pid = 2147480000, host = "some-other-machine", start = 1,
+  }), 0)
+  uv.fs_close(held2)
+  local entered3 = false
+  store.with_lock(target, function() entered3 = true; return true end)
+  ok("13d: a lock from ANOTHER host is not broken on pid evidence alone",
+    entered3 == false, "entered=" .. tostring(entered3))
+  vim.fn.delete(lock)
+
+  -- ── release is ownership-checked, not by pathname ──
+  -- After any break — including a legitimate one — a straggler in the old
+  -- process reaching its release path would unlink the SUCCESSOR's lock by
+  -- pathname, admitting a third writer.
+  local inner_lock_ino
+  store.with_lock(target, function()
+    -- Simulate the successor: replace the lock file with a different inode
+    -- while we are inside, then let our release run.
+    vim.fn.delete(lock)
+    local other = uv.fs_open(lock, "wx", tonumber("600", 8))
+    uv.fs_write(other, vim.json.encode({ pid = uv.os_getpid(),
+      host = uv.os_gethostname(), start = 1 }), 0)
+    uv.fs_close(other)
+    local st = uv.fs_stat(lock)
+    inner_lock_ino = st and st.ino
+    return true
+  end)
+  local after = uv.fs_stat(lock)
+  ok("13e: *** release does NOT unlink a lock it no longer owns ***",
+    after ~= nil and after.ino == inner_lock_ino,
+    "successor lock survived=" .. tostring(after ~= nil))
+  vim.fn.delete(lock)
+
+  -- CONTROL: a lock we DO own is released, or every run would leak one.
+  store.with_lock(target, function() return true end)
+  ok("13e: CONTROL — a lock we own IS released", uv.fs_stat(lock) == nil)
+
+  store._root_override = nil
+  vim.fn.delete(root, "rf")
 end)()
 
 -- ───────────── assertion-count floor (silent-drop guard) ─────────────
