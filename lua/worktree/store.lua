@@ -404,20 +404,37 @@ function M.with_lock(path, fn)
   -- write aborts rather than proceeding (r6 should-fix 1). Logging and carrying
   -- on left exactly the "unreadable owner record" state that costs the next
   -- writer its diagnosis — and reported success while doing it.
+  ---_abandon closes and removes the lock we just created, and reports whether
+  ---the removal actually happened. Binding libuv's result matters here for the
+  ---same reason it mattered in the release path: `pcall` reports only whether
+  ---Lua threw. This is the SEVENTH place in this module where an unbound
+  ---`fs_unlink` had to be corrected — written into new cleanup code after the
+  ---identical fix was made elsewhere — so it is a named helper now rather than
+  ---a line to be re-typed.
+  ---
+  ---Removing OUR OWN lock is not the contested-pathname case: we created it a
+  ---moment ago with O_EXCL and nothing else can hold it yet.
+  ---@return string suffix  "" when clean, otherwise recovery text for the error
+  local function _abandon()
+    pcall(uv.fs_close, fd)
+    local removed, uerr = uv.fs_unlink(lock)
+    if removed then return "" end
+    return (". The lock file %s COULD NOT be removed (%s) and will block the"
+      .. " next writer — see README.md \"Recovering a stuck lock\"")
+      :format(lock, tostring(uerr))
+  end
+
   local ok_enc, encoded = pcall(vim.json.encode, _owner_record())
   if not ok_enc then
-    pcall(uv.fs_close, fd); pcall(uv.fs_unlink, lock)
-    return nil, "with_lock: could not encode the owner record: " .. tostring(encoded)
+    return nil, ("with_lock: could not encode the owner record: %s%s")
+      :format(tostring(encoded), _abandon())
   end
   local wrote, werr = uv.fs_write(fd, encoded, 0)
   if wrote ~= #encoded then
-    -- Remove OUR OWN lock on the way out: we created it, nothing else can hold
-    -- it yet, so this unlink is not the contested-pathname case.
-    pcall(uv.fs_close, fd); pcall(uv.fs_unlink, lock)
     return nil, ("with_lock: could not stamp the owner record on %s (wrote %s of"
-      .. " %d bytes%s) — refusing rather than holding an unidentifiable lock")
+      .. " %d bytes%s) — refusing rather than holding an unidentifiable lock%s")
       :format(lock, tostring(wrote), #encoded,
-        werr and (": " .. tostring(werr)) or "")
+        werr and (": " .. tostring(werr)) or "", _abandon())
   end
   local mine = uv.fs_fstat(fd)
 

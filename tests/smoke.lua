@@ -1591,6 +1591,45 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
       local leftover = uv.fs_stat(root .. "/stamp.json.lock") ~= nil
       return entered == false and v == nil and e ~= nil and not leftover
     end)(), "must not enter the callback, and must remove its own lock")
+  -- If the cleanup unlink ITSELF fails, the error must name the leftover lock
+  -- and point at the recovery procedure (r7 note 2) — otherwise the caller is
+  -- told the stamp failed and never learns a blocking file was left behind.
+  ok("15a: *** a failed cleanup names the leftover lock and the recovery doc ***",
+    (function()
+      local real_write, real_unlink = uv.fs_write, uv.fs_unlink
+      uv.fs_write = function(fd, data, off)
+        if type(data) == "string" and data:find("\"pid\"", 1, true) then
+          return nil, "EIO"
+        end
+        return real_write(fd, data, off)
+      end
+      uv.fs_unlink = function(pth)
+        if tostring(pth):find("cleanup%.json%.lock$") then return nil, "EPERM" end
+        return real_unlink(pth)
+      end
+      local _, e = store.with_lock(root .. "/cleanup.json", function() return true end)
+      uv.fs_write, uv.fs_unlink = real_write, real_unlink
+      vim.fn.delete(root .. "/cleanup.json.lock")
+      return e ~= nil
+        and tostring(e):find("COULD NOT be removed", 1, true) ~= nil
+        and tostring(e):find("cleanup.json.lock", 1, true) ~= nil
+        and tostring(e):find("Recovering a stuck lock", 1, true) ~= nil
+    end)(), "a leftover lock must be reported with its path and the procedure")
+  ok("15a: CONTROL — a clean cleanup adds no leftover-lock text",
+    (function()
+      local real_write = uv.fs_write
+      uv.fs_write = function(fd, data, off)
+        if type(data) == "string" and data:find("\"pid\"", 1, true) then
+          return nil, "EIO"
+        end
+        return real_write(fd, data, off)
+      end
+      local _, e = store.with_lock(root .. "/clean.json", function() return true end)
+      uv.fs_write = real_write
+      return e ~= nil and tostring(e):find("COULD NOT be removed", 1, true) == nil
+        and uv.fs_stat(root .. "/clean.json.lock") == nil
+    end)(), "a successful cleanup must not warn about a leftover")
+
   ok("15a: a PARTIAL stamp is treated as a failure, not a success",
     (function()
       local real_write = uv.fs_write
@@ -1740,10 +1779,11 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
         commit = string.rep("1", 40), revision = 1 })
       c.comments = {}; return c end)()))))
 
-  -- DEADLINE CONTROL on the real default: the constant must drive the loop, not
-  -- a hard-coded iteration count. Measured against a live holder, so the wait is
-  -- genuinely exhausted. Uses a reduced-but-nontrivial value to keep the suite
-  -- fast while still proving the linkage.
+  -- DEADLINE CONTROL on a REPRESENTATIVE CONFIGURED deadline — not the shipped
+  -- default, which this deliberately does not wait out. What is under test is
+  -- the LINKAGE: whatever `LOCK_WAIT_MS` says must be what the loop waits, so a
+  -- hard-coded iteration count (the r5 defect) cannot come back. Measured
+  -- against a live holder so the window is genuinely exhausted.
   store.LOCK_WAIT_MS = 400
   do
     local held = uv.fs_open(root .. "/dl.json.lock", "wx", tonumber("600", 8))
@@ -1936,7 +1976,7 @@ end)()
 --
 -- A floor catches it while still allowing new tests to be added freely: raise
 -- MIN_ASSERTIONS when you add coverage, and a drop below it is a hard failure.
-local MIN_ASSERTIONS = 282
+local MIN_ASSERTIONS = 284
 local total_asserts = pass_count + fail_count
 if total_asserts < MIN_ASSERTIONS then
   fail_count = fail_count + 1

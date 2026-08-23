@@ -494,8 +494,11 @@ entirely.
 
 ## Recovering a stuck lock
 
-`worktree.nvim` guards its shared state (`watches.json`, the review store) with a
-lock file so two Neovim instances cannot lose each other's writes. A lock is
+`worktree.nvim` guards the **watch registry** (`watches.json`) with a lock file so
+two Neovim instances cannot lose each other's writes. Only that file uses a lock.
+Review revisions use a different mechanism — each is claimed by exclusive
+creation, so a concurrent reviewer gets the next revision number rather than
+overwriting yours, and no lock is involved. A lock is
 **never** removed automatically — there is no atomic "remove only if unchanged"
 operation available, so any automatic reclamation can delete a *live* lock and
 let two writers in at once.
