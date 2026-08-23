@@ -158,11 +158,6 @@ end
 ---#1). Liveness is decided by `_owner_dead` below.
 M.LOCK_STALE_MS = 10000
 
----LOCK_ABANDONED_MS is the LAST-RESORT backstop for a lock we cannot judge —
----one with no parseable owner record (a legacy zero-byte lock, or a truncated
----write). Deliberately far longer than any plausible critical section here,
----because breaking on age is exactly the mistake this module made before.
-M.LOCK_ABANDONED_MS = 15 * 60 * 1000
 
 ---_proc_start returns a process's start time, used to defeat PID REUSE: a pid
 ---alone is not an identity, because the OS reuses pids and a recycled one would
@@ -174,16 +169,29 @@ M.LOCK_ABANDONED_MS = 15 * 60 * 1000
 ---than age.
 ---@param pid integer
 ---@return integer? starttime
-function M._proc_start(pid)
-  if type(pid) ~= "number" then return nil end
-  local fd = io.open("/proc/" .. pid .. "/stat", "r")
-  if not fd then return nil end
-  local line = fd:read("*l") or ""
-  fd:close()
-  -- The comm field can contain spaces and parentheses, so count from the LAST
-  -- ")" rather than splitting the whole line.
-  local tail = line:match("%)%s+(.*)$")
-  if not tail then return nil end
+---_parse_proc_stat extracts field 22 (starttime) from one /proc/<pid>/stat
+---line. Split out from `_proc_start` so the parsing can be tested against a
+---hostile comm without needing a real process to be named that way.
+---@param line string
+---@return integer? starttime
+function M._parse_proc_stat(line)
+  line = tostring(line or "")
+  -- The comm field is parenthesised and may itself contain spaces AND
+  -- parentheses, so the fields after it begin at the LAST ")" on the line.
+  -- `line:match("%)%s+(.*)$")` did NOT do that: Lua takes the leftmost match,
+  -- so a comm like `(nvim) shifted` made it start from the FIRST ") " and
+  -- return the wrong field — the start time read as 0, which `_owner_dead`
+  -- then reads as pid reuse and a live holder becomes "dead" (r4 #2). The
+  -- comment claimed "LAST" while the code took the first: the fourth
+  -- comment-contradicts-code defect found in this module, so it is now
+  -- computed rather than pattern-matched.
+  local close = nil
+  for i = #line, 1, -1 do
+    if line:sub(i, i) == ")" then close = i break end
+  end
+  if not close then return nil end
+  local tail = line:sub(close + 1):match("^%s*(.*)$")
+  if not tail or tail == "" then return nil end
   local n, i = nil, 0
   for word in tail:gmatch("%S+") do
     i = i + 1
@@ -191,6 +199,19 @@ function M._proc_start(pid)
   end
   return n
 end
+
+---@param pid integer
+---@return integer? starttime
+function M._proc_start(pid)
+  if type(pid) ~= "number" then return nil end
+  local fd = io.open("/proc/" .. pid .. "/stat", "r")
+  if not fd then return nil end
+  local line = fd:read("*l") or ""
+  fd:close()
+  return M._parse_proc_stat(line)
+end
+
+M._parse_proc_stat_for_tests = M._parse_proc_stat
 
 ---_owner_record describes THIS process as the lock's owner.
 local function _owner_record()
@@ -216,14 +237,16 @@ local function _owner_dead(rec)
   if not (uv.kill and uv.os_getpid) then return false end
   if rec.pid == uv.os_getpid() then return false end -- ourselves, re-entering
 
-  local ok_sig, sig_err = uv.kill(rec.pid, 0)
+  -- luv returns `0` on success, or `nil, message, CODE`. The third result is the
+  -- stable errno name; matching the human-readable message was fragile across
+  -- platforms and would silently mean "never break" if the wording differed
+  -- (r4 should-fix 1).
+  local ok_sig, _, sig_code = uv.kill(rec.pid, 0)
   if ok_sig ~= 0 then
-    -- Only "no such process" proves death. EPERM means the process EXISTS and
-    -- this user may not signal it — treating that as dead was a direct
-    -- contradiction of this function's own contract (r3 #1). Anything we cannot
-    -- positively read as ESRCH is alive.
-    local msg = tostring(sig_err or "")
-    if msg:find("ESRCH") or msg:find("no such process") then return true end
+    -- Only ESRCH proves death. EPERM means the process EXISTS and this user may
+    -- not signal it; treating that as dead contradicted this function's own
+    -- contract (r3 #1). Anything not positively ESRCH is alive.
+    if sig_code == "ESRCH" then return true end
     return false
   end
   do
@@ -244,30 +267,25 @@ end
 ---read-modify-write of a shared store file must run in here.
 ---
 ---The lock is a sibling `<path>.lock` created with O_EXCL, which is atomic on
----every filesystem we target. A lock older than `LOCK_STALE_MS` is assumed
----orphaned by a crash and broken, because refusing forever is worse than
----racing once.
+---every filesystem we target, and it CARRIES its owner (pid, host, process
+---start time) so a contender can say who holds it.
+---
+---**A lock is never broken automatically.** Three revisions of this module tried
+---to reclaim a dead owner's lock and each only moved the race: libuv exposes no
+---atomic conditional unlink, so any `fs_stat` then `fs_unlink` leaves a window
+---in which a successor is installed and then deleted by a decision that is
+---already stale. `LOCK_STALE_MS` is therefore a CONTENTION WINDOW, not a
+---staleness proof — after it, acquisition fails and reports the recorded owner.
+---
+---The trade, stated plainly: a crashed holder leaves a lock that must be removed
+---by hand. That is chosen over automatic reclamation because a lost update in a
+---shared registry is silent and unbounded, whereas a stuck lock is loud, names
+---its own cause, and clears with one `rm`. The error text includes the pid, the
+---host, and whether that process is still running.
 ---Returns at most TWO values from `fn`, which is all any caller here needs
 ---(`value, err`). Kept deliberately narrow: threading true varargs out would
 ---need `table.maxn`/`unpack`, whose availability differs across the Lua
 ---versions Neovim has shipped, for no benefit at these call sites.
----_break_stale removes `lock` ONLY if it is still the inode we judged.
----
----An unconditional unlink here was a takeover race (r3 #1): two contenders read
----the same dead owner, A unlinked and acquired, then B executed the unlink its
----now-STALE read had justified and deleted A's LIVE successor, admitting a
----second writer. The release path was already inode-checked; acquisition was
----not, and a release-time check cannot undo an unlink that already happened.
----@param lock string
----@param seen_ino integer?   the inode the caller's decision was based on
----@return boolean removed
-local function _break_stale(lock, seen_ino)
-  local st = uv.fs_stat(lock)
-  if not st then return false end                 -- already gone
-  if seen_ino and st.ino ~= seen_ino then return false end  -- a successor: not ours
-  return (pcall(uv.fs_unlink, lock))
-end
-
 ---@param path string          the file being guarded (NOT the lock path)
 ---@param fn fun():any,any?    critical section; runs at most once
 ---@return any? value, string? err
@@ -278,6 +296,9 @@ function M.with_lock(path, fn)
   end
   local lock = path .. ".lock"
   local fd
+  -- The owner record we last read off a contested lock, so the refusal can say
+  -- WHO holds it rather than only that acquisition failed.
+  local held_by
 
   for _ = 1, 50 do -- ~500ms of contention before we give up
     fd = uv.fs_open(lock, "wx", tonumber("600", 8))
@@ -290,41 +311,35 @@ function M.with_lock(path, fn)
     -- (ADR-0060 r2 #1). A heartbeat would not help either: a process stalled
     -- in fsync cannot refresh its own mtime, which is precisely when the old
     -- age check fired.
-    -- Capture the inode our decision is based on, so the unlink below cannot
-    -- act on a lock that was replaced in the meantime (r3 #1).
-    local seen = uv.fs_stat(lock)
-    local seen_ino = seen and seen.ino or nil
+    -- NO automatic takeover (r4 #1). There is no atomic conditional unlink in
+    -- libuv: any `fs_stat` then `fs_unlink` leaves a window in which a
+    -- successor is installed and then deleted by our stale decision — moving
+    -- the race rather than closing it, which is exactly what the previous two
+    -- attempts here did. `pcall(uv.fs_unlink, ...)` also reports whether Lua
+    -- threw, not whether libuv removed anything.
+    --
+    -- So we never remove a lock we do not own. A dead owner's lock is REPORTED,
+    -- with the identity needed to clear it by hand. That trades automatic
+    -- crash recovery for provable mutual exclusion, deliberately: a rare lost
+    -- update in a shared registry is silent and unbounded, whereas a stuck lock
+    -- is loud, diagnosable, and cleared by removing one named file.
     local rec = select(1, M.read_json(lock))
-    if _owner_dead(rec) then
-      _break_stale(lock, seen_ino)
-    elseif rec == nil then
-      -- No parseable owner (a legacy zero-byte lock, or a torn write). We
-      -- cannot judge it, so fall back to age at a MUCH longer horizon — this
-      -- is a backstop against a permanently wedged registry, not a routine
-      -- path. Nothing on the system garbage-collects this file, so refusing
-      -- forever would turn one SIGKILL into an unrecoverable failure.
-      local secs = seen and seen.mtime and seen.mtime.sec or nil
-      if secs and (os.time() - secs) * 1000 > M.LOCK_ABANDONED_MS then
-        -- DOCUMENTED RESIDUAL RISK (r3 #1). This is the one path where age
-        -- still decides, and it is therefore a LEASE, not strict mutual
-        -- exclusion: a live holder whose owner record was torn mid-write and
-        -- which then stalls past the horizon can still be broken. Accepted
-        -- deliberately — the alternative is a permanently wedged registry that
-        -- only manual removal of a dotfile can clear — but it is logged, so a
-        -- forced break is never silent.
-        if _break_stale(lock, seen_ino) then
-          local ok_log, log = pcall(require, "worktree.log")
-          if ok_log then
-            log.warn("store", ("force-broke an unreadable lock after %d minutes: %s"
-              .. " — if this recurs, a writer is failing mid-write")
-              :format(M.LOCK_ABANDONED_MS / 60000, lock))
-          end
-        end
-      end
-    end
+    held_by = rec
     vim.wait(10)
   end
-  if not fd then return nil, "with_lock: could not acquire " .. lock end
+  if not fd then
+    local who
+    if type(held_by) == "table" and held_by.pid then
+      who = ("pid %s on %s"):format(tostring(held_by.pid), tostring(held_by.host or "?"))
+      if _owner_dead(held_by) then
+        who = who .. " — that process is NO LONGER RUNNING, so this lock is"
+          .. " stale; remove it to recover"
+      end
+    else
+      who = "an unreadable owner record (likely written by an older version)"
+    end
+    return nil, ("with_lock: could not acquire %s (held by %s)"):format(lock, who)
+  end
 
   -- Stamp ownership INTO the lock so a contender can judge us the same way.
   -- The file used to be created and never written — zero bytes, no identity.
@@ -342,7 +357,17 @@ function M.with_lock(path, fn)
   -- otherwise delete the SUCCESSOR's lock by pathname and admit a third writer.
   local now = uv.fs_stat(lock)
   if now and mine and now.ino == mine.ino then
-    pcall(uv.fs_unlink, lock)
+    -- `pcall` would report only whether Lua threw, so bind libuv's own result
+    -- (r4 #1). Nothing can replace our lock while we hold it now that automatic
+    -- takeover is gone, which is what makes this stat-then-unlink sound.
+    local removed, unlink_err = uv.fs_unlink(lock)
+    if not removed then
+      local ok_log, log = pcall(require, "worktree.log")
+      if ok_log then
+        log.warn("store", ("could not release %s: %s — the next writer will"
+          .. " refuse until it is removed"):format(lock, tostring(unlink_err)))
+      end
+    end
   end
 
   if not ok then return nil, "with_lock: " .. tostring(value) end
@@ -387,7 +412,6 @@ function M.create_exclusive(path, content)
 end
 
 ---Test seams for the takeover protocol and the liveness model (r3 #1).
-M._break_stale_for_tests = _break_stale
 M._owner_dead_for_tests = _owner_dead
 
 ---reviews_dir is where a repo's review files live.

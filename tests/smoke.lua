@@ -1487,10 +1487,13 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
   vim.fn.mkdir(root, "p")
   store._root_override = root
 
-  -- ── #1a: STALE TAKEOVER must not delete a live successor ──
-  -- Release was inode-checked, but TAKEOVER was not: two contenders both read
-  -- the same dead owner, A unlinked and acquired, then B executed the unlink
-  -- justified by its now-stale read and deleted A's LIVE successor.
+  -- ── #1a: a lock we do not own is NEVER removed ──
+  -- Two previous attempts tried to make takeover safe and both only MOVED the
+  -- race: any `fs_stat` then `fs_unlink` leaves a window in which a successor
+  -- is installed and then deleted by a stale decision. libuv offers no atomic
+  -- conditional unlink, so automatic takeover is gone entirely (r4 #1). A dead
+  -- owner's lock is now REPORTED with the identity needed to clear it — loud
+  -- and diagnosable instead of a silent, unbounded lost update.
   local target = root .. "/takeover.json"
   local lock = target .. ".lock"
   local dead = uv.fs_open(lock, "wx", tonumber("600", 8))
@@ -1499,42 +1502,73 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
   uv.fs_close(dead)
   local dead_ino = (uv.fs_stat(lock) or {}).ino
 
-  -- Simulate A winning the race between B's read and B's unlink: replace the
-  -- dead lock with a LIVE one under a different inode.
-  vim.fn.delete(lock)
-  local live = uv.fs_open(lock, "wx", tonumber("600", 8))
-  uv.fs_write(live, vim.json.encode({ pid = uv.os_getpid(),
-    host = uv.os_gethostname(), start = store._proc_start(uv.os_getpid()) }), 0)
-  uv.fs_close(live)
-  local live_ino = (uv.fs_stat(lock) or {}).ino
-  ok("15a: the successor lock has a different inode", live_ino ~= dead_ino)
-
-  -- B now attempts, holding a stale belief that the lock is dead.
   local entered = false
-  store._break_stale_for_tests(lock, dead_ino)   -- B's stale-justified unlink
-  ok("15a: *** a stale takeover does NOT delete the live successor ***",
-    uv.fs_stat(lock) ~= nil and (uv.fs_stat(lock) or {}).ino == live_ino,
-    "successor still present=" .. tostring(uv.fs_stat(lock) ~= nil))
-  store.with_lock(target, function() entered = true; return true end)
-  ok("15a: and B does not enter while the live holder is in place",
-    entered == false, "entered=" .. tostring(entered))
-  -- CONTROL: a takeover justified by a CURRENT read does remove the lock.
-  ok("15a: CONTROL — a takeover matching the observed inode DOES break it",
+  local v, err = store.with_lock(target, function() entered = true; return true end)
+  ok("15a: *** a DEAD owner's lock is not taken over automatically ***",
+    entered == false and v == nil, "entered=" .. tostring(entered))
+  ok("15a: *** and the lock file is left exactly as it was ***",
+    (uv.fs_stat(lock) or {}).ino == dead_ino,
+    "inode changed or file removed")
+  ok("15a: the refusal names the holding pid",
+    tostring(err):find("2147480000", 1, true) ~= nil, tostring(err))
+  ok("15a: and says the process is gone, so the lock is clearable",
+    tostring(err):find("NO LONGER RUNNING", 1, true) ~= nil, tostring(err))
+  ok("15a: an unreadable owner record is reported as such, not broken",
     (function()
-      local ino = (uv.fs_stat(lock) or {}).ino
-      store._break_stale_for_tests(lock, ino)
-      return uv.fs_stat(lock) == nil
-    end)())
+      vim.fn.delete(lock)
+      local torn = uv.fs_open(lock, "wx", tonumber("600", 8))
+      uv.fs_write(torn, '{"pid":123,"ho', 0); uv.fs_close(torn)
+      local _, e = store.with_lock(target, function() return true end)
+      local still = uv.fs_stat(lock) ~= nil
+      return still and tostring(e):find("unreadable owner record", 1, true) ~= nil
+    end)(), "a torn record must be reported, never force-removed")
+  vim.fn.delete(lock)
+  -- CONTROL: with no lock present, acquisition works and releases cleanly.
+  local ok_run = store.with_lock(target, function() return true end)
+  ok("15a: CONTROL — an uncontested lock is acquired and released",
+    ok_run == true and uv.fs_stat(lock) == nil)
 
   -- ── #1b: EPERM is not death ──
   -- pid 1 exists and cannot be signalled by a normal user: kill(1,0) yields
   -- EPERM. My code returned true for every non-success, while its own comment
   -- said only ESRCH counts — the same comment/code contradiction as before.
-  ok("15b: *** an EPERM signal result is NOT treated as death ***",
-    store._owner_dead_for_tests({ pid = 1, host = uv.os_gethostname() }) == false)
-  ok("15b: CONTROL — an impossible pid IS treated as death",
-    store._owner_dead_for_tests({ pid = 2147480000,
-      host = uv.os_gethostname() }) == true)
+  -- Stubbed rather than relying on pid 1's real permissions, so the errno
+  -- BRANCH is exercised deterministically on any machine (r4 should-fix 1).
+  local real_kill = uv.kill
+  local rec_live = { pid = 4242, host = uv.os_gethostname(), start = 1 }
+  uv.kill = function() return nil, "permission denied", "EPERM" end
+  ok("15b: *** EPERM (process exists, cannot signal) is NOT death ***",
+    store._owner_dead_for_tests(rec_live) == false)
+  uv.kill = function() return nil, "no such process", "ESRCH" end
+  ok("15b: ESRCH IS death", store._owner_dead_for_tests(rec_live) == true)
+  uv.kill = function() return nil, "something new libuv invented", "EWEIRD" end
+  ok("15b: an UNKNOWN errno fails safe — treated as alive, never broken",
+    store._owner_dead_for_tests(rec_live) == false)
+  uv.kill = real_kill
+  ok("15b: CONTROL — unstubbed, a live pid (ourselves' parent-safe probe) is alive",
+    store._owner_dead_for_tests({ pid = uv.os_getpid(),
+      host = uv.os_gethostname() }) == false)
+
+  -- ── #2: /proc/<pid>/stat must be parsed from the LAST ")" ──
+  -- The pattern took the leftmost `") "`, so a comm containing `) ` returned the
+  -- wrong field — a start time of 0, which _owner_dead reads as pid reuse and a
+  -- LIVE holder becomes "dead" (r4 #2).
+  ok("15b: _proc_start reads a real start time for this process",
+    type(store._proc_start(uv.os_getpid())) == "number"
+      and store._proc_start(uv.os_getpid()) > 0,
+    tostring(store._proc_start(uv.os_getpid())))
+  ok("15b: *** a comm containing ') ' does not shift the field ***",
+    (function()
+      -- field 22 is the 20th token after the comm; build a line whose comm
+      -- itself contains ") " to defeat a leftmost match.
+      local fields = {}
+      for i = 1, 30 do fields[i] = tostring(1000 + i) end
+      local line = '4242 (nvim) shifted) S ' .. table.concat(fields, " ", 1, 30)
+      return store._parse_proc_stat_for_tests(line) == tonumber(fields[19])
+    end)(), "parsed=" .. tostring(store._parse_proc_stat_for_tests(
+      '4242 (nvim) shifted) S ' .. (function()
+        local f = {}; for i = 1, 30 do f[i] = tostring(1000 + i) end
+        return table.concat(f, " ") end)())))
 
   -- ── #2: github_payload must MATERIALISE the side default ──
   -- The internal artifact may omit side (review-json §3), but GitHub's REST
@@ -1689,11 +1723,18 @@ print("\n[13] store.with_lock — liveness, not age; ownership-checked release")
   uv.fs_close(dead)
   local entered2 = false
   local v3 = store.with_lock(target, function() entered2 = true; return true end)
-  ok("13c: *** a DEAD owner's lock IS broken, so a crash cannot wedge it ***",
-    entered2 == true and v3 == true, "entered=" .. tostring(entered2))
+  -- INVERTED, not deleted (the P6 pattern). This block used to assert that a
+  -- dead owner's lock IS broken, and that an unjudgeable one is broken past a
+  -- 15-minute horizon. Both behaviours were REMOVED in r4: every attempt to
+  -- make that unlink safe only moved the race, because libuv has no atomic
+  -- conditional unlink. So the assertions now guard that automatic takeover
+  -- STAYS gone — dead coverage turned into a live invariant rather than thrown
+  -- away.
+  ok("13c: *** a DEAD owner's lock is NOT broken automatically ***",
+    entered2 == false and v3 == nil, "entered=" .. tostring(entered2))
+  ok("13c: the dead lock is still on disk, to be cleared deliberately",
+    uv.fs_stat(lock) ~= nil)
 
-  -- A lock we cannot JUDGE (no parseable owner) is not broken on sight — only
-  -- after the much longer abandoned-lock horizon.
   vim.fn.delete(lock)
   local torn = uv.fs_open(lock, "wx", tonumber("600", 8))
   uv.fs_write(torn, '{"pid":123,"ho', 0)   -- truncated write
@@ -1702,12 +1743,17 @@ print("\n[13] store.with_lock — liveness, not age; ownership-checked release")
   store.with_lock(target, function() entered_torn = true; return true end)
   ok("13c: an UNJUDGEABLE lock is not broken on sight",
     entered_torn == false, "entered=" .. tostring(entered_torn))
-  local long_ago = os.time() - (store.LOCK_ABANDONED_MS / 1000) - 60
-  uv.fs_utime(lock, long_ago, long_ago)
-  local entered_old = false
-  store.with_lock(target, function() entered_old = true; return true end)
-  ok("13c: but IS broken past the abandoned-lock horizon (no permanent wedge)",
-    entered_old == true, "entered=" .. tostring(entered_old))
+  ok("13c: and no age threshold breaks it later either (the lease is gone)",
+    (function()
+      local long_ago = os.time() - 365 * 24 * 3600
+      uv.fs_utime(lock, long_ago, long_ago)
+      local e = false
+      store.with_lock(target, function() e = true; return true end)
+      return e == false and uv.fs_stat(lock) ~= nil
+    end)(), "a year-old unreadable lock must still not be force-broken")
+  ok("13c: LOCK_ABANDONED_MS is gone, so nothing can reintroduce the lease",
+    store.LOCK_ABANDONED_MS == nil, tostring(store.LOCK_ABANDONED_MS))
+  vim.fn.delete(lock)
 
   -- ── a foreign HOST's lock is not ours to judge ──
   local held2 = uv.fs_open(lock, "wx", tonumber("600", 8))
@@ -1764,7 +1810,7 @@ end)()
 --
 -- A floor catches it while still allowing new tests to be added freely: raise
 -- MIN_ASSERTIONS when you add coverage, and a drop below it is a hard failure.
-local MIN_ASSERTIONS = 209
+local MIN_ASSERTIONS = 272
 local total_asserts = pass_count + fail_count
 if total_asserts < MIN_ASSERTIONS then
   fail_count = fail_count + 1
