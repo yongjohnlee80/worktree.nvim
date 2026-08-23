@@ -53,6 +53,7 @@ M.REQUIRED = {
   "git.log.commit_files",
   "git.graph.fan_out",
   "git.graph.show_diff",
+  "git.graph.working_diff",
   "git.worktree.parse_porcelain",
   "git.worktree.list",
   "git.diff.parse",
@@ -310,6 +311,22 @@ function M.diff(repo, sha)
   if not core or not repo then return {} end
   local raw = core.git.graph.show_diff(repo.common_dir, sha)
   return core.git.diff.parse(raw)
+end
+
+---diff_working parses a WORKTREE's uncommitted diff — the UNCOMMITTED node's
+---counterpart to `diff(repo, sha)`.
+---
+---Staged and unstaged changes to tracked files plus every untracked file, in
+---one parse, so `o` on UNCOMMITTED opens the same three-column view a commit
+---does. Uncached in auto-core, deliberately: a working tree changes between
+---keypresses.
+---@param wt table  a worktree record (needs `.path`)
+---@return table[] files
+function M.diff_working(wt)
+  local core = _core()
+  if not core or not wt or not wt.path then return {} end
+  local raw = core.git.graph.working_diff(wt.path)
+  return core.git.diff.parse(table.concat(raw, "\n"))
 end
 
 ---toggle_watch flips a worktree's watch. Re-exported here so a frontend needs
