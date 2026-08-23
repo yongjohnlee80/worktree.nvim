@@ -1513,6 +1513,48 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
     tostring(err):find("2147480000", 1, true) ~= nil, tostring(err))
   ok("15a: and says the process is gone, so the lock is clearable",
     tostring(err):find("NO LONGER RUNNING", 1, true) ~= nil, tostring(err))
+  -- MANUAL RECOVERY MUST DEMAND QUIESCENCE (r5 must-fix). "remove it to
+  -- recover" moved the race into the operator's hands: two repairers both
+  -- diagnose the same stale lock, the first removes it, a writer acquires a
+  -- successor, and the second's `rm` deletes that live successor. A pathname
+  -- `rm` is no more conditional than `fs_unlink` was.
+  ok("15a: *** the refusal requires stopping EVERY writer before removing it ***",
+    tostring(err):find("QUIT EVERY Neovim", 1, true) ~= nil, tostring(err))
+  ok("15a: names the exact lock path to remove, not a pattern",
+    tostring(err):find(lock, 1, true) ~= nil, tostring(err))
+  ok("15a: and warns that removing it live can delete a successor",
+    tostring(err):find("delete a live successor", 1, true) ~= nil, tostring(err))
+  ok("15a: the refusal reports the window it actually waited",
+    tostring(err):find(tostring(store.LOCK_WAIT_MS) .. "ms", 1, true) ~= nil,
+    tostring(err))
+
+  -- A STILL-RUNNING holder is ordinary contention and must NOT be described as
+  -- clearable (r5 should-fix 4: every case gets a status, not only the dead one).
+  ok("15a: a LIVE holder is reported as normal contention, not as stale",
+    (function()
+      vim.fn.delete(lock)
+      local mine = uv.fs_open(lock, "wx", tonumber("600", 8))
+      uv.fs_write(mine, vim.json.encode({ pid = uv.os_getpid(),
+        host = uv.os_gethostname(),
+        start = store._proc_start(uv.os_getpid()) }), 0)
+      uv.fs_close(mine)
+      local _, e = store.with_lock(target, function() return true end)
+      vim.fn.delete(lock)
+      return tostring(e):find("STILL RUNNING", 1, true) ~= nil
+        and tostring(e):find("QUIT EVERY", 1, true) == nil
+    end)(), "a live holder must not be advertised as removable")
+
+  -- A non-EEXIST fs_open failure is a different problem and must say so, rather
+  -- than being reported as an unreadable owner record (r5 should-fix 2).
+  ok("15a: a permissions failure is reported as itself, not as contention",
+    (function()
+      local ro = root .. "/ro"
+      vim.fn.mkdir(ro, "p")
+      vim.fn.system({ "chmod", "500", ro })
+      local _, e = store.with_lock(ro .. "/x.json", function() return true end)
+      vim.fn.system({ "chmod", "700", ro })
+      return e ~= nil and tostring(e):find("owner record", 1, true) == nil
+    end)(), "an EACCES must not masquerade as an unreadable owner record")
   ok("15a: an unreadable owner record is reported as such, not broken",
     (function()
       vim.fn.delete(lock)
@@ -1520,8 +1562,13 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
       uv.fs_write(torn, '{"pid":123,"ho', 0); uv.fs_close(torn)
       local _, e = store.with_lock(target, function() return true end)
       local still = uv.fs_stat(lock) ~= nil
-      return still and tostring(e):find("unreadable owner record", 1, true) ~= nil
-    end)(), "a torn record must be reported, never force-removed")
+      -- Asserted on MEANING, not an exact phrase: the file must survive and the
+      -- caller must be told liveness is unknown. (An earlier version matched
+      -- literal wording and broke when the message was reworded — the assertion
+      -- was coupled to prose rather than behaviour.)
+      return still and tostring(e):find("UNKNOWN", 1, true) ~= nil
+        and tostring(e):find("QUIT EVERY", 1, true) ~= nil
+    end)(), "a torn record must be reported with unknown liveness, never removed")
   vim.fn.delete(lock)
   -- CONTROL: with no lock present, acquisition works and releases cleanly.
   local ok_run = store.with_lock(target, function() return true end)
@@ -1695,7 +1742,7 @@ print("\n[13] store.with_lock — liveness, not age; ownership-checked release")
                                 start = store._proc_start(uv.os_getpid()) })
   uv.fs_write(held, rec, 0)
   -- Age it far past any threshold. THIS process is alive and owns it.
-  local ancient = os.time() - (store.LOCK_STALE_MS / 1000) * 100
+  local ancient = os.time() - (store.LOCK_WAIT_MS / 1000) * 100
   uv.fs_utime(lock, ancient, ancient)
   local entered = false
   local v2, e2 = store.with_lock(target, function() entered = true; return true end)
@@ -1810,7 +1857,7 @@ end)()
 --
 -- A floor catches it while still allowing new tests to be added freely: raise
 -- MIN_ASSERTIONS when you add coverage, and a drop below it is a hard failure.
-local MIN_ASSERTIONS = 272
+local MIN_ASSERTIONS = 278
 local total_asserts = pass_count + fail_count
 if total_asserts < MIN_ASSERTIONS then
   fail_count = fail_count + 1

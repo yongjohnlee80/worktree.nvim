@@ -153,10 +153,18 @@ function M.mtime(path)
   return st.mtime.sec * 1000000000 + (st.mtime.nsec or 0)
 end
 
----LOCK_STALE_MS is the contention window before `with_lock` gives up. It is NOT
----a staleness proof: age cannot establish that a holder is dead (ADR-0060 r2
----#1). Liveness is decided by `_owner_dead` below.
-M.LOCK_STALE_MS = 10000
+---LOCK_WAIT_MS is how long `with_lock` waits for a contested lock before
+---refusing. It is a CONTENTION WINDOW and nothing more: age never establishes
+---that a holder is dead (ADR-0060 r2 #1), and no code path breaks a lock.
+---
+---Renamed from `LOCK_STALE_MS`, which advertised 10000 ms while the retry loop
+---was hard-coded to 50 iterations of 10 ms — a measured 505 ms (r5 should-fix
+---1). The constant now DRIVES the loop, so the documented figure and the
+---behaviour cannot drift apart again.
+M.LOCK_WAIT_MS = 10000
+
+---LOCK_POLL_MS is the retry interval inside that window.
+M.LOCK_POLL_MS = 10
 
 
 ---_proc_start returns a process's start time, used to defeat PID REUSE: a pid
@@ -274,7 +282,7 @@ end
 ---to reclaim a dead owner's lock and each only moved the race: libuv exposes no
 ---atomic conditional unlink, so any `fs_stat` then `fs_unlink` leaves a window
 ---in which a successor is installed and then deleted by a decision that is
----already stale. `LOCK_STALE_MS` is therefore a CONTENTION WINDOW, not a
+---already stale. `LOCK_WAIT_MS` is therefore a CONTENTION WINDOW, not a
 ---staleness proof — after it, acquisition fails and reports the recorded owner.
 ---
 ---The trade, stated plainly: a crashed holder leaves a lock that must be removed
@@ -300,61 +308,99 @@ function M.with_lock(path, fn)
   -- WHO holds it rather than only that acquisition failed.
   local held_by
 
-  for _ = 1, 50 do -- ~500ms of contention before we give up
-    fd = uv.fs_open(lock, "wx", tonumber("600", 8))
-    if fd then break end
+  -- Deadline derived from the constant, not a hard-coded iteration count.
+  local attempts = math.max(1, math.floor(M.LOCK_WAIT_MS / M.LOCK_POLL_MS))
+  local open_err, open_code
+  for _ = 1, attempts do
+    -- Bind libuv's error (r5 should-fix 2). Previously any failure was treated
+    -- as contention, so an EACCES on a directory we cannot write was reported
+    -- as "an unreadable owner record from an older version" — a misleading
+    -- diagnosis of a permissions problem. Only EEXIST means "someone holds it".
+    local nfd, err, code = uv.fs_open(lock, "wx", tonumber("600", 8))
+    if nfd then fd = nfd break end
+    open_err, open_code = err, code
+    if code ~= "EEXIST" then break end   -- not contention; stop and report it
 
-    -- Held. Break it ONLY on proven death of the owner. Age is not liveness: a
-    -- live holder can exceed any window on a filesystem stall, a scheduler
-    -- suspension or a debugger, and breaking it admits a second writer to the
-    -- same read-modify-write — the lost update this lock exists to prevent
-    -- (ADR-0060 r2 #1). A heartbeat would not help either: a process stalled
-    -- in fsync cannot refresh its own mtime, which is precisely when the old
-    -- age check fired.
-    -- NO automatic takeover (r4 #1). There is no atomic conditional unlink in
-    -- libuv: any `fs_stat` then `fs_unlink` leaves a window in which a
-    -- successor is installed and then deleted by our stale decision — moving
-    -- the race rather than closing it, which is exactly what the previous two
-    -- attempts here did. `pcall(uv.fs_unlink, ...)` also reports whether Lua
-    -- threw, not whether libuv removed anything.
-    --
-    -- So we never remove a lock we do not own. A dead owner's lock is REPORTED,
-    -- with the identity needed to clear it by hand. That trades automatic
-    -- crash recovery for provable mutual exclusion, deliberately: a rare lost
-    -- update in a shared registry is silent and unbounded, whereas a stuck lock
-    -- is loud, diagnosable, and cleared by removing one named file.
-    local rec = select(1, M.read_json(lock))
-    held_by = rec
-    vim.wait(10)
+    -- NO automatic takeover (r4 #1). libuv has no atomic conditional unlink:
+    -- any `fs_stat` then `fs_unlink` leaves a window in which a successor is
+    -- installed and then deleted by an already-stale decision. Three revisions
+    -- of this code proved that a second check only moves the race. So a lock we
+    -- do not own is never removed — it is REPORTED, with the identity needed to
+    -- clear it deliberately and offline.
+    held_by = select(1, M.read_json(lock))
+    vim.wait(M.LOCK_POLL_MS)
   end
+
   if not fd then
-    local who
+    -- A non-EEXIST failure is not contention at all; say what it really was.
+    if open_code and open_code ~= "EEXIST" then
+      return nil, ("with_lock: cannot create %s (%s: %s)")
+        :format(lock, tostring(open_code), tostring(open_err))
+    end
+
+    -- MANUAL RECOVERY REQUIRES GLOBAL QUIESCENCE (r5 must-fix). Saying "remove
+    -- it to recover" moved the race out of the code and into the operator's
+    -- hands: two repairers can both diagnose the same stale lock L, the first
+    -- removes it, a writer acquires successor L2, and the second's `rm` — still
+    -- justified by its own stale read — deletes L2, letting a fourth writer in
+    -- beside the third. A pathname `rm` is no more conditional than
+    -- `fs_unlink` was.
+    --
+    -- So the instruction is offline repair, not a one-liner: every Neovim that
+    -- may write this directory must be stopped FIRST, so no writer can acquire
+    -- a successor while the file is being removed.
+    local who, status
     if type(held_by) == "table" and held_by.pid then
       who = ("pid %s on %s"):format(tostring(held_by.pid), tostring(held_by.host or "?"))
-      if _owner_dead(held_by) then
-        who = who .. " — that process is NO LONGER RUNNING, so this lock is"
-          .. " stale; remove it to recover"
+      -- Every case gets a status, not only the dead one (r5 should-fix 4).
+      local host = uv.os_gethostname and uv.os_gethostname() or nil
+      if held_by.host and host and held_by.host ~= host then
+        status = "on another host, so its liveness is UNKNOWN from here"
+      elseif _owner_dead(held_by) then
+        status = "that process is NO LONGER RUNNING, so the lock is stale"
+      else
+        status = "that process is STILL RUNNING, so this is normal contention"
       end
     else
-      who = "an unreadable owner record (likely written by an older version)"
+      who = "an owner record this version cannot read"
+      status = "liveness UNKNOWN (likely written by an older version)"
     end
-    return nil, ("with_lock: could not acquire %s (held by %s)"):format(lock, who)
+    return nil, ("with_lock: could not acquire %s after %dms (held by %s — %s).%s")
+      :format(lock, M.LOCK_WAIT_MS, who, status,
+        (status:find("STILL RUNNING") and "" or
+          (" To clear a stale lock: QUIT EVERY Neovim that writes " .. M.root()
+           .. ", then remove " .. lock .. ", then restart. Removing it while any"
+           .. " writer is running can delete a live successor lock.")))
   end
 
   -- Stamp ownership INTO the lock so a contender can judge us the same way.
   -- The file used to be created and never written — zero bytes, no identity.
   local ok_enc, encoded = pcall(vim.json.encode, _owner_record())
-  if ok_enc then pcall(uv.fs_write, fd, encoded, 0) end
+  if ok_enc then
+    -- Bind libuv's result rather than swallowing it in pcall (r5 should-fix 2):
+    -- a lock whose record failed to write is exactly the "unreadable owner"
+    -- case that costs the next writer its diagnosis, so it must be visible.
+    local wrote, werr = uv.fs_write(fd, encoded, 0)
+    if not wrote then
+      local ok_log, log = pcall(require, "worktree.log")
+      if ok_log then
+        log.warn("store", ("could not stamp the owner record on %s: %s — a"
+          .. " contender will not be able to identify this holder")
+          :format(lock, tostring(werr)))
+      end
+    end
+  end
   local mine = uv.fs_fstat(fd)
 
-  -- Release on EVERY path, including a throw: a leaked lock would block the
-  -- next writer until the abandoned-lock backstop expires.
+  -- Release on EVERY path, including a throw. There is no backstop that will
+  -- clean up after us: a leaked lock blocks the next writer until someone
+  -- removes it offline.
   local ok, value, err = pcall(fn)
   pcall(uv.fs_close, fd)
 
-  -- Unlink only if the pathname STILL refers to the file we created. After any
-  -- break — including a legitimate one — a straggler reaching this line would
-  -- otherwise delete the SUCCESSOR's lock by pathname and admit a third writer.
+  -- Unlink only if the pathname STILL refers to the file we created. This is
+  -- sound only because nothing removes a lock automatically any more; if
+  -- takeover ever returns, this stat-then-unlink becomes a race again.
   local now = uv.fs_stat(lock)
   if now and mine and now.ino == mine.ino then
     -- `pcall` would report only whether Lua threw, so bind libuv's own result
