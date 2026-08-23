@@ -286,10 +286,17 @@ end
 ---staleness proof — after it, acquisition fails and reports the recorded owner.
 ---
 ---The trade, stated plainly: a crashed holder leaves a lock that must be removed
----by hand. That is chosen over automatic reclamation because a lost update in a
----shared registry is silent and unbounded, whereas a stuck lock is loud, names
----its own cause, and clears with one `rm`. The error text includes the pid, the
----host, and whether that process is still running.
+---**offline**. That is chosen over automatic reclamation because a lost update in
+---a shared registry is silent and unbounded, whereas a stuck lock is loud and
+---names its own cause.
+---
+---Recovery is NOT a single `rm`. An earlier version of this docstring said it
+---was, which is the same unsafe shortcut the error text had to drop: removing
+---the file while any writer is running can delete a LIVE successor lock, because
+---`rm` resolves a pathname and cannot be conditional on the inode any more than
+---`fs_unlink` could. The procedure requires every writer stopped first, and it
+---is written down in README.md ("Recovering a stuck lock") because the error
+---message disappears the moment you follow its own first step.
 ---Returns at most TWO values from `fn`, which is all any caller here needs
 ---(`value, err`). Kept deliberately narrow: threading true varargs out would
 ---need `table.maxn`/`unpack`, whose availability differs across the Lua
@@ -349,46 +356,68 @@ function M.with_lock(path, fn)
     -- So the instruction is offline repair, not a one-liner: every Neovim that
     -- may write this directory must be stopped FIRST, so no writer can acquire
     -- a successor while the file is being removed.
-    local who, status
+    -- `liveness` is an ENUM driving the branch; the prose is derived FROM it.
+    -- It was the other way round — `status:find("STILL RUNNING")` — which made
+    -- a reworded sentence able to start advertising repair for a LIVE holder
+    -- (r6 should-fix 2). I had just fixed a TEST for being coupled to prose and
+    -- then coupled production control flow to prose in the same change.
+    local who, liveness
     if type(held_by) == "table" and held_by.pid then
       who = ("pid %s on %s"):format(tostring(held_by.pid), tostring(held_by.host or "?"))
-      -- Every case gets a status, not only the dead one (r5 should-fix 4).
       local host = uv.os_gethostname and uv.os_gethostname() or nil
       if held_by.host and host and held_by.host ~= host then
-        status = "on another host, so its liveness is UNKNOWN from here"
+        liveness = "unknown_host"
       elseif _owner_dead(held_by) then
-        status = "that process is NO LONGER RUNNING, so the lock is stale"
+        liveness = "dead"
       else
-        status = "that process is STILL RUNNING, so this is normal contention"
+        liveness = "alive"
       end
     else
       who = "an owner record this version cannot read"
-      status = "liveness UNKNOWN (likely written by an older version)"
+      liveness = "unknown_record"
+    end
+
+    local status = ({
+      alive = "that process is STILL RUNNING, so this is normal contention",
+      dead = "that process is NO LONGER RUNNING, so the lock is stale",
+      unknown_host = "on another host, so its liveness is UNKNOWN from here",
+      unknown_record = "liveness UNKNOWN (likely written by an older version)",
+    })[liveness]
+
+    -- Repair instructions are offered ONLY when the holder is not alive, keyed
+    -- off the enum rather than off the wording above.
+    local repair = ""
+    if liveness ~= "alive" then
+      repair = (" To clear a stale lock: QUIT EVERY Neovim that writes %s (on"
+        .. " every host that mounts it), THEN remove %s, then restart. Removing"
+        .. " it while any writer is running can delete a live successor lock."
+        .. " Full procedure: README.md, \"Recovering a stuck lock\".")
+        :format(M.root(), lock)
     end
     return nil, ("with_lock: could not acquire %s after %dms (held by %s — %s).%s")
-      :format(lock, M.LOCK_WAIT_MS, who, status,
-        (status:find("STILL RUNNING") and "" or
-          (" To clear a stale lock: QUIT EVERY Neovim that writes " .. M.root()
-           .. ", then remove " .. lock .. ", then restart. Removing it while any"
-           .. " writer is running can delete a live successor lock.")))
+      :format(lock, M.LOCK_WAIT_MS, who, status, repair)
   end
 
   -- Stamp ownership INTO the lock so a contender can judge us the same way.
   -- The file used to be created and never written — zero bytes, no identity.
+  -- A lock we cannot STAMP is a lock nobody can diagnose, so a failed or PARTIAL
+  -- write aborts rather than proceeding (r6 should-fix 1). Logging and carrying
+  -- on left exactly the "unreadable owner record" state that costs the next
+  -- writer its diagnosis — and reported success while doing it.
   local ok_enc, encoded = pcall(vim.json.encode, _owner_record())
-  if ok_enc then
-    -- Bind libuv's result rather than swallowing it in pcall (r5 should-fix 2):
-    -- a lock whose record failed to write is exactly the "unreadable owner"
-    -- case that costs the next writer its diagnosis, so it must be visible.
-    local wrote, werr = uv.fs_write(fd, encoded, 0)
-    if not wrote then
-      local ok_log, log = pcall(require, "worktree.log")
-      if ok_log then
-        log.warn("store", ("could not stamp the owner record on %s: %s — a"
-          .. " contender will not be able to identify this holder")
-          :format(lock, tostring(werr)))
-      end
-    end
+  if not ok_enc then
+    pcall(uv.fs_close, fd); pcall(uv.fs_unlink, lock)
+    return nil, "with_lock: could not encode the owner record: " .. tostring(encoded)
+  end
+  local wrote, werr = uv.fs_write(fd, encoded, 0)
+  if wrote ~= #encoded then
+    -- Remove OUR OWN lock on the way out: we created it, nothing else can hold
+    -- it yet, so this unlink is not the contested-pathname case.
+    pcall(uv.fs_close, fd); pcall(uv.fs_unlink, lock)
+    return nil, ("with_lock: could not stamp the owner record on %s (wrote %s of"
+      .. " %d bytes%s) — refusing rather than holding an unidentifiable lock")
+      :format(lock, tostring(wrote), #encoded,
+        werr and (": " .. tostring(werr)) or "")
   end
   local mine = uv.fs_fstat(fd)
 
@@ -457,7 +486,9 @@ function M.create_exclusive(path, content)
   return false, "link failed: " .. tostring(lerr)
 end
 
----Test seams for the takeover protocol and the liveness model (r3 #1).
+---Test seams for the liveness model (r3 #1). `_owner_dead_for_tests` backs the
+---enum that drives the refusal text, so a test can assert the DECISION rather
+---than the wording.
 M._owner_dead_for_tests = _owner_dead
 
 ---reviews_dir is where a repo's review files live.

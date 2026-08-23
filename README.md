@@ -492,6 +492,56 @@ After a successful remove:
 The currently-active worktree is excluded from the remove picker
 entirely.
 
+## Recovering a stuck lock
+
+`worktree.nvim` guards its shared state (`watches.json`, the review store) with a
+lock file so two Neovim instances cannot lose each other's writes. A lock is
+**never** removed automatically — there is no atomic "remove only if unchanged"
+operation available, so any automatic reclamation can delete a *live* lock and
+let two writers in at once.
+
+That means a crashed or force-killed Neovim can leave a lock behind, and you
+clear it by hand. **Write this down or keep this page open**: the error message
+tells you the path, but its first instruction is to quit Neovim, which closes the
+message.
+
+### What you will see
+
+```
+with_lock: could not acquire <state>/watches.json.lock after 10000ms
+  (held by pid 12345 on thishost — that process is NO LONGER RUNNING, so the
+  lock is stale). To clear a stale lock: QUIT EVERY Neovim that writes
+  <state> (on every host that mounts it), THEN remove
+  <state>/watches.json.lock, then restart.
+```
+
+If it instead says **STILL RUNNING**, nothing is wrong: another Neovim holds the
+lock for a moment. No repair is offered in that case, and none should be
+performed.
+
+### The procedure
+
+1. **Note the exact lock path** from the message. It is a full path; do not
+   guess it and do not use a wildcard.
+2. **Quit every Neovim that writes that state directory** — on every machine, if
+   the directory is shared or mounted. The state root is
+   `$XDG_STATE_HOME/nvim/worktree.nvim` (`:lua= require("worktree.store").root()`
+   prints it while Neovim is still open).
+3. **Only then remove that one file.**
+4. **Restart.**
+
+### Why the order matters
+
+Removing the lock while any writer is running can delete a *live successor*: the
+first repairer removes the stale lock, a writer immediately takes a new one, and
+a second `rm` — still aimed at the old path — deletes that new lock instead,
+letting two writers into the same read-modify-write. `rm` resolves a pathname and
+cannot be conditional on which file is there, which is the same reason the plugin
+does not reclaim locks itself.
+
+If you cannot stop every writer, leave the lock alone. A stuck lock costs you a
+watch toggle; a lost update silently discards another instance's state.
+
 ## License
 
 MIT.

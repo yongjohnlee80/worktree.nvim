@@ -1487,6 +1487,15 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
   vim.fn.mkdir(root, "p")
   store._root_override = root
 
+  -- Production waits LOCK_WAIT_MS (10s) before refusing, which is right for a
+  -- user but made this suite spend ~60s deliberately losing races (r6
+  -- should-fix 3). Scope it down for the contention assertions and restore it
+  -- after, keeping ONE control below that the real default still drives the
+  -- loop — otherwise shortening the window here could hide a regression where
+  -- the constant stops being honoured at all.
+  local real_wait = store.LOCK_WAIT_MS
+  store.LOCK_WAIT_MS = 60
+
   -- ── #1a: a lock we do not own is NEVER removed ──
   -- Two previous attempts tried to make takeover safe and both only MOVED the
   -- race: any `fs_stat` then `fs_unlink` leaves a window in which a successor
@@ -1546,15 +1555,57 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
 
   -- A non-EEXIST fs_open failure is a different problem and must say so, rather
   -- than being reported as an unreadable owner record (r5 should-fix 2).
+  -- Stubbed rather than chmod'd (r6 should-fix 3): chmod behaves differently for
+  -- root and on some filesystems, and asserting the ABSENCE of one wrong phrase
+  -- would pass for any other wrong message. Assert the errno reaches the caller.
   ok("15a: a permissions failure is reported as itself, not as contention",
     (function()
-      local ro = root .. "/ro"
-      vim.fn.mkdir(ro, "p")
-      vim.fn.system({ "chmod", "500", ro })
-      local _, e = store.with_lock(ro .. "/x.json", function() return true end)
-      vim.fn.system({ "chmod", "700", ro })
-      return e ~= nil and tostring(e):find("owner record", 1, true) == nil
-    end)(), "an EACCES must not masquerade as an unreadable owner record")
+      local real_open = uv.fs_open
+      uv.fs_open = function(pth, flags, mode)
+        if tostring(pth):match("%.lock$") then
+          return nil, "permission denied", "EACCES"
+        end
+        return real_open(pth, flags, mode)
+      end
+      local _, e = store.with_lock(root .. "/perm.json", function() return true end)
+      uv.fs_open = real_open
+      return e ~= nil and tostring(e):find("EACCES", 1, true) ~= nil
+        and tostring(e):find("could not acquire", 1, true) == nil
+    end)(), "an EACCES must surface as EACCES, not as contention")
+
+  -- A failed or PARTIAL owner stamp must ABORT and clean up its own lock, not
+  -- proceed with an unidentifiable lock and report success (r6 should-fix 1).
+  ok("15a: *** a failed owner stamp REFUSES rather than holding a mute lock ***",
+    (function()
+      local real_write = uv.fs_write
+      uv.fs_write = function(fd, data, off)
+        if type(data) == "string" and data:find("\"pid\"", 1, true) then
+          return nil, "EIO"          -- the stamp specifically
+        end
+        return real_write(fd, data, off)
+      end
+      local entered = false
+      local v, e = store.with_lock(root .. "/stamp.json",
+        function() entered = true; return true end)
+      uv.fs_write = real_write
+      local leftover = uv.fs_stat(root .. "/stamp.json.lock") ~= nil
+      return entered == false and v == nil and e ~= nil and not leftover
+    end)(), "must not enter the callback, and must remove its own lock")
+  ok("15a: a PARTIAL stamp is treated as a failure, not a success",
+    (function()
+      local real_write = uv.fs_write
+      uv.fs_write = function(fd, data, off)
+        if type(data) == "string" and data:find("\"pid\"", 1, true) then
+          return 3                    -- short write
+        end
+        return real_write(fd, data, off)
+      end
+      local entered = false
+      local v = store.with_lock(root .. "/partial.json",
+        function() entered = true; return true end)
+      uv.fs_write = real_write
+      return entered == false and v == nil
+    end)(), "a short write leaves a truncated record — same as no record")
   ok("15a: an unreadable owner record is reported as such, not broken",
     (function()
       vim.fn.delete(lock)
@@ -1689,6 +1740,27 @@ print("\n[15] ADR-0060 r3 — conditional takeover, side projection, repo identi
         commit = string.rep("1", 40), revision = 1 })
       c.comments = {}; return c end)()))))
 
+  -- DEADLINE CONTROL on the real default: the constant must drive the loop, not
+  -- a hard-coded iteration count. Measured against a live holder, so the wait is
+  -- genuinely exhausted. Uses a reduced-but-nontrivial value to keep the suite
+  -- fast while still proving the linkage.
+  store.LOCK_WAIT_MS = 400
+  do
+    local held = uv.fs_open(root .. "/dl.json.lock", "wx", tonumber("600", 8))
+    uv.fs_write(held, vim.json.encode({ pid = uv.os_getpid(),
+      host = uv.os_gethostname(), start = store._proc_start(uv.os_getpid()) }), 0)
+    uv.fs_close(held)
+    local t0 = uv.hrtime()
+    store.with_lock(root .. "/dl.json", function() return true end)
+    local ms = (uv.hrtime() - t0) / 1e6
+    ok("15e: the wait is DRIVEN by LOCK_WAIT_MS, not a fixed iteration count",
+      ms >= 400 * 0.7 and ms <= 400 * 3,
+      ("waited %dms for a %dms window"):format(math.floor(ms), 400))
+    vim.fn.delete(root .. "/dl.json.lock")
+  end
+  store.LOCK_WAIT_MS = real_wait
+  ok("15e: and the production default is restored", store.LOCK_WAIT_MS == real_wait)
+
   store._root_override = nil
   vim.fn.delete(root, "rf")
 end)()
@@ -1707,6 +1779,12 @@ print("\n[13] store.with_lock — liveness, not age; ownership-checked release")
   local root = vim.fn.tempname() .. "-lock"
   vim.fn.mkdir(root, "p")
   store._root_override = root
+  -- Scoped window: this section deliberately loses several races, and at the
+  -- production 10s each one costs the suite ten seconds of waiting for a result
+  -- we already know (r6 should-fix 3). Section [15] keeps the control proving
+  -- the real constant still drives the loop.
+  local real_wait = store.LOCK_WAIT_MS
+  store.LOCK_WAIT_MS = 60
   local target = root .. "/guarded.json"
   local lock = target .. ".lock"
 
@@ -1841,6 +1919,7 @@ print("\n[13] store.with_lock — liveness, not age; ownership-checked release")
   store.with_lock(target, function() return true end)
   ok("13e: CONTROL — a lock we own IS released", uv.fs_stat(lock) == nil)
 
+  store.LOCK_WAIT_MS = real_wait
   store._root_override = nil
   vim.fn.delete(root, "rf")
 end)()
@@ -1857,7 +1936,7 @@ end)()
 --
 -- A floor catches it while still allowing new tests to be added freely: raise
 -- MIN_ASSERTIONS when you add coverage, and a drop below it is a hard failure.
-local MIN_ASSERTIONS = 278
+local MIN_ASSERTIONS = 282
 local total_asserts = pass_count + fail_count
 if total_asserts < MIN_ASSERTIONS then
   fail_count = fail_count + 1
