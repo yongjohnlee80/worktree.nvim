@@ -88,13 +88,12 @@ doc.comments = {
 -- canonical reviews — review-json §6 requires a primary Markdown for every
 -- projection, and `save_next` never wrote one. The e2e models the skill, so it
 -- models the new step.
-local function markdown_for(rev)
-  local dir = ("%s/agents/lector/reviews"):format(vim.env.AUTO_AGENTS_KB_ROOT)
-  vim.fn.mkdir(dir, "p")
-  return "# Review\n\nprose the JSON cannot carry",
-    ("%s/2026-08-24-e2e-r%d-review.md"):format(dir, rev)
-end
-local res, serr = review.save_pair(slug, doc, markdown_for)
+-- The skill supplies a BODY and a topic; the store owns the path. It also sets
+-- `reviewer_slug`, which is the directory the document lands in — the store
+-- refuses a write it cannot attribute to a reviewer.
+local MARKDOWN = "# Review\n\nprose the JSON cannot carry"
+doc.reviewer_slug = "lector"
+local res, serr = review.save_pair(slug, doc, MARKDOWN, { topic = "e2e" })
 local path, rev = res and res.json_path, res and res.revision
 ok("skill step 4: save_pair() writes the JSON", path ~= nil
   and vim.fn.filereadable(path) == 1, tostring(serr))
@@ -111,12 +110,12 @@ ok("skill step 4: *** the JSON cross-references the document ***",
 -- non-negotiable #2: a 0-based line must be REJECTED
 local bad = vim.deepcopy(doc); bad.comments[1].line = 0
 ok("non-negotiable 2: a 0-based line is refused, not shifted",
-  select(1, review.save_pair(slug, bad, markdown_for)) == nil)
+  select(1, review.save_pair(slug, bad, MARKDOWN, { topic = "e2e" })) == nil)
 
 -- non-negotiable 4: a re-review is a NEW revision, and save_next assigns it
 -- rather than the caller guessing.
 local doc2 = vim.deepcopy(doc)
-local res2 = review.save_pair(slug, doc2, markdown_for)
+local res2 = (function() doc2.reviewer_slug = "lector"; return review.save_pair(slug, doc2, MARKDOWN, { topic = "e2e" }) end)()
 local p2, rev2 = res2 and res2.json_path, res2 and res2.revision
 -- ADR-0067: a re-review is a NEW revision, and a FAILED attempt RETIRES the
 -- number it reserved rather than recycling it. The refused 0-based review above
@@ -127,11 +126,21 @@ ok("non-negotiable 4: a re-review claims a NEW revision, leaving r1 intact",
   rev2 ~= nil and rev2 > 1 and review.latest_revision(slug, sha) == rev2
     and #review.list_for(slug, sha) == 2,
   tostring(rev2) .. " / " .. tostring(review.latest_revision(slug, sha)))
-ok("non-negotiable 4: *** the refused attempt's revision was RETIRED, not reused ***",
-  rev2 > 2, ("refused r2, next claim was r%s"):format(tostring(rev2)))
-ok("non-negotiable 4: and the retirement left a tombstone, not a deletion",
-  vim.fn.filereadable(review.tombstone_path(slug, sha, 2)) == 1,
+-- ADR-0067's preflight changed this for the better: a review refused for a
+-- SCHEMA reason (here, a 0-based line) is now rejected BEFORE the reservation,
+-- so it consumes nothing at all. Previously it reserved, failed late, and
+-- retired the number — correct, but wasteful and surprising.
+ok("non-negotiable 4: *** a schema refusal consumes NO revision ***",
+  rev2 == 2, ("next claim was r%s — the refused attempt reserved nothing")
+    :format(tostring(rev2)))
+ok("non-negotiable 4: and left no tombstone, because nothing was claimed",
+  vim.fn.filereadable(review.tombstone_path(slug, sha, 2)) == 0,
   review.tombstone_path(slug, sha, 2))
+ok("non-negotiable 4: the refusal still happened (positive control)",
+  select(1, review.save_pair(slug, (function()
+    local b = vim.deepcopy(doc); b.comments[1].line = 0; b.reviewer_slug = "lector"
+    return b
+  end)(), MARKDOWN, { topic = "e2e" })) == nil)
 ok("non-negotiable 4: and r1's content is untouched",
   (review.load(slug, sha, 1) or {}).reviewer == "lector", tostring(p2))
 

@@ -30,11 +30,16 @@ local review = require("worktree.review")
 store._root_override = sb .. "/wtstore"
 
 local SLUG, SHA = "o__r", string.rep("d", 40)
-local function md_for(rev)
-  local dir = ("%s/agents/lector/reviews"):format(vim.env.AUTO_AGENTS_KB_ROOT)
-  vim.fn.mkdir(dir, "p")
-  return "# Review\n\nprose", ("%s/2026-08-24-a1-r%d-review.md"):format(dir, rev)
+-- The STORE owns the path now (ADR-0067 §2.2), so the test asks IT where a
+-- given revision will land rather than reproducing the naming — which is the
+-- point: a path the caller computes is a path the caller can get wrong.
+local TOPIC = "a1"
+local function doc_path(rev)
+  return review.canonical_document({
+    kb_root = vim.env.AUTO_AGENTS_KB_ROOT, reviewer_slug = "lector",
+    slug = SLUG, topic = TOPIC, revision = rev })
 end
+local BODY = "# Review\n\nprose"
 local function mk()
   local d = review.new({ slug = SLUG, owner = "o", name = "r", commit = SHA,
                          reviewer = "lector" })
@@ -44,7 +49,7 @@ local function mk()
 end
 
 io.stdout:write("\n[1] a pair is written, JSON last\n")
-local res, err = review.save_pair(SLUG, mk(), md_for)
+local res, err = review.save_pair(SLUG, mk(), BODY, { topic = TOPIC })
 ok("save_pair succeeds", res ~= nil, tostring(err))
 ok("the JSON exists", res and vim.fn.filereadable(res.json_path) == 1)
 ok("the Markdown exists", res and vim.fn.filereadable(res.md_path) == 1)
@@ -77,9 +82,10 @@ end
 io.stdout:write("\n[3] a taken Markdown name RETIRES the revision\n")
 do
   local nextrev = review.max_recorded_revision(SLUG, SHA) + 1
-  local _, taken = md_for(nextrev)
+  local taken = doc_path(nextrev)
+  vim.fn.mkdir(vim.fn.fnamemodify(taken, ":h"), "p")
   vim.fn.writefile({ "squatter" }, taken)
-  local r2, e2 = review.save_pair(SLUG, mk(), md_for)
+  local r2, e2 = review.save_pair(SLUG, mk(), BODY, { topic = TOPIC })
   ok("save_pair still succeeds, at a later revision", r2 ~= nil and r2.revision > nextrev,
     tostring(e2) .. " " .. tostring(r2 and r2.revision))
   ok("*** the squatted file is untouched ***",
@@ -87,7 +93,7 @@ do
   ok("*** and the skipped revision is TOMBSTONED, not silently reused ***",
     vim.fn.filereadable(review.tombstone_path(SLUG, SHA, nextrev)) == 1,
     review.tombstone_path(SLUG, SHA, nextrev))
-  local r3 = review.save_pair(SLUG, mk(), md_for)
+  local r3 = review.save_pair(SLUG, mk(), BODY, { topic = TOPIC })
   ok("a later write never re-offers the tombstoned number",
     r3 ~= nil and r3.revision ~= nextrev, tostring(r3 and r3.revision))
 end
@@ -111,9 +117,16 @@ do
   review.cleanup(SLUG, SHA)
   ok("*** an EXPIRED lease is tombstoned ***",
     vim.fn.filereadable(review.tombstone_path(SLUG, SHA, dead)) == 1)
-  ok("*** and tombstoned, NOT unlinked — nothing a writer owns is deleted ***",
-    vim.fn.filereadable(review.reserve_path(SLUG, SHA, dead)) == 0
-    or vim.fn.filereadable(review.tombstone_path(SLUG, SHA, dead)) == 1)
+  -- Was an A-or-B disjunction, which the tombstone alone satisfied — it could
+  -- not distinguish "reclaimed by tombstone" from "reclaimed by deletion",
+  -- which is the entire claim in its label. Assert the retirement RECORD
+  -- exists and that the revision is out of circulation.
+  ok("*** the retirement is a tombstone RECORD, not a deletion ***",
+    vim.fn.filereadable(review.tombstone_path(SLUG, SHA, dead)) == 1,
+    review.tombstone_path(SLUG, SHA, dead))
+  ok("*** and the retired revision is never re-offered ***",
+    review.max_recorded_revision(SLUG, SHA) >= dead,
+    ("max_recorded=%d dead=%d"):format(review.max_recorded_revision(SLUG, SHA), dead))
   ok("the live reservation is still untouched afterwards",
     vim.fn.filereadable(review.reserve_path(SLUG, SHA, live)) == 1)
   vim.fn.delete(review.reserve_path(SLUG, SHA, live))
@@ -166,7 +179,7 @@ do
 
   local mism = mk()
   mism.revision = 503
-  local _, mp = md_for(999)
+  local mp = doc_path(999)
   vim.fn.writefile({ "# r999" }, mp)
   mism.document = mp
   ok("*** a document whose rN disagrees with the review is refused ***",
