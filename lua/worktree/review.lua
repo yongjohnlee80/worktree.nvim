@@ -99,8 +99,12 @@ end
 ---validate checks a review's shape and returns the problems it found, so a
 ---malformed file is reported precisely rather than rendering as a blank pane.
 ---@param review any
+---@param opts { for_write: boolean? }?
+---  `for_write` REQUIRES `document`. Reads stay tolerant so artifacts written
+---  before ADR-0067 still load; writes do not, because JSON-last removed the
+---  transient unpaired state that made the field optional in the first place.
 ---@return boolean ok, string[] problems
-function M.validate(review)
+function M.validate(review, opts)
   local problems = {}
   if type(review) ~= "table" then
     return false, { "not a table" }
@@ -145,6 +149,27 @@ function M.validate(review)
       problems[#problems + 1] =
         "repo carries no identity — needs a non-empty url, or owner AND name"
     end
+  end
+  -- `document` — the cross-reference to the primary Markdown (review-json §6).
+  -- Shape only here; existence and containment are `validate_pair`'s job,
+  -- because this function must stay filesystem-free.
+  if review.document ~= nil then
+    if type(review.document) ~= "string" or review.document == "" then
+      problems[#problems + 1] = "document must be a non-empty string"
+    else
+      local drev = tonumber(review.document:match("%-r(%d+)%-review%.md$"))
+      if not drev then
+        problems[#problems + 1] =
+          "document must be named …-r<N>-review.md so the pair is legible"
+      elseif type(review.revision) == "number" and drev ~= review.revision then
+        problems[#problems + 1] = ("document is r%d but the review is r%s")
+          :format(drev, tostring(review.revision))
+      end
+    end
+  elseif opts and opts.for_write then
+    problems[#problems + 1] =
+      "document required for a new review — every JSON is a projection of a "
+      .. "Markdown review (review-json §6); write through save_pair()"
   end
   if type(review.comments) ~= "table" then
     problems[#problems + 1] = "comments missing"
@@ -207,6 +232,169 @@ function M.validate(review)
   return #problems == 0, problems
 end
 
+-- ── The paired store (ADR-0067) ──────────────────────────────────────────
+--
+-- Three record kinds share the reviews directory. Only the canonical JSON is
+-- visible to readers: `list_for` scans `"%.review%.json$"` and `store.list_files`
+-- filters on exactly that pattern, so the two below are never listed, never
+-- loaded and never counted by `latest_revision`.
+--
+--   <slug>@<short>.r<N>.review.json   canonical  — the commit point
+--   <slug>@<short>.r<N>.reserve       reservation — a live writer's claim
+--   <slug>@<short>.r<N>.tombstone     tombstone   — this revision is retired
+--
+-- Reclamation is APPEND-ONLY. Nothing is ever unlinked to reclaim it, because
+-- conditional deletion is not expressible here: `store.lua`'s own registry lock
+-- records that any `fs_stat` then `fs_unlink` "leaves a window in which a
+-- successor is installed and then deleted by a decision that is already stale",
+-- and that `rm` cannot be conditional on an inode any more than `fs_unlink`
+-- could. An expired reservation is TOMBSTONED, never removed.
+
+M.RESERVE_SUFFIX = ".reserve"
+M.TOMBSTONE_SUFFIX = ".tombstone"
+
+---LEASE_SECONDS is how long a reservation is considered live without renewal.
+---
+---Liveness is the lease and deliberately NOT a pid probe. This family has
+---already shipped two defects that way (ADR-0060 r4): a `/proc/<pid>/stat`
+---first-parenthesis parser that made a live renamed process look like PID
+---reuse, and a stat-to-unlink interleaving that deleted a live successor. A
+---lease has no such failure mode — its worst case is a slow writer losing a
+---revision number it had not committed.
+M.LEASE_SECONDS = 120
+
+local function _base(slug, sha, revision)
+  local short = tostring(sha or ""):sub(1, 7)
+  return string.format("%s@%s.r%d", slug, short, tonumber(revision) or 1)
+end
+
+---reserve_path / tombstone_path — the two non-canonical record names.
+function M.reserve_path(slug, sha, revision)
+  return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.RESERVE_SUFFIX
+end
+
+function M.tombstone_path(slug, sha, revision)
+  return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.TOMBSTONE_SUFFIX
+end
+
+---_token mints an UNGUESSABLE reservation owner.
+---
+---Not a pid and not a name: a guessable token is a lock anyone can forge, and
+---ownership is the only thing standing between a cleanup pass and a live
+---writer's claim.
+local function _token()
+  local ok, bytes = pcall(function()
+    return (vim.uv or vim.loop).random(16)
+  end)
+  if ok and type(bytes) == "string" and #bytes > 0 then
+    return (bytes:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+  end
+  -- Fallback: still unguessable enough for a same-machine race, and the only
+  -- path when libuv has no `random`.
+  local t = {}
+  for _ = 1, 16 do t[#t + 1] = string.format("%02x", math.random(0, 255)) end
+  return table.concat(t)
+end
+
+---_now is seconds since the epoch.
+local function _now() return os.time() end
+
+---max_recorded_revision is the allocation maximum over ALL THREE record kinds.
+---
+---`latest_revision` scans canonical files alone and is unchanged — it answers
+---"what is the newest review", which is a different question. Allocating from
+---it re-offers a number that is reserved or tombstoned but never committed,
+---which would hand a crashed writer's revision to the next one.
+---@param slug string
+---@param sha string
+---@return integer  0 when nothing is recorded
+function M.max_recorded_revision(slug, sha)
+  local short = tostring(sha or ""):sub(1, 7)
+  local dir = store.reviews_dir(slug)
+  local highest = 0
+  for _, name in ipairs(store.list_files(dir)) do
+    local rev = name:match("^.+@" .. short .. "%.r(%d+)%.review%.json$")
+      or name:match("^.+@" .. short .. "%.r(%d+)%" .. M.RESERVE_SUFFIX .. "$")
+      or name:match("^.+@" .. short .. "%.r(%d+)%" .. M.TOMBSTONE_SUFFIX .. "$")
+    rev = tonumber(rev)
+    if rev and rev > highest then highest = rev end
+  end
+  return highest
+end
+
+---_read_reservation returns the decoded reservation at `rev`, or nil.
+local function _read_reservation(slug, sha, rev)
+  local data = store.read_json(M.reserve_path(slug, sha, rev))
+  if type(data) ~= "table" then return nil end
+  return data
+end
+
+---_owns reports whether `token` still holds the reservation AND the revision has
+---not been tombstoned underneath it.
+local function _owns(slug, sha, rev, token)
+  if vim.uv and vim.uv.fs_stat(M.tombstone_path(slug, sha, rev)) then return false end
+  local r = _read_reservation(slug, sha, rev)
+  return r ~= nil and r.owner == token
+end
+
+---retire fences a revision so it can never be handed out again.
+---
+---Tombstoning can itself fail — a read-only reviews directory rejects the
+---tombstone for the same reason it rejected the JSON — so this is an ATTEMPT,
+---not a guarantee. The reservation is the fallback fence: it already
+---participates in `max_recorded_revision`, so retaining it keeps the number out
+---of circulation just as well. The only difference is whether the fence
+---survives a cleanup pass.
+---@return boolean tombstoned, string? err
+function M.retire(slug, sha, rev, token)
+  local ok, err = store.create_exclusive(
+    M.tombstone_path(slug, sha, rev),
+    vim.json.encode({ retired_at = _now(), by = token }))
+  if ok then
+    -- The tombstone fences the revision, so releasing our own reservation is
+    -- now safe. It is the ONLY unconditional removal in the protocol besides
+    -- the post-commit one.
+    if token and _owns(slug, sha, rev, token) then
+      pcall(function() (vim.uv or vim.loop).fs_unlink(M.reserve_path(slug, sha, rev)) end)
+    end
+    return true, nil
+  end
+  -- Taken by another writer's tombstone is success for our purposes: the
+  -- revision is fenced either way.
+  if not err and (vim.uv and vim.uv.fs_stat(M.tombstone_path(slug, sha, rev))) then
+    return true, nil
+  end
+  return false, err or "tombstone could not be created"
+end
+
+---cleanup tombstones reservations whose lease has expired.
+---
+---An expired lease is the ONLY evidence of staleness this protocol accepts. "No
+---canonical JSON yet" is not — that is also the state of every live writer
+---between reserving and committing, and a cleanup built on it reaps running
+---submitters.
+---@return integer retired
+function M.cleanup(slug, sha)
+  local short = tostring(sha or ""):sub(1, 7)
+  local dir = store.reviews_dir(slug)
+  local n = 0
+  for _, name in ipairs(store.list_files(dir)) do
+    local rev = tonumber(name:match("^.+@" .. short .. "%.r(%d+)%" .. M.RESERVE_SUFFIX .. "$"))
+    if rev then
+      -- Never tombstone a revision that already committed: the pair is
+      -- complete and the tombstone would be pure noise.
+      local canonical = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
+      local committed = vim.uv and vim.uv.fs_stat(canonical) ~= nil
+      local r = _read_reservation(slug, sha, rev)
+      local expired = r and type(r.lease_until) == "number" and r.lease_until < _now()
+      if not committed and expired then
+        if M.retire(slug, sha, rev, nil) then n = n + 1 end
+      end
+    end
+  end
+  return n
+end
+
 ---new builds a valid, empty review for a commit.
 ---@param opts { slug: string?, url: string?, owner: string?, name: string?, commit: string, base: string?, revision: integer?, reviewer: string?, verdict: string?, summary: string? }
 ---@return WorktreeReview
@@ -240,9 +428,27 @@ end
 ---@param opts { overwrite: boolean? }?
 ---@return string? path, string? err
 function M.save(slug, review, opts)
-  local ok, problems = M.validate(review)
+  -- A PRIMITIVE, not the supported writer (ADR-0067 §2.5). `save_pair` is.
+  --
+  -- This refuses an unpaired canonical review because the "no reader ever sees
+  -- a JSON without its document" invariant is only worth what the narrowest
+  -- writer allows — and this one is public. The check is the full pair check,
+  -- not merely "the field is present": a syntactically valid path naming a
+  -- nonexistent file would otherwise satisfy it and publish the very artifact
+  -- §6 forbids. It runs BEFORE the exclusive create, so a refusal leaves
+  -- nothing behind.
+  local ok, problems = M.validate(review, { for_write = true })
   if not ok then
     return nil, "invalid review: " .. table.concat(problems, "; ")
+  end
+  -- No escape hatch. A `skip_pair_check` option was considered and rejected:
+  -- an invariant any caller can opt out of is not an invariant, and the whole
+  -- point of closing this path is that the narrowest public writer decides what
+  -- readers can observe.
+  local okp, pproblems = M.validate_pair(review, opts)
+  if not okp then
+    return nil, "unpaired review refused (write through save_pair): "
+      .. table.concat(pproblems, "; ")
   end
   local dir = store.reviews_dir(slug)
   local name = M.filename(slug, review.commit, review.revision)
@@ -282,12 +488,21 @@ end
 ---@param slug string
 ---@param review WorktreeReview
 ---@return string? path, integer|string? revision_or_err
-function M.save_next(slug, review)
+function M.save_next(slug, review, opts)
+  -- Also a PRIMITIVE. It re-selects the revision on collision, which is exactly
+  -- what makes it unsafe for a pair: the JSON would end up at a revision the
+  -- Markdown was never named for. Kept for callers that manage their own
+  -- pairing, and refusing an unpaired write like `save` does.
   local start = M.latest_revision(slug, review.commit) + 1
   for rev = start, start + 24 do
     review.revision = rev
-    local ok, problems = M.validate(review)
+    local ok, problems = M.validate(review, { for_write = true })
     if not ok then return nil, "invalid review: " .. table.concat(problems, "; ") end
+    local okp, pproblems = M.validate_pair(review, opts)
+    if not okp then
+      return nil, "unpaired review refused (write through save_pair): "
+        .. table.concat(pproblems, "; ")
+    end
 
     local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, review.commit, rev)
     local ok_enc, encoded = pcall(vim.json.encode, review)
@@ -299,6 +514,174 @@ function M.save_next(slug, review)
     -- Taken by another writer between our scan and our claim: take the next.
   end
   return nil, "save_next: could not claim a revision after 25 attempts"
+end
+
+---validate_pair checks that a review's `document` names a real primary
+---artifact in the reviewer's own directory.
+---
+---Split from `validate` by WHAT IT NEEDS. `validate` stays pure — schema only,
+---no filesystem — so it keeps its unit tests and can run anywhere. This one
+---touches disk, and exists because `document` PRESENCE is not pair EXISTENCE: a
+---syntactically valid path naming a nonexistent file satisfies a field check
+---and still publishes an unpaired canonical JSON.
+---@param review table
+---@param opts { kb_root: string? }?
+---@return boolean ok, string[] problems
+function M.validate_pair(review, opts)
+  local problems = {}
+  if type(review) ~= "table" then return false, { "not a table" } end
+  local doc = review.document
+  if type(doc) ~= "string" or doc == "" then
+    return false, { "document missing — a review must name its primary Markdown" }
+  end
+
+  local kb = (opts and opts.kb_root) or vim.env.AUTO_AGENTS_KB_ROOT
+  if type(kb) ~= "string" or kb == "" then
+    problems[#problems + 1] = "cannot resolve $KB_ROOT to contain the document"
+  else
+    local abs = doc
+    if not abs:match("^/") then abs = kb .. "/" .. abs end
+    local norm = vim.fs and vim.fs.normalize(abs) or abs
+    local reviewer = tostring(review.reviewer_slug or "")
+    local want = vim.fs and vim.fs.normalize(kb .. "/agents/") or (kb .. "/agents/")
+    -- Containment is checked on the NORMALISED path, so `..` cannot walk out.
+    if norm:sub(1, #want) ~= want then
+      problems[#problems + 1] = "document is outside $KB_ROOT/agents/: " .. norm
+    elseif reviewer ~= "" then
+      local mine = vim.fs and vim.fs.normalize(kb .. "/agents/" .. reviewer .. "/reviews/")
+        or (kb .. "/agents/" .. reviewer .. "/reviews/")
+      if norm:sub(1, #mine) ~= mine then
+        problems[#problems + 1] = "document is under another reviewer's directory: " .. norm
+      end
+    end
+    if not (vim.uv or vim.loop).fs_stat(norm) then
+      problems[#problems + 1] = "document does not exist: " .. norm
+    end
+  end
+
+  local rev = tonumber(doc:match("%-r(%d+)%-review%.md$"))
+  if not rev then
+    problems[#problems + 1] = "document name does not carry a revision (…-rN-review.md)"
+  elseif type(review.revision) == "number" and rev ~= review.revision then
+    problems[#problems + 1] = ("document is r%d but the review is r%s")
+      :format(rev, tostring(review.revision))
+  end
+  return #problems == 0, problems
+end
+
+---save_pair writes a review and its primary Markdown as ONE operation.
+---
+---Ordering is the entire safety argument, and two earlier designs failed on it:
+---
+---  * Markdown-first is unimplementable — the Markdown filename carries `r<N>`,
+---    but `save_next` only assigns N at write time, so two submitters can both
+---    write `…-r1-review.md`.
+---  * Canonical-JSON-first fixes the naming race and MOVES the damage: readers
+---    can observe a valid JSON-only review the instant it appears, and a kill
+---    between phases makes that permanent.
+---
+---So: reserve on a NON-CANONICAL name, derive N from the won reservation,
+---generate both final contents at that point, claim the Markdown, and publish
+---the complete canonical JSON LAST as the commit point. Every crash window
+---leaves at most an orphan Markdown — a primary document nobody has projected
+---yet, which review-json §6 permits — and never a projection without its
+---primary.
+---@param slug string
+---@param review table            revision is assigned here
+---@param markdown fun(rev: integer): string, string   body, absolute path
+---@param opts { kb_root: string?, attempts: integer? }?
+---@return table? result  { json_path, md_path, revision }
+---@return string? err
+function M.save_pair(slug, review, markdown, opts)
+  if type(review) ~= "table" then return nil, "review must be a table" end
+  if type(markdown) ~= "function" then return nil, "markdown generator required" end
+  local sha = review.commit
+  if type(sha) ~= "string" then return nil, "review.commit required" end
+
+  -- A stale reservation blocks its number forever unless something retires it,
+  -- so the cheap same-directory scan runs first.
+  pcall(M.cleanup, slug, sha)
+
+  local attempts = (opts and opts.attempts) or 25
+  local start = M.max_recorded_revision(slug, sha) + 1
+  local token = _token()
+
+  for rev = start, start + attempts - 1 do
+    local tomb = (vim.uv or vim.loop).fs_stat(M.tombstone_path(slug, sha, rev))
+    if not tomb then
+      local claimed = store.create_exclusive(M.reserve_path(slug, sha, rev),
+        vim.json.encode({ owner = token, created_at = _now(),
+                          lease_until = _now() + M.LEASE_SECONDS }))
+      if claimed then
+        -- The revision is ours, so both final names are now determined.
+        local body, md_path = markdown(rev)
+        if type(body) ~= "string" or type(md_path) ~= "string" then
+          M.retire(slug, sha, rev, token)
+          return nil, "markdown generator returned no body/path"
+        end
+
+        review.revision = rev
+        review.document = md_path
+
+        if not _owns(slug, sha, rev, token) then
+          -- Reclaimed underneath us before anything was written.
+          goto continue
+        end
+
+        if not store.ensure_dir(vim.fn.fnamemodify(md_path, ":h")) then
+          M.retire(slug, sha, rev, token)
+          return nil, "could not create " .. vim.fn.fnamemodify(md_path, ":h")
+        end
+        local md_ok, md_err = store.create_exclusive(md_path, body)
+        if md_err then
+          M.retire(slug, sha, rev, token)
+          return nil, md_err
+        end
+        if not md_ok then
+          -- The final name is taken: retire this revision so BOTH names move.
+          M.retire(slug, sha, rev, token)
+          goto continue
+        end
+
+        if not _owns(slug, sha, rev, token) then
+          -- Lost it after the Markdown landed: abandon, leaving the orphan.
+          -- That is the tolerated remnant, never an unpaired JSON.
+          goto continue
+        end
+
+        local ok_v, problems = M.validate(review, { for_write = true })
+        if not ok_v then
+          M.retire(slug, sha, rev, token)
+          return nil, "invalid review: " .. table.concat(problems, "; ")
+        end
+        local ok_enc, encoded = pcall(vim.json.encode, review)
+        if not ok_enc then
+          M.retire(slug, sha, rev, token)
+          return nil, "encode failed: " .. tostring(encoded)
+        end
+
+        -- ***THE COMMIT POINT***
+        local json_path = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
+        local j_ok, j_err = store.create_exclusive(json_path, encoded)
+        if not j_ok then
+          local _, terr = M.retire(slug, sha, rev, token)
+          return nil, ("the review JSON could not be written (%s). Your Markdown review "
+            .. "is kept at %s — it is not lost.%s"):format(
+              tostring(j_err or "revision taken"), md_path,
+              terr and (" (revision not tombstoned: " .. terr .. "; reservation retained "
+                .. "as the fence)") or "")
+        end
+
+        -- Committed. The canonical JSON is the monotonic fence, so no live
+        -- writer can still hold this revision — the one place removing the
+        -- reservation unconditionally is safe.
+        pcall(function() (vim.uv or vim.loop).fs_unlink(M.reserve_path(slug, sha, rev)) end)
+        return { json_path = json_path, md_path = md_path, revision = rev }, nil
+      end
+    end
+    ::continue::
+  end
+  return nil, ("could not claim a revision after %d attempts"):format(attempts)
 end
 
 ---load reads one review by `(slug, sha, revision)`.

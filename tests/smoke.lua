@@ -50,6 +50,26 @@ local function ok(name, cond, detail)
   end
 end
 
+-- ADR-0067: every public write must name a real primary Markdown, so sections
+-- that exercise the write PRIMITIVES pair one for real. Declared at file scope
+-- because several independent sections need it.
+-- $KB_ROOT is isolated here for the same reason XDG is: ADR-0067's paired
+-- writes land under $KB_ROOT/agents/<reviewer>/reviews/, so an inherited value
+-- means the suite writes into the real knowledge base.
+vim.env.AUTO_AGENTS_KB_ROOT = vim.fn.tempname() .. "-kbroot"
+vim.fn.mkdir(vim.env.AUTO_AGENTS_KB_ROOT, "p")
+
+local function _smoke_pair(rv, reviewer_slug)
+  local kb = vim.env.AUTO_AGENTS_KB_ROOT
+  local dir = ("%s/agents/%s/reviews"):format(kb, reviewer_slug or "lector")
+  vim.fn.mkdir(dir, "p")
+  local path = ("%s/2026-08-24-smoke-r%d-review.md"):format(dir, rv.revision or 1)
+  vim.fn.writefile({ "# primary review" }, path)
+  rv.document = path
+  rv.reviewer_slug = reviewer_slug or "lector"
+  return rv
+end
+
 -- ───────── 1. require + public API surface ─────────
 print("\n[1] require + public API surface")
 local wt = require("worktree")
@@ -740,6 +760,8 @@ do
   local store  = require("worktree.store")
   local watch  = require("worktree.watch")
   local review = require("worktree.review")
+
+
   local repos  = require("worktree.repos")
 
   -- Point the store at a temp root so the user's real state is untouched.
@@ -874,6 +896,22 @@ do
   ok("10d: parse_filename rejects a foreign name",
     select(1, review.parse_filename("notes.md")) == nil)
 
+  -- ADR-0067: `save`/`save_next` are primitives that REFUSE an unpaired
+  -- canonical review, so these tests pair one for real rather than opting out —
+  -- an invariant a caller can skip is not an invariant, and no `skip` option
+  -- exists. The helper writes a genuine Markdown document under
+  -- $KB_ROOT/agents/<reviewer>/reviews/ and points the review at it.
+  local function pair_doc(rv, reviewer_slug)
+    local kb = vim.env.AUTO_AGENTS_KB_ROOT
+    local dir = ("%s/agents/%s/reviews"):format(kb, reviewer_slug or "lector")
+    vim.fn.mkdir(dir, "p")
+    local path = ("%s/2026-08-24-smoke-r%d-review.md"):format(dir, rv.revision or 1)
+    vim.fn.writefile({ "# primary review" }, path)
+    rv.document = path
+    rv.reviewer_slug = reviewer_slug or "lector"
+    return rv
+  end
+
   local r = review.new({ commit = "ff24bc5fcc759dec047bec7794e4704582696caa",
     base = "2377bdb", revision = 1, reviewer = "lector",
     owner = "yongjohnlee80", name = "autodb", verdict = "change_requested",
@@ -906,6 +944,7 @@ do
   ok("10d: a foreign schema is rejected", select(1, review.validate(badschema)) == false)
 
   -- save/load/list
+  pair_doc(r)
   local path, serr = review.save("yongjohnlee80__autodb", r)
   ok("10d: save() writes the file", path ~= nil and vim.fn.filereadable(path) == 1, tostring(serr))
   ok("10d: save() REFUSES an invalid review (a broken file is worse than none)",
@@ -916,7 +955,7 @@ do
     (function() local v, e = review.load("yongjohnlee80__autodb", "0000000", 9); return v == nil and e == nil end)())
 
   local r2 = vim.deepcopy(r); r2.revision = 2
-  review.save("yongjohnlee80__autodb", r2)
+  review.save("yongjohnlee80__autodb", pair_doc(r2))
   local listed = review.list_for("yongjohnlee80__autodb", r.commit)
   ok("10d: list_for() finds both revisions, newest first",
     #listed == 2 and listed[1].revision == 2, vim.inspect(vim.tbl_map(function(x) return x.revision end, listed)))
@@ -931,9 +970,9 @@ do
   -- error to either writer. Reproduced across two real processes in r1.
   local imm = vim.deepcopy(r); imm.revision = 1
   imm.summary = "FIRST summary"
-  local ip1 = review.save("immut__repo", imm)
+  local ip1 = review.save("immut__repo", pair_doc(imm))
   local imm2 = vim.deepcopy(imm); imm2.summary = "SECOND summary"
-  local ip2, ierr = review.save("immut__repo", imm2)
+  local ip2, ierr = review.save("immut__repo", pair_doc(imm2))
   ok("10d-r1: *** re-saving an existing revision is REFUSED ***",
     ip2 == nil and ierr ~= nil, tostring(ip2) .. " / " .. tostring(ierr))
   local kept = review.load("immut__repo", imm.commit, 1)
@@ -942,12 +981,23 @@ do
   ok("10d-r1: the refusal names the revision so the caller can bump",
     tostring(ierr):match("r1") ~= nil or tostring(ierr):match("revision") ~= nil, tostring(ierr))
   ok("10d-r1: an explicit overwrite is still possible for a deliberate amend",
-    review.save("immut__repo", imm2, { overwrite = true }) ~= nil)
+    review.save("immut__repo", pair_doc(imm2), { overwrite = true }) ~= nil)
 
   -- save_next claims atomically, so two agents cannot both take rN.
   local nx = vim.deepcopy(r); nx.commit = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
-  local np1, nr1 = review.save_next("claim__repo", nx)
-  local np2, nr2 = review.save_next("claim__repo", vim.deepcopy(nx))
+  -- save_next re-selects the revision, so the document has to be paired for
+  -- whichever revision it lands on: generate it per attempt.
+  local function paired_next(slug, rv)
+    for attempt = 1, 25 do
+      rv.revision = review.latest_revision(slug, rv.commit) + 1
+      pair_doc(rv, "lector")
+      local pth, rev = review.save_next(slug, rv)
+      if pth then return pth, rev end
+      if attempt == 25 then return nil, rev end
+    end
+  end
+  local np1, nr1 = paired_next("claim__repo", nx)
+  local np2, nr2 = paired_next("claim__repo", vim.deepcopy(nx))
   ok("10d-r1: save_next() claims r1 then r2, never colliding",
     nr1 == 1 and nr2 == 2, tostring(nr1) .. "/" .. tostring(nr2))
   ok("10d-r1: both claims produced distinct files",
@@ -1164,7 +1214,7 @@ do
   local rr = review.new({ commit = nodes[2].sha, revision = 1, reviewer = "lector",
                           owner = "smoke", name = "fixture" })
   rr.comments = { { path = "f.txt", line = 1, side = "RIGHT", severity = "nit", body = "ok" } }
-  review.save(repo.slug, rr)
+  review.save(repo.slug, _smoke_pair(rr))
   ok("10h: reviews() finds a review recorded for that commit",
     #repos.reviews(repo, nodes[2].sha) == 1, vim.inspect(repos.reviews(repo, nodes[2].sha)))
 
@@ -1381,7 +1431,7 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   -- save_next and left save() as stat-then-replacing-write. A real second
   -- process committing r1 inside that gap destroyed the first review with both
   -- writers getting err=nil.
-  local p1 = review.save("toctou__repo", mkreview(1))
+  local p1 = review.save("toctou__repo", _smoke_pair(mkreview(1)))
   ok("14a: save() writes a new revision", p1 ~= nil)
   -- Blind ONLY the pre-check, exactly as the TOCTOU does, and confirm the
   -- write is still refused — proving the claim (not the stat) is the gate.
@@ -1391,7 +1441,7 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
     if not blinded and p == p1 then blinded = true; return nil end
     return real_stat(p)
   end
-  local p2, e2 = review.save("toctou__repo", mkreview(1))
+  local p2, e2 = review.save("toctou__repo", _smoke_pair(mkreview(1)))
   uv.fs_stat = real_stat
   ok("14a: *** with the pre-check blinded, save() STILL refuses (atomic claim) ***",
     p2 == nil and e2 ~= nil, tostring(p2) .. " / " .. tostring(e2))
@@ -1399,9 +1449,9 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   ok("14a: and the original review is intact",
     kept ~= nil and kept.summary == "S1", kept and kept.summary)
   ok("14a: CONTROL — an explicit overwrite still replaces deliberately",
-    review.save("toctou__repo", (function()
+    review.save("toctou__repo", _smoke_pair((function()
       local r = mkreview(1); r.summary = "AMENDED"; return r
-    end)(), { overwrite = true }) ~= nil)
+    end)()), { overwrite = true }) ~= nil)
   ok("14a: CONTROL — and the amend is what is now on disk",
     (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "AMENDED")
 
