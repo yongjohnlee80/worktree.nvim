@@ -57,10 +57,22 @@ M.REQUIRED = {
   "git.worktree.parse_porcelain",
   "git.worktree.list",
   "git.diff.parse",
-  -- The write surface (ADR-0060 git actions). Listed here for the same reason
-  -- as the reads: a version-skewed auto-core must degrade through this probe
-  -- and let the panel fall back, rather than erroring the moment someone
-  -- presses `s`.
+}
+
+---REQUIRED_WRITE is the git-ACTION surface, probed separately from the reads.
+---
+---These were briefly in `M.REQUIRED`, which was wrong in a way worth recording:
+---`available()` gates the WHOLE repos panel, so an auto-core without the write
+---module made the entire view vanish rather than just disabling `f`/`s`/`c`/`P`.
+---Verified — against auto-core v0.2.2, `available()` returned false with
+---`missing = auto-core.git.write.stage`, and the panel a user already had would
+---simply stop appearing.
+---
+---That also contradicts ADR-0060 r1 SF2, which asks for a missing capability to
+---degrade into a notification rather than break the surface. The reads decide
+---whether the panel can exist at all; the writes decide whether four keys work,
+---and the panel's handlers already notify when a verb is absent.
+M.REQUIRED_WRITE = {
   "git.fetch.fetch_one",
   "git.write.stage",
   "git.write.unstage",
@@ -88,6 +100,22 @@ function M.available()
   local core = _core()
   if core == nil then return false, "auto-core" end
   for _, dotted in ipairs(M.REQUIRED) do
+    if type(_resolve(core, dotted)) ~= "function" then
+      return false, "auto-core." .. dotted
+    end
+  end
+  return true, nil
+end
+
+---write_available reports whether the git ACTIONS can run.
+---
+---Separate from `available()` on purpose: the panel must still render against an
+---auto-core that predates the write module, with only `f`/`s`/`c`/`P` inert.
+---@return boolean available, string? missing
+function M.write_available()
+  local core = _core()
+  if core == nil then return false, "auto-core" end
+  for _, dotted in ipairs(M.REQUIRED_WRITE) do
     if type(_resolve(core, dotted)) ~= "function" then
       return false, "auto-core." .. dotted
     end

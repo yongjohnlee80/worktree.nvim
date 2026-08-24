@@ -2009,13 +2009,33 @@ end
 ;(function()
   local repos = require("worktree.repos")
 
-  -- The probe must include the writes. Its whole purpose is that a
-  -- version-skewed auto-core degrades HERE rather than at the keypress.
-  local req = table.concat(repos.REQUIRED, ",")
+  -- The write surface is probed SEPARATELY from the reads. It was briefly in
+  -- M.REQUIRED, which gates the whole panel: against auto-core v0.2.2 that made
+  -- available() false and the entire repos view vanish, rather than leaving four
+  -- keys inert. ADR-0060 r1 SF2 asks for a missing capability to degrade into a
+  -- notification, not to remove the surface.
+  local req_write = table.concat(repos.REQUIRED_WRITE, ",")
   for _, sym in ipairs({ "git.write.stage", "git.write.unstage", "git.write.commit",
                          "git.write.push", "git.write.has_staged", "git.fetch.fetch_one" }) do
-    ok("10g: REQUIRED covers " .. sym, req:find(sym, 1, true) ~= nil)
+    ok("10g: REQUIRED_WRITE covers " .. sym, req_write:find(sym, 1, true) ~= nil)
   end
+  local req_read = table.concat(repos.REQUIRED, ",")
+  ok("10g: and the READ list does NOT gate the panel on them",
+    req_read:find("git.write.", 1, true) == nil, req_read)
+  ok("10g: write_available() exists as its own probe",
+    type(repos.write_available) == "function")
+
+  -- The regression itself: strip the write module and the PANEL must survive.
+  local core = require("auto-core")
+  local saved = core.git.write
+  core.git.write = nil
+  local panel_ok = repos.available()
+  local writes_ok = repos.write_available()
+  core.git.write = saved
+  ok("10g: with no write module the panel is STILL available", panel_ok == true)
+  ok("10g: while the git actions report unavailable", writes_ok == false)
+  ok("10g: and restoring it brings the actions back (probe is not stuck)",
+    repos.write_available() == true)
 
   -- A real repo, so path resolution and the delegation are both genuine.
   local lab = vim.fn.tempname() .. "-10g"
