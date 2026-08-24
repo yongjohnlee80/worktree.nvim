@@ -186,6 +186,66 @@ do
     select(1, review.save(SLUG, mism)) == nil)
 end
 
+io.stdout:write("\n[6b] a NON-CANONICAL document name is refused by the public writers\n")
+do
+  -- The regression this pins, verbatim: a REAL regular file whose name carries
+  -- neither the repo component nor a separate topic. The whole r2 suite passed
+  -- while this bug was live, because `validate_pair` reduced its slug to nil
+  -- unconditionally and the component was never checked.
+  local RSLUG = "own__realrepo"
+  local d = review.new({ slug = RSLUG, owner = "own", name = "realrepo",
+                         commit = SHA, reviewer = "lector" })
+  d.reviewer_slug = "lector"
+  d.revision = 1
+  d.comments = { { path = "a.go", line = 1, side = "RIGHT", severity = "nit", body = "x" } }
+  local dir = ("%s/agents/lector/reviews"):format(vim.env.AUTO_AGENTS_KB_ROOT)
+  vim.fn.mkdir(dir, "p")
+  d.document = dir .. "/2026-08-25-x-r1-review.md"
+  vim.fn.writefile({ "# a real file" }, d.document)
+  ok("the document really exists (positive control — this is not a missing-file test)",
+    vim.fn.filereadable(d.document) == 1)
+
+  local p1, e1 = review.save(RSLUG, d)
+  ok("*** save() refuses a non-canonical document name ***", p1 == nil, tostring(p1))
+  ok("and names the required shape", (e1 or ""):find("realrepo", 1, true) ~= nil, tostring(e1))
+  ok("*** and publishes NO canonical JSON ***",
+    vim.fn.filereadable(store.reviews_dir(RSLUG) .. "/" .. review.filename(RSLUG, SHA, 1)) == 0)
+
+  local p2 = review.save_next(RSLUG, vim.deepcopy(d))
+  ok("save_next() refuses it too", p2 == nil)
+
+  -- The canonical POSITIVE: the same review, named by the store, is accepted.
+  local d2 = vim.deepcopy(d)
+  d2.revision = 2
+  d2.document = review.canonical_document({
+    kb_root = vim.env.AUTO_AGENTS_KB_ROOT, reviewer_slug = "lector",
+    slug = RSLUG, topic = "sessions", revision = 2 })
+  vim.fn.writefile({ "# a real file" }, d2.document)
+  ok("*** but the store's own canonical name IS accepted ***",
+    review.save(RSLUG, d2) ~= nil, d2.document)
+end
+
+io.stdout:write("\n[6c] the uv.random fallback produces a usable token\n")
+do
+  -- Forced, because every other test takes the `uv.random` path — so moving
+  -- `_now` back below `_token` would leave the whole suite green while the
+  -- fallback crashed with "attempt to call global '_now'".
+  local uv = vim.uv or vim.loop
+  local real_random = uv.random
+  uv.random = nil
+  local FSHA = string.rep("c", 40)
+  local d = review.from_draft({ slug = SLUG }, FSHA, "lector",
+    { comments = { { path = "a.go", line = 1, side = "RIGHT", severity = "nit", body = "x" } } })
+  local okc, res, err = pcall(review.save_pair, SLUG, d, "# fallback", { topic = "fallback" })
+  uv.random = real_random
+  ok("*** the fallback does not crash ***", okc, tostring(res))
+  ok("*** and still writes a complete pair ***",
+    okc and res ~= nil and vim.fn.filereadable(res.json_path) == 1
+    and vim.fn.filereadable(res.md_path) == 1, tostring(err or (res and res.json_path)))
+  ok("whose JSON cross-references its document",
+    okc and res and (review.load(SLUG, FSHA, res.revision) or {}).document == res.md_path)
+end
+
 io.stdout:write("\n[7] reads stay tolerant of pre-ADR artifacts\n")
 do
   local legacy = mk()
