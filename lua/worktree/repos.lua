@@ -57,6 +57,16 @@ M.REQUIRED = {
   "git.worktree.parse_porcelain",
   "git.worktree.list",
   "git.diff.parse",
+  -- The write surface (ADR-0060 git actions). Listed here for the same reason
+  -- as the reads: a version-skewed auto-core must degrade through this probe
+  -- and let the panel fall back, rather than erroring the moment someone
+  -- presses `s`.
+  "git.fetch.fetch_one",
+  "git.write.stage",
+  "git.write.unstage",
+  "git.write.commit",
+  "git.write.push",
+  "git.write.has_staged",
 }
 
 ---_resolve walks a dotted path from a root table, returning nil at the first
@@ -344,6 +354,132 @@ function M.is_watched(path) return watch.is_watched(path) end
 M.TOPIC_WATCH = watch.TOPIC
 
 ---_reset_for_tests clears the base-branch cache.
+-- ─── git actions (ADR-0060) ───────────────────────────────────────
+--
+-- worktree.nvim owns git for the repos surface, so the WRITE verbs live here
+-- and auto-finder only binds keys to them. The alternative — the panel calling
+-- git itself — is what put a second git owner in the stack once already.
+--
+-- Every one of these is a thin delegation on purpose. The hardening that
+-- matters (no `--no-optional-locks` on a write, `GIT_EDITOR` pinned, refusing
+-- a commit with an empty index) belongs in auto-core where the argv is built,
+-- not duplicated per consumer.
+
+---_cwd picks the directory a git write should run in.
+---
+---A bare repo has no working tree, so a write needs one of its worktrees; the
+---common dir is the fallback for operations that do not need one (a push of
+---already-committed refs works fine from a bare repo).
+---@param repo WorktreeRepo
+---@return string|nil
+local function _cwd(repo)
+  if type(repo) ~= "table" then return nil end
+  if type(repo.sample_worktree) == "string" and repo.sample_worktree ~= "" then
+    return repo.sample_worktree
+  end
+  if type(repo.common_dir) == "string" and repo.common_dir ~= "" then
+    return repo.common_dir
+  end
+  return nil
+end
+
+---_wt_path resolves a worktree argument to its path.
+---@param wt table|string
+---@return string|nil
+local function _wt_path(wt)
+  if type(wt) == "string" then return wt ~= "" and wt or nil end
+  if type(wt) ~= "table" then return nil end
+  for _, k in ipairs({ "path", "dir", "root" }) do
+    if type(wt[k]) == "string" and wt[k] ~= "" then return wt[k] end
+  end
+  return nil
+end
+
+---fetch updates a repo's remotes. Delegates to auto-core's existing async
+---fetch — this verb adds a worktree-shaped signature, not a second fetch.
+---@param repo WorktreeRepo
+---@param on_done fun(ok: boolean, err: string?)?
+function M.fetch(repo, on_done)
+  local core = _core()
+  local fetch_one = core and _resolve(core, "git.fetch.fetch_one")
+  if not fetch_one then
+    if on_done then on_done(false, "auto-core.git.fetch.fetch_one unavailable") end
+    return
+  end
+  if not (type(repo) == "table" and type(repo.common_dir) == "string") then
+    if on_done then on_done(false, "fetch: repo.common_dir required") end
+    return
+  end
+  fetch_one({ common_dir = repo.common_dir, label = repo.label }, nil, on_done)
+end
+
+---@param wt table|string
+---@param paths string|string[]
+---@param on_done fun(ok: boolean, err: string?)?
+function M.stage(wt, paths, on_done)
+  local core = _core()
+  local fn = core and _resolve(core, "git.write.stage")
+  local cwd = _wt_path(wt)
+  if not fn then return on_done and on_done(false, "auto-core.git.write.stage unavailable") end
+  if not cwd then return on_done and on_done(false, "stage: worktree path required") end
+  fn(cwd, paths, on_done)
+end
+
+---@param wt table|string
+---@param paths string|string[]
+---@param on_done fun(ok: boolean, err: string?)?
+function M.unstage(wt, paths, on_done)
+  local core = _core()
+  local fn = core and _resolve(core, "git.write.unstage")
+  local cwd = _wt_path(wt)
+  if not fn then return on_done and on_done(false, "auto-core.git.write.unstage unavailable") end
+  if not cwd then return on_done and on_done(false, "unstage: worktree path required") end
+  fn(cwd, paths, on_done)
+end
+
+---has_staged lets a caller decide whether `commit` is worth offering.
+---@param wt table|string
+---@return boolean
+function M.has_staged(wt)
+  local core = _core()
+  local fn = core and _resolve(core, "git.write.has_staged")
+  local cwd = _wt_path(wt)
+  if not (fn and cwd) then return false end
+  local ok, res = pcall(fn, cwd)
+  return ok and res == true
+end
+
+---@param wt table|string
+---@param msg string
+---@param on_done fun(ok: boolean, err: string?)?
+function M.commit(wt, msg, on_done)
+  local core = _core()
+  local fn = core and _resolve(core, "git.write.commit")
+  local cwd = _wt_path(wt)
+  if not fn then return on_done and on_done(false, "auto-core.git.write.commit unavailable") end
+  if not cwd then return on_done and on_done(false, "commit: worktree path required") end
+  fn(cwd, msg, nil, on_done)
+end
+
+---push publishes a repo's commits.
+---
+---The CONFIRMATION is deliberately not here. This verb is callable from
+---anywhere, including a test; the "are you sure" belongs to the surface holding
+---the user's attention, which is the only place that can name what is about to
+---be published. See auto-finder's repos panel binding.
+---@param repo WorktreeRepo
+---@param opts { remote: string?, branch: string?, set_upstream: boolean? }?
+---@param on_done fun(ok: boolean, err: string?)?
+function M.push(repo, opts, on_done)
+  local core = _core()
+  local fn = core and _resolve(core, "git.write.push")
+  local cwd = _cwd(repo)
+  if not fn then return on_done and on_done(false, "auto-core.git.write.push unavailable") end
+  if not cwd then return on_done and on_done(false, "push: repo path required") end
+  opts = vim.tbl_extend("force", { label = repo and repo.label or nil }, opts or {})
+  fn(cwd, opts, on_done)
+end
+
 function M._reset_for_tests() _base_cache = {} end
 
 return M

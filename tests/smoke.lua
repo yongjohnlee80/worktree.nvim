@@ -16,10 +16,19 @@ local plugin_root = vim.fn.fnamemodify(
   vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"), ":h:h")
 
 local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
+-- `prepend` puts each later entry FIRST, so this list is in ASCENDING priority:
+-- the last one that exists wins. The same-branch sibling sits above `main`
+-- because a cross-repo change lives in two worktrees at once — developing a
+-- worktree.repos verb against `auto-core.nvim/main` would probe an auto-core
+-- that has none of the new primitives and report the surface unavailable,
+-- or worse, pass while exercising a different copy of the code.
+local siblings = vim.fn.fnamemodify(plugin_root, ":h:h")
+local branch_dir = vim.fn.fnamemodify(plugin_root, ":t")
 for _, p in ipairs({
   LAZY .. "/plenary.nvim",
   LAZY .. "/auto-core.nvim",
-  vim.fn.fnamemodify(plugin_root, ":h:h") .. "/auto-core.nvim/main",
+  siblings .. "/auto-core.nvim/main",
+  siblings .. "/auto-core.nvim/" .. branch_dir,
   plugin_root,
 }) do
   if vim.fn.isdirectory(p) == 1 then
@@ -1989,6 +1998,89 @@ else
     total_asserts, MIN_ASSERTIONS))
   pass_count = pass_count + 1
 end
+
+-- ── [10g] repos git actions (ADR-0060) ────────────────────────────
+--
+-- The verbs themselves are thin delegations, and auto-core's tests/git_write.lua
+-- covers the actual git behaviour against a real repo. What worktree.nvim adds
+-- is the part tested here: the availability probe covering the WRITE surface,
+-- path resolution for repo-vs-worktree shapes, and a reason rather than a
+-- traceback when a capability is missing.
+;(function()
+  local repos = require("worktree.repos")
+
+  -- The probe must include the writes. Its whole purpose is that a
+  -- version-skewed auto-core degrades HERE rather than at the keypress.
+  local req = table.concat(repos.REQUIRED, ",")
+  for _, sym in ipairs({ "git.write.stage", "git.write.unstage", "git.write.commit",
+                         "git.write.push", "git.write.has_staged", "git.fetch.fetch_one" }) do
+    ok("10g: REQUIRED covers " .. sym, req:find(sym, 1, true) ~= nil)
+  end
+
+  -- A real repo, so path resolution and the delegation are both genuine.
+  local lab = vim.fn.tempname() .. "-10g"
+  vim.fn.mkdir(lab, "p")
+  local function G(...)
+    local argv = { "git", "-C", lab, "-c", "user.email=t@t", "-c", "user.name=t" }
+    for _, a in ipairs({ ... }) do argv[#argv + 1] = a end
+    return vim.system(argv, { text = true }):wait()
+  end
+  G("init", "-q", "-b", "main")
+  vim.fn.writefile({ "hello" }, lab .. "/f.txt")
+
+  local function sync(fn)
+    local done, res = false, nil
+    fn(function(o, e) res = { ok = o, err = e }; done = true end)
+    vim.wait(15000, function() return done end, 20)
+    return res or { ok = false, err = "timed out" }
+  end
+
+  -- A worktree argument may arrive as a table or a bare path; both must work,
+  -- because the panel row carries a table and a test carries a string.
+  local r1 = sync(function(cb) repos.stage({ path = lab }, "f.txt", cb) end)
+  ok("10g: stage accepts a worktree TABLE", r1.ok, r1.err)
+  ok("10g: and has_staged sees it", repos.has_staged({ path = lab }) == true)
+  local r2 = sync(function(cb) repos.unstage(lab, "f.txt", cb) end)
+  ok("10g: unstage accepts a bare PATH", r2.ok, r2.err)
+  ok("10g: and the index is clean again", repos.has_staged(lab) == false)
+
+  -- commit refuses an empty index through the worktree layer too — the refusal
+  -- has to survive the delegation, not just exist in auto-core.
+  local c1 = sync(function(cb) repos.commit(lab, "nope", cb) end)
+  ok("10g: commit with nothing staged is refused, with a reason",
+    c1.ok == false and tostring(c1.err):find("nothing staged", 1, true) ~= nil, c1.err)
+  sync(function(cb) repos.stage(lab, "f.txt", cb) end)
+  local c2 = sync(function(cb) repos.commit(lab, "real", cb) end)
+  ok("10g: and succeeds once something is staged", c2.ok, c2.err)
+
+  -- Missing arguments produce a REASON on the callback, never a raised error:
+  -- the panel binds these to keys and a traceback there is the ADR-0060 r1 SF2
+  -- failure mode.
+  local m1 = sync(function(cb) repos.stage(nil, "f.txt", cb) end)
+  ok("10g: stage with no worktree calls back with a reason",
+    m1.ok == false and tostring(m1.err):find("worktree path required", 1, true) ~= nil, m1.err)
+  local m2 = sync(function(cb) repos.push(nil, nil, cb) end)
+  ok("10g: push with no repo calls back with a reason",
+    m2.ok == false and tostring(m2.err):find("repo path required", 1, true) ~= nil, m2.err)
+  local m3 = sync(function(cb) repos.fetch({}, cb) end)
+  ok("10g: fetch without common_dir calls back with a reason",
+    m3.ok == false and tostring(m3.err):find("common_dir", 1, true) ~= nil, m3.err)
+  ok("10g: and none of those raised — every failure arrived as a callback",
+    m1.err ~= "timed out" and m2.err ~= "timed out" and m3.err ~= "timed out")
+
+  -- push resolves a BARE repo to one of its worktrees, since a bare repo has no
+  -- working tree of its own.
+  ok("10g: a repo with sample_worktree resolves to it",
+    (function()
+      local seen
+      local core = require("auto-core")
+      local orig = core.git.write.push
+      core.git.write.push = function(cwd) seen = cwd end
+      repos.push({ common_dir = "/bare/x.git", sample_worktree = lab, label = "x" })
+      core.git.write.push = orig
+      return seen == lab
+    end)(), "expected the sample worktree")
+end)()
 
 -- ───────────────────── summary ─────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
