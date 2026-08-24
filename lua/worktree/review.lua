@@ -277,6 +277,13 @@ function M.tombstone_path(slug, sha, revision)
   return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.TOMBSTONE_SUFFIX
 end
 
+---_now is seconds since the epoch.
+---
+---Declared BEFORE `_token`, which uses it. As a local below its use site it
+---was simply nil there, so the entire fallback branch crashed the moment
+---`uv.random` was unavailable — verified, `token_fallback_pcall=false`.
+local function _now() return os.time() end
+
 ---_token mints an UNGUESSABLE reservation owner.
 ---
 ---Not a pid and not a name: a guessable token is a lock anyone can forge, and
@@ -299,9 +306,6 @@ local function _token()
   for _ = 1, 16 do t[#t + 1] = string.format("%02x", math.random(0, 255)) end
   return table.concat(t, "-")
 end
-
----_now is seconds since the epoch.
-local function _now() return os.time() end
 
 ---max_recorded_revision is the allocation maximum over ALL THREE record kinds.
 ---
@@ -453,7 +457,8 @@ function M.save(slug, review, opts)
   -- an invariant any caller can opt out of is not an invariant, and the whole
   -- point of closing this path is that the narrowest public writer decides what
   -- readers can observe.
-  local okp, pproblems = M.validate_pair(review, opts)
+  local okp, pproblems = M.validate_pair(review,
+      vim.tbl_extend("keep", { slug = slug }, opts or {}))
   if not okp then
     return nil, "unpaired review refused (write through save_pair): "
       .. table.concat(pproblems, "; ")
@@ -506,7 +511,8 @@ function M.save_next(slug, review, opts)
     review.revision = rev
     local ok, problems = M.validate(review, { for_write = true })
     if not ok then return nil, "invalid review: " .. table.concat(problems, "; ") end
-    local okp, pproblems = M.validate_pair(review, opts)
+    local okp, pproblems = M.validate_pair(review,
+      vim.tbl_extend("keep", { slug = slug }, opts or {}))
     if not okp then
       return nil, "unpaired review refused (write through save_pair): "
         .. table.concat(pproblems, "; ")
@@ -634,9 +640,20 @@ function M.check_document_path(doc, opts)
       problems[#problems + 1] = ("document is r%s but the review is r%s")
         :format(drev, tostring(opts.revision))
     end
-    if opts.slug and not mid:find(_repo_component(opts.slug), 1, true) then
+    -- The middle must be `<repo>-<topic>` with a NON-EMPTY topic. A substring
+    -- match on the repo alone accepted a single-component middle, so
+    -- `2026-08-25-x-r1-review.md` passed for `owner__realrepo` — carrying
+    -- neither the required repo component nor a separate topic.
+    if opts.slug then
+      local repo = _repo_component(opts.slug)
+      local topic = mid:match("^" .. vim.pesc(repo) .. "%-(.+)$")
+      if not topic or topic == "" then
+        problems[#problems + 1] =
+          ("document name must be <date>-%s-<topic>-r<N>-review.md, got %s"):format(repo, name)
+      end
+    else
       problems[#problems + 1] =
-        "document name omits the repo component (" .. _repo_component(opts.slug) .. ")"
+        "cannot verify the repo component: no slug supplied and the review carries no owner/name"
     end
   end
   return #problems == 0, problems
@@ -656,9 +673,19 @@ end
 function M.validate_pair(review, opts)
   if type(review) ~= "table" then return false, { "not a table" } end
   opts = opts or {}
+  -- The slug is REQUIRED for the repo-component check, and this used to reduce
+  -- to nil unconditionally — `opts.slug or X and nil or nil` is always nil — so
+  -- the component was never verified and a non-canonical name passed. Public
+  -- writers now supply theirs; failing that, derive it from the repo identity
+  -- the review already carries.
+  local slug = opts.slug
+  if not slug then
+    local r = review.repo or {}
+    if r.owner and r.name then slug = r.owner .. "__" .. r.name end
+  end
   local ok, problems = M.check_document_path(review.document, {
     kb_root = opts.kb_root, reviewer_slug = review.reviewer_slug,
-    slug = opts.slug or (review.repo or {}).name and nil or nil,
+    slug = slug,
     revision = review.revision,
   })
   problems = problems or {}

@@ -59,16 +59,22 @@ end
 vim.env.AUTO_AGENTS_KB_ROOT = vim.fn.tempname() .. "-kbroot"
 vim.fn.mkdir(vim.env.AUTO_AGENTS_KB_ROOT, "p")
 
-local function _smoke_pair(rv, reviewer_slug)
-  local kb = vim.env.AUTO_AGENTS_KB_ROOT
-  local dir = ("%s/agents/%s/reviews"):format(kb, reviewer_slug or "lector")
-  vim.fn.mkdir(dir, "p")
-  local path = ("%s/2026-08-24-smoke-r%d-review.md"):format(dir, rv.revision or 1)
+local function _smoke_pair(rv, slug, reviewer_slug)
+  local review = require("worktree.review")
+  local rslug = reviewer_slug or "lector"
+  -- Ask the STORE for the canonical path rather than composing one here. The
+  -- name must carry <repo>-<topic>, and a test that reproduces the naming is a
+  -- second implementation of it that can drift — which is exactly what happened.
+  local path = review.canonical_document({
+    kb_root = vim.env.AUTO_AGENTS_KB_ROOT, reviewer_slug = rslug,
+    slug = slug, topic = "smoke", revision = rv.revision or 1 })
+  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
   vim.fn.writefile({ "# primary review" }, path)
   rv.document = path
-  rv.reviewer_slug = reviewer_slug or "lector"
+  rv.reviewer_slug = rslug
   return rv
 end
+
 
 -- ───────── 1. require + public API surface ─────────
 print("\n[1] require + public API surface")
@@ -944,7 +950,7 @@ do
   ok("10d: a foreign schema is rejected", select(1, review.validate(badschema)) == false)
 
   -- save/load/list
-  pair_doc(r)
+  _smoke_pair(r, "yongjohnlee80__autodb")
   local path, serr = review.save("yongjohnlee80__autodb", r)
   ok("10d: save() writes the file", path ~= nil and vim.fn.filereadable(path) == 1, tostring(serr))
   ok("10d: save() REFUSES an invalid review (a broken file is worse than none)",
@@ -955,7 +961,7 @@ do
     (function() local v, e = review.load("yongjohnlee80__autodb", "0000000", 9); return v == nil and e == nil end)())
 
   local r2 = vim.deepcopy(r); r2.revision = 2
-  review.save("yongjohnlee80__autodb", pair_doc(r2))
+  review.save("yongjohnlee80__autodb", _smoke_pair(r2, "yongjohnlee80__autodb"))
   local listed = review.list_for("yongjohnlee80__autodb", r.commit)
   ok("10d: list_for() finds both revisions, newest first",
     #listed == 2 and listed[1].revision == 2, vim.inspect(vim.tbl_map(function(x) return x.revision end, listed)))
@@ -970,9 +976,9 @@ do
   -- error to either writer. Reproduced across two real processes in r1.
   local imm = vim.deepcopy(r); imm.revision = 1
   imm.summary = "FIRST summary"
-  local ip1 = review.save("immut__repo", pair_doc(imm))
+  local ip1 = review.save("immut__repo", _smoke_pair(imm, "immut__repo"))
   local imm2 = vim.deepcopy(imm); imm2.summary = "SECOND summary"
-  local ip2, ierr = review.save("immut__repo", pair_doc(imm2))
+  local ip2, ierr = review.save("immut__repo", _smoke_pair(imm2, "immut__repo"))
   ok("10d-r1: *** re-saving an existing revision is REFUSED ***",
     ip2 == nil and ierr ~= nil, tostring(ip2) .. " / " .. tostring(ierr))
   local kept = review.load("immut__repo", imm.commit, 1)
@@ -981,7 +987,7 @@ do
   ok("10d-r1: the refusal names the revision so the caller can bump",
     tostring(ierr):match("r1") ~= nil or tostring(ierr):match("revision") ~= nil, tostring(ierr))
   ok("10d-r1: an explicit overwrite is still possible for a deliberate amend",
-    review.save("immut__repo", pair_doc(imm2), { overwrite = true }) ~= nil)
+    review.save("immut__repo", _smoke_pair(imm2, "immut__repo"), { overwrite = true }) ~= nil)
 
   -- save_next claims atomically, so two agents cannot both take rN.
   local nx = vim.deepcopy(r); nx.commit = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
@@ -990,7 +996,7 @@ do
   local function paired_next(slug, rv)
     for attempt = 1, 25 do
       rv.revision = review.latest_revision(slug, rv.commit) + 1
-      pair_doc(rv, "lector")
+      _smoke_pair(rv, slug, "lector")
       local pth, rev = review.save_next(slug, rv)
       if pth then return pth, rev end
       if attempt == 25 then return nil, rev end
@@ -1214,7 +1220,7 @@ do
   local rr = review.new({ commit = nodes[2].sha, revision = 1, reviewer = "lector",
                           owner = "smoke", name = "fixture" })
   rr.comments = { { path = "f.txt", line = 1, side = "RIGHT", severity = "nit", body = "ok" } }
-  review.save(repo.slug, _smoke_pair(rr))
+  review.save(repo.slug, _smoke_pair(rr, repo.slug))
   ok("10h: reviews() finds a review recorded for that commit",
     #repos.reviews(repo, nodes[2].sha) == 1, vim.inspect(repos.reviews(repo, nodes[2].sha)))
 
@@ -1431,7 +1437,7 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   -- save_next and left save() as stat-then-replacing-write. A real second
   -- process committing r1 inside that gap destroyed the first review with both
   -- writers getting err=nil.
-  local p1 = review.save("toctou__repo", _smoke_pair(mkreview(1)))
+  local p1 = review.save("toctou__repo", _smoke_pair(mkreview(1), "toctou__repo"))
   ok("14a: save() writes a new revision", p1 ~= nil)
   -- Blind ONLY the pre-check, exactly as the TOCTOU does, and confirm the
   -- write is still refused — proving the claim (not the stat) is the gate.
@@ -1441,7 +1447,7 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
     if not blinded and p == p1 then blinded = true; return nil end
     return real_stat(p)
   end
-  local p2, e2 = review.save("toctou__repo", _smoke_pair(mkreview(1)))
+  local p2, e2 = review.save("toctou__repo", _smoke_pair(mkreview(1), "toctou__repo"))
   uv.fs_stat = real_stat
   ok("14a: *** with the pre-check blinded, save() STILL refuses (atomic claim) ***",
     p2 == nil and e2 ~= nil, tostring(p2) .. " / " .. tostring(e2))
@@ -1451,7 +1457,7 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   ok("14a: CONTROL — an explicit overwrite still replaces deliberately",
     review.save("toctou__repo", _smoke_pair((function()
       local r = mkreview(1); r.summary = "AMENDED"; return r
-    end)()), { overwrite = true }) ~= nil)
+    end)(), "toctou__repo"), { overwrite = true }) ~= nil)
   ok("14a: CONTROL — and the amend is what is now on disk",
     (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "AMENDED")
 

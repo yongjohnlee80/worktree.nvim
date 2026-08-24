@@ -105,6 +105,16 @@ do
         .. '  local r = real(p, b)\n'
         .. '  if tostring(p):find("%.reserve$") then (vim.uv or vim.loop).kill((vim.uv or vim.loop).os_getpid(), 9) end\n'
         .. '  return r\nend' },
+    { name = "after the JSON commit",
+      -- The remnant here is a COMPLETE pair: the commit point has passed, so
+      -- only the reservation can be left over. Absent from r1, and it is the
+      -- phase that proves the commit point is where the ADR says it is.
+      after_commit = true,
+      extra = 'local real = store.create_exclusive\n'
+        .. 'store.create_exclusive = function(p, b)\n'
+        .. '  local r = real(p, b)\n'
+        .. '  if tostring(p):find("%.review%.json$") then (vim.uv or vim.loop).kill((vim.uv or vim.loop).os_getpid(), 9) end\n'
+        .. '  return r\nend' },
     { name = "after the Markdown claim",
       extra = 'local real = store.create_exclusive\n'
         .. 'store.create_exclusive = function(p, b)\n'
@@ -145,11 +155,26 @@ do
     end
     ok(("*** killed %s: no reader ever sees a JSON without its document ***"):format(ph.name),
       not unpaired, ("%d canonical revision(s)"):format(#revs))
-    ok(("killed %s: the writer really got that far (positive control)"):format(ph.name),
-      reserved, "a reservation must exist, or the kill fired before any work")
-    ok(("killed %s: NO canonical JSON was published"):format(ph.name),
-      #revs == 0, ("%d revision(s)"):format(#revs))
-    if i == 1 then
+    if ph.after_commit then
+      ok(("killed %s: the writer really got that far (positive control)"):format(ph.name),
+        #revs == 1, "the commit must have happened before the kill")
+    else
+      ok(("killed %s: the writer really got that far (positive control)"):format(ph.name),
+        reserved, "a reservation must exist, or the kill fired before any work")
+    end
+    if not ph.after_commit then
+      ok(("killed %s: NO canonical JSON was published"):format(ph.name),
+        #revs == 0, ("%d revision(s)"):format(#revs))
+    end
+    if ph.after_commit then
+      -- Past the commit point: the pair must be COMPLETE, not a remnant.
+      ok("*** killed after the JSON commit: the pair is COMPLETE ***",
+        #revs == 1 and md_here, ("%d revision(s), md=%s"):format(#revs, tostring(md_here)))
+      local d = revs[1] and review.load(SLUG, sha, revs[1].revision)
+      ok("killed after the JSON commit: and the JSON names its document",
+        d ~= nil and d.document ~= nil and vim.fn.filereadable(d.document) == 1,
+        vim.inspect(d and d.document))
+    elseif ph.name == "after the reservation" then
       ok("killed after the reservation: and no Markdown either", not md_here)
     else
       ok("*** killed after the Markdown claim: the ORPHAN Markdown is on disk ***",
@@ -158,27 +183,36 @@ do
   end
 end
 
-io.stdout:write("\n[3] a write-denied store: tombstone fails, the reservation FENCES\n")
+io.stdout:write("\n[3] a GENUINELY write-denied store: tombstone fails, reservation FENCES\n")
 do
   local sha = string.rep("8", 40)
   local doc = review.from_draft({ slug = SLUG }, sha, "lector",
     { comments = { { path = "a", line = 1, side = "RIGHT", severity = "nit", body = "x" } } })
   local dir = store.reviews_dir(SLUG)
   store.ensure_dir(dir)
-  -- Deny every create in the reviews dir EXCEPT the reservation, so the JSON
-  -- fails and the tombstone that would retire it fails too — the case a
-  -- read-only store actually produces, and the one a targeted failure cannot.
+
+  -- REAL permissions, not an injected create_exclusive error. An injected error
+  -- is a stub agreeing with the test; `chmod 0500` is the condition a read-only
+  -- store actually presents, and it denies the JSON and the tombstone for the
+  -- same reason — which is exactly the case the reservation fallback exists for.
+  -- The reservation is created while the directory is still writable, then the
+  -- permissions drop at the Markdown claim (which lives in the KB, not here).
   local real = store.create_exclusive
-  store.create_exclusive = function(p, b)
-    local s = tostring(p)
-    if s:find("%.reserve$") then return real(p, b) end
-    if s:find("%.review%.json$") or s:find("%.tombstone$") then
-      return false, "injected: store is read-only"
+  local dropped = false
+  store.create_exclusive = function(pth, b)
+    local r, e = real(pth, b)
+    if not dropped and tostring(pth):find("%-review%.md$") then
+      dropped = true
+      vim.fn.system({ "chmod", "0500", dir })
     end
-    return real(p, b)
+    return r, e
   end
   local res, err = review.save_pair(SLUG, doc, "# body", { topic = "denied" })
   store.create_exclusive = real
+  vim.fn.system({ "chmod", "0700", dir })
+
+  ok("the write really was denied (positive control)", dropped,
+    "the chmod must have fired, or this proves nothing")
   ok("the submission fails", res == nil, tostring(res))
   ok("*** and reports BOTH the write failure and the un-tombstoned revision ***",
     err and err:find("not lost", 1, true) and err:find("reservation retained", 1, true),
@@ -186,48 +220,107 @@ do
   ok("*** the reservation is RETAINED as the fence ***",
     vim.fn.filereadable(review.reserve_path(SLUG, sha, 1)) == 1,
     review.reserve_path(SLUG, sha, 1))
+  ok("no tombstone could be written either (that is the point)",
+    vim.fn.filereadable(review.tombstone_path(SLUG, sha, 1)) == 0)
   ok("*** so the next write SKIPS that revision once writes are possible again ***",
     (function()
       local d2 = review.from_draft({ slug = SLUG }, sha, "lector",
         { comments = { { path = "a", line = 1, side = "RIGHT", severity = "nit", body = "y" } } })
-      local r2 = review.save_pair(SLUG, d2, "# body2", { topic = "denied" })
+      local r2 = review.save_pair(SLUG, d2, "# body2", { topic = "denied2" })
       return r2 ~= nil and r2.revision > 1
     end)(), "the retained reservation must keep r1 out of circulation")
 end
 
-io.stdout:write("\n[4] forced interleavings — cleanup against a committing writer\n")
+io.stdout:write("\n[4] forced interleavings\n")
 do
+  -- (a) A cleanup landing AFTER the owner's final recheck and BEFORE the JSON
+  -- create — the window the ADR names. Running it while our lease is current
+  -- only proves a live lease survives; to prove "complete pair PLUS a redundant
+  -- tombstone" the cleanup has to actually tombstone, so the lease is expired
+  -- first and the cleanup is fired from inside the JSON create.
   local sha = string.rep("9", 40)
   local doc = review.from_draft({ slug = SLUG }, sha, "lector",
     { comments = { { path = "a", line = 1, side = "RIGHT", severity = "nit", body = "x" } } })
-  -- Land a cleanup pass BETWEEN the Markdown claim and the JSON commit.
   local real = store.create_exclusive
-  local fired = false
-  store.create_exclusive = function(p, b)
-    local r, e = real(p, b)
-    if not fired and tostring(p):find("%-review%.md$") then
+  local fired, target = false, nil
+  store.create_exclusive = function(pth, b)
+    if not fired and tostring(pth):find("%.review%.json$") then
       fired = true
-      review.cleanup(SLUG, sha)   -- our lease is CURRENT, so it must not reap us
+      target = tonumber(tostring(pth):match("%.r(%d+)%.review%.json$"))
+      -- expire OUR reservation, then let a cleanup reap it, all before the
+      -- commit that is already authorised.
+      real = real
+      local rp = review.reserve_path(SLUG, sha, target)
+      vim.fn.writefile({ vim.json.encode({ owner = "ours", lease_until = os.time() - 1 }) }, rp)
+      review.cleanup(SLUG, sha)
     end
-    return r, e
+    return real(pth, b)
   end
   local res = review.save_pair(SLUG, doc, "# body", { topic = "interleave" })
   store.create_exclusive = real
-  ok("*** a cleanup mid-write does not reap a live lease: the pair commits ***",
-    res ~= nil, "a current lease must survive a concurrent cleanup")
-  ok("and the committed pair is loadable",
+
+  ok("the interleaving really fired (positive control)", fired,
+    "the cleanup must have run inside the JSON create")
+  ok("*** the pair still COMMITS despite a cleanup mid-write ***", res ~= nil,
+    "an already-authorised commit must not be undone by a concurrent reclaim")
+  ok("and the committed pair loads with its document",
+    res and (function()
+      local d = review.load(SLUG, sha, res.revision)
+      return d ~= nil and d.document and vim.fn.filereadable(d.document) == 1
+    end)())
+  ok("*** leaving a REDUNDANT tombstone beside a complete pair ***",
+    target and vim.fn.filereadable(review.tombstone_path(SLUG, sha, target)) == 1,
+    tostring(target))
+  ok("which is benign: the reader sees a valid pair, not a retired revision",
     res and review.load(SLUG, sha, res.revision) ~= nil)
 
-  -- Two cleanups on one expired reservation collapse to a single tombstone.
-  local dead = review.max_recorded_revision(SLUG, sha) + 1
-  store.create_exclusive(review.reserve_path(SLUG, sha, dead),
+  -- (b) Two INDEPENDENT concurrent cleanups on one expired reservation.
+  -- Sequential calls in one Lua state cannot race; these are separate
+  -- processes started together.
+  local sha2 = string.rep("7", 40)
+  store.ensure_dir(store.reviews_dir(SLUG))
+  local dead = 1
+  store.create_exclusive(review.reserve_path(SLUG, sha2, dead),
     vim.json.encode({ owner = "crashed", lease_until = os.time() - 1 }))
-  review.cleanup(SLUG, sha); review.cleanup(SLUG, sha)
-  ok("*** two cleanups on one revision yield ONE tombstone ***",
-    vim.fn.filereadable(review.tombstone_path(SLUG, sha, dead)) == 1)
-  ok("and cleanup refuses to tombstone an already-committed revision",
-    res and vim.fn.filereadable(review.tombstone_path(SLUG, sha, res.revision)) == 0,
-    res and review.tombstone_path(SLUG, sha, res.revision))
+  local CLEAN = ([[
+local root = "%s"
+vim.opt.runtimepath:prepend(root)
+package.path = root .. "/lua/?.lua;" .. package.path
+local store = require("worktree.store"); local review = require("worktree.review")
+store._root_override = "%s"
+io.stdout:write(tostring(review.cleanup("%s", "%s")) .. "\n")
+]]):format(root, store._root_override, SLUG, sha2)
+  local cp = vim.fn.tempname() .. "-clean.lua"
+  vim.fn.writefile(vim.split(CLEAN, "\n"), cp)
+  local j1 = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", cp }, { text = true })
+  local j2 = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", cp }, { text = true })
+  local o1, o2 = j1:wait(), j2:wait()
+  local n1 = tonumber(vim.trim(o1.stdout or "")) or -1
+  local n2 = tonumber(vim.trim(o2.stdout or "")) or -1
+  -- BOTH may report a retirement, and that is deliberate: `retire` treats "a
+  -- tombstone is already there" as success, because the revision is fenced
+  -- either way and a loser that reported failure would invite a caller to
+  -- retry something already done. The invariant is the ARTIFACT — exactly one
+  -- tombstone — not the number of reporters.
+  ok("*** two INDEPENDENT cleanups produce exactly ONE tombstone ***",
+    vim.fn.filereadable(review.tombstone_path(SLUG, sha2, dead)) == 1
+    and #vim.fn.glob(store.reviews_dir(SLUG) .. "/*@" .. sha2:sub(1, 7)
+        .. ".r*.tombstone", false, true) == 1,
+    ("reported %d + %d"):format(n1, n2))
+  ok("and neither process failed", n1 >= 0 and n2 >= 0, ("%d + %d"):format(n1, n2))
+  ok("at least one of them did the retiring", (n1 + n2) >= 1, ("%d + %d"):format(n1, n2))
+
+  -- A cleanup run AFTER the commit adds nothing: the committed revision is
+  -- fenced by its canonical JSON. (The redundant tombstone above was written
+  -- BEFORE that JSON existed, which is why it is redundant rather than wrong —
+  -- asserting "no tombstone on a committed revision" here would contradict it.)
+  local before_tomb = #vim.fn.glob(store.reviews_dir(SLUG) .. "/*@" .. sha:sub(1, 7)
+    .. ".r*.tombstone", false, true)
+  review.cleanup(SLUG, sha)
+  ok("*** a cleanup after the commit adds no tombstone ***",
+    #vim.fn.glob(store.reviews_dir(SLUG) .. "/*@" .. sha:sub(1, 7) .. ".r*.tombstone",
+      false, true) == before_tomb,
+    ("%d tombstone(s) before and after"):format(before_tomb))
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", pass, fail))
