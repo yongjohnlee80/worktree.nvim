@@ -1084,6 +1084,66 @@ do
   ok("10e: an unknown verdict degrades to COMMENT",
     review.github_payload({ verdict = "???" }).review_event == "COMMENT")
 
+  -- ── [10g] the FORGEJO projection (item 4, provider-agnostic half) ──
+  -- Forgejo/Gitea is a SECOND projection, not a GitHub flag: the review event
+  -- vocabulary and the line-anchor fields both differ. This is the pure shape
+  -- transform only — no network, no token, no POST. The transport that consumes
+  -- it is deferred (see the split KB todo).
+  local fp = review.forgejo_payload(r)
+  ok("10g: verdict maps to a FORGEJO event (APPROVED, not GitHub's APPROVE)",
+    review.forgejo_payload({ verdict = "approved" }).event == "APPROVED",
+    review.forgejo_payload({ verdict = "approved" }).event)
+  ok("10g: change_requested maps to REQUEST_CHANGES", fp.event == "REQUEST_CHANGES", fp.event)
+  ok("10g: an unknown verdict degrades to COMMENT",
+    review.forgejo_payload({ verdict = "???" }).event == "COMMENT")
+  ok("10g: the summary becomes the body", fp.body == "one must-fix")
+  ok("10g: the commit anchors the review", fp.commit_id == r.commit, tostring(fp.commit_id))
+  ok("10g: RESOLVED comments are excluded", #fp.comments == 2, tostring(#fp.comments))
+  ok("10g: a RIGHT-side comment anchors by new_position (not line+side)",
+    fp.comments[1].new_position == 134 and fp.comments[1].old_position == nil,
+    vim.inspect(fp.comments[1]))
+  ok("10g: severity is folded into the body", fp.comments[1].body:find("must%-fix") ~= nil,
+    fp.comments[1].body)
+  ok("10g: *** a multi-line range is folded into the body (no native field) ***",
+    fp.comments[1].body:find("L128%-134") ~= nil, fp.comments[1].body)
+  do
+    -- A LEFT-side comment anchors by old_position instead.
+    local lr = { verdict = "comment", summary = "s",
+      comments = { { path = "x", line = 7, side = "LEFT", body = "b" } } }
+    local lp = review.forgejo_payload(lr)
+    ok("10g: a LEFT-side comment anchors by old_position",
+      lp.comments[1].old_position == 7 and lp.comments[1].new_position == nil,
+      vim.inspect(lp.comments[1]))
+  end
+
+  -- ── [10h] provider autodetection from the git remote (item 4) ──
+  -- Forgejo is open-source and self-hosted everywhere, so the provider is
+  -- derived from the repo's remote URL, never hard-coded. github.com -> GitHub
+  -- API; any other host -> Forgejo/Gitea /api/v1 at that host.
+  local gh = review.provider_for("git@github.com:yongjohnlee80/autodb.git")
+  ok("10h: an scp-form github remote is GitHub", gh and gh.provider == "github", vim.inspect(gh))
+  ok("10h: with the api.github.com base", gh and gh.api_base == "https://api.github.com", gh and gh.api_base)
+  ok("10h: owner and repo are parsed", gh and gh.owner == "yongjohnlee80" and gh.repo == "autodb",
+    vim.inspect(gh))
+  local gh2 = review.provider_for("https://github.com/o/r.git")
+  ok("10h: an https github remote is GitHub too", gh2 and gh2.provider == "github", vim.inspect(gh2))
+  local fj = review.provider_for("ssh://git@git.johnosoft.org:2222/knowledge-base/global-kb.git")
+  ok("10h: a self-hosted remote is Forgejo", fj and fj.provider == "forgejo", vim.inspect(fj))
+  ok("10h: *** the SSH port is dropped — the API is HTTPS, not :2222 ***",
+    fj and fj.api_base == "https://git.johnosoft.org/api/v1", fj and fj.api_base)
+  ok("10h: owner/repo parsed from a nested path", fj and fj.owner == "knowledge-base" and fj.repo == "global-kb",
+    vim.inspect(fj))
+  local fj2 = review.provider_for("https://git.johnosoft.org/o/r.git")
+  ok("10h: an https self-hosted remote is Forgejo", fj2 and fj2.provider == "forgejo", vim.inspect(fj2))
+  ok("10h: a garbage remote is nil + error",
+    (function() local v, e = review.provider_for("not a url"); return v == nil and e ~= nil end)())
+
+  -- payload_for dispatches by provider, so a caller holds one call site.
+  ok("10h: payload_for(github) yields the GitHub shape",
+    review.payload_for(r, "github").review_event ~= nil)
+  ok("10h: payload_for(forgejo) yields the Forgejo shape",
+    review.payload_for(r, "forgejo").event ~= nil)
+
   -- ── repos surface over a REAL bare + worktree layout ──
   ok("10f: available() is true with auto-core >= 0.1.70 present", repos.available() == true)
 
