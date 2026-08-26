@@ -988,4 +988,141 @@ function M.github_payload(review)
   }
 end
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- PROVIDER PROJECTIONS — the transport-agnostic half of "post a review"
+-- (diffview follow-up item 4).
+--
+-- These are PURE SHAPE TRANSFORMS. They take a validated review document and
+-- return the exact JSON body a forge's review API expects. They do NOT touch
+-- the network, read a token, or POST anything — and NOTHING in the UI is wired
+-- to them yet (no command, no keymap). That is deliberate: the actual transport
+-- (POST to GitHub via `gh`; POST to Forgejo via `tea` or curl+token+cert) is
+-- SPLIT OUT and deferred until the auth/cert story is decided. See the KB todo
+-- `2026-08-26-post-review-json-to-github-forgejo-transport` before wiring any
+-- caller that sends over the wire. Keeping the projections here now means the
+-- transport, when it lands, is a thin shell over already-tested shape code.
+-- ─────────────────────────────────────────────────────────────────────────
+
+---FORGEJO_EVENTS maps a review verdict onto a Forgejo/Gitea review event.
+---
+---Note the vocabulary is NOT GitHub's: Forgejo says `APPROVED`, GitHub says
+---`APPROVE`. Emitting GitHub's word here is silently rejected by Forgejo, which
+---is exactly why this is a separate map rather than a reuse of `VERDICTS`.
+M.FORGEJO_EVENTS = {
+  approved = "APPROVED",
+  change_requested = "REQUEST_CHANGES",
+  comment = "COMMENT",
+}
+
+---forgejo_payload projects a review onto Forgejo/Gitea's review API shape:
+---`POST /api/v1/repos/{owner}/{repo}/pulls/{index}/reviews`, whose body is
+---`{ event, body, commit_id, comments:[{path, new_position|old_position, body}] }`.
+---
+---Three things differ from `github_payload`, and each is a place a naive reuse
+---would break:
+---  * the event vocabulary (see FORGEJO_EVENTS);
+---  * anchoring is by POSITION per side — `new_position` for the RIGHT/after
+---    side, `old_position` for the LEFT/before side — NOT GitHub's `line`+`side`;
+---  * there is NO native multi-line range field, so a ranged finding's scope is
+---    folded into the body text rather than silently dropped.
+---`severity` and `resolved` are ours, handled as in `github_payload`: severity
+---folded into the body, resolved comments excluded from the upload.
+---@param review WorktreeReview
+---@return { event: string, body: string, commit_id: string?, comments: table[] }
+function M.forgejo_payload(review)
+  review = review or {}
+  local comments = {}
+  for _, c in ipairs(review.comments or {}) do
+    if not c.resolved then
+      local body = c.body or ""
+      if c.severity then body = "**" .. c.severity .. "** — " .. body end
+      -- No native range field: preserve the reviewer's scope in the text so it
+      -- is not lost, the same defensive choice the diff-view painter makes.
+      if c.start_line and c.start_line ~= c.line then
+        body = body .. ("\n\n_(range L%d-%d)_"):format(
+          math.min(c.start_line, c.line), math.max(c.start_line, c.line))
+      end
+      local entry = { path = c.path, body = body }
+      -- LEFT (the a/ side) anchors by old_position; RIGHT (b/, the default) by
+      -- new_position. A comment with no side defaults to RIGHT, as GitHub does.
+      if (c.side or "RIGHT") == "LEFT" then
+        entry.old_position = c.line
+      else
+        entry.new_position = c.line
+      end
+      comments[#comments + 1] = entry
+    end
+  end
+  return {
+    event = M.FORGEJO_EVENTS[review.verdict or "comment"] or "COMMENT",
+    body = review.summary or "",
+    -- Forgejo accepts a commit_id to anchor the review to a specific commit;
+    -- the review already carries it, so pass it rather than letting the server
+    -- default to the PR head.
+    commit_id = review.commit,
+    comments = comments,
+  }
+end
+
+---provider_for derives the forge from a git remote URL — never hard-coded,
+---because Forgejo is open-source and self-hosted on arbitrary hosts.
+---
+---`github.com` -> the GitHub REST API; ANY OTHER host is treated as a
+---Forgejo/Gitea instance at `https://<host>/api/v1`. The SSH port (e.g. the
+---`:2222` on git.johnosoft.org) is DROPPED: it addresses the git transport, not
+---the HTTPS API, which is on 443. Accepts both scp-form (`git@host:owner/repo`)
+---and URL-form (`scheme://[user@]host[:port]/owner/repo`) remotes.
+---@param remote_url string
+---@return { provider: string, host: string, owner: string, repo: string, api_base: string }?, string?
+function M.provider_for(remote_url)
+  remote_url = tostring(remote_url or "")
+  local host, path
+  -- scp-form: git@host:owner/repo(.git)
+  host, path = remote_url:match("^[%w._-]+@([^:/]+):(.+)$")
+  if not host then
+    -- URL-form: scheme://[user@]host[:port]/owner/repo(.git). Grab the authority
+    -- as one span, then strip an optional `user@` and a trailing `:port`. Doing
+    -- it in one regex is fragile: a host character class wide enough to reject
+    -- `:` and `/` still admits `@`, so `git@host` leaks into the host (the exact
+    -- bug this replaced). The SSH port must go — it addresses the git transport,
+    -- while the API is on HTTPS 443.
+    local authority
+    authority, path = remote_url:match("^%w+://([^/]+)/(.+)$")
+    if authority then
+      authority = authority:gsub("^[^@]*@", "")   -- drop userinfo
+      host = authority:gsub(":%d+$", "")          -- drop the port
+    end
+  end
+  if not host or not path or path == "" then
+    return nil, "unrecognized remote URL: " .. remote_url
+  end
+  path = path:gsub("%.git$", "")
+  local owner, repo = path:match("([^/]+)/([^/]+)$")
+  if not owner or not repo then
+    return nil, "no owner/repo in remote URL: " .. remote_url
+  end
+  local provider, api_base
+  if host == "github.com" or host == "www.github.com" then
+    provider, api_base = "github", "https://api.github.com"
+  else
+    provider, api_base = "forgejo", "https://" .. host .. "/api/v1"
+  end
+  return { provider = provider, host = host, owner = owner, repo = repo, api_base = api_base }
+end
+
+---payload_for is a one-call-site dispatcher onto the right projection, so a
+---caller that has already resolved the provider does not branch on it. Defaults
+---to GitHub for an unknown provider — the historical default, and the one whose
+---transport (`gh`) is already available.
+---@param review WorktreeReview
+---@param provider string  "github" | "forgejo" | "gitea"
+---@return table
+function M.payload_for(review, provider)
+  if provider == "forgejo" or provider == "gitea" then
+    return M.forgejo_payload(review)
+  end
+  return M.github_payload(review)
+end
+
+
 return M
