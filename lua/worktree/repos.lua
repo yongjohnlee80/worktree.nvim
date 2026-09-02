@@ -150,12 +150,16 @@ function M.repos(root)
   local found = core.git.graph.fan_out(root, { max_depth = 3 }) or {}
   local out = {}
   for _, r in ipairs(found) do
-    local slug, url = store.remote_slug(r.common_dir)
+    -- OWNER and NAME travel with the record, not just the slug. A review must
+    -- name its repository (`review.validate`: a url, or owner AND name), and
+    -- with only a slug a frontend could not build one — so submitting a review
+    -- for a repo with no remote was refused outright (ADR-0060 §11.8).
+    local id = store.remote_identity(r.common_dir)
     out[#out + 1] = {
       common_dir = r.common_dir, label = r.label,
       is_bare = r.is_bare and true or false,
       sample_worktree = r.sample_worktree,
-      slug = slug, url = url,
+      slug = id.slug, url = id.url, owner = id.owner, name = id.name,
     }
   end
   return out

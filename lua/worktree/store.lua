@@ -43,7 +43,22 @@ M._root_override = nil
 ---string becomes a PATH SEGMENT and must never be able to escape the store.
 ---@param identity string   remote url, or a filesystem path
 ---@return string slug
-function M.slug(identity)
+---identity parses a repo identity — a remote URL or a local path — into the
+---OWNER and NAME halves that `slug` joins.
+---
+---Exposed because a REVIEW must carry the pair: `review.validate` requires a
+---non-empty url, or owner AND name. This function always computed both and
+---then threw them away behind the joined slug, so a caller holding only a slug
+---could not build a valid review — and every submit for a repo with NO remote
+---was refused with "repo carries no identity". That made the repos panel's
+---review submit impossible on any local-only repository, which is most of a
+---scratch workspace (Johno, 2026-09-02: "not usable still").
+---
+---ONE parser, so the pair and the slug can never disagree about what a repo is
+---called ([[shared-resolver-single-source-of-truth]]).
+---@param identity string  a remote URL, or a path to the repo
+---@return string owner, string name   both already path-safe
+function M.identity(identity)
   local s = tostring(identity or "")
   -- Order matters: strip trailing slashes FIRST. `…/r.git/` would otherwise
   -- keep its `.git` (it is not at the end), the dot would sanitise to `-`, and
@@ -71,24 +86,57 @@ function M.slug(identity)
     -- survive, so `..` traversal is impossible by construction.
     return (tostring(part):gsub("[^%w%-_]", "-"))
   end
-  return clean(owner) .. "__" .. clean(repo)
+  return clean(owner), clean(repo)
+end
+
+---slug joins `identity`'s two halves into the filesystem-safe store key.
+---@param identity string
+---@return string slug
+function M.slug(identity)
+  local owner, repo = M.identity(identity)
+  return owner .. "__" .. repo
 end
 
 ---remote_slug resolves a repo's slug from its own git config, falling back to
 ---the common dir's name when the repo has no `origin`.
 ---@param common_dir string
 ---@return string slug, string? url
+---remote_identity resolves everything a caller needs to NAME a repo: the store
+---slug, the remote URL when there is one, and the owner/name pair either way.
+---
+---A repo with no `origin` is named after its container, so it still has an
+---identity a review can carry — being unhosted is not the same as being
+---anonymous, and refusing to review a local repository was never the intent.
+---@param common_dir string
+---@return { slug: string, url: string?, owner: string, name: string }
+function M.remote_identity(common_dir)
+  local source, url
+  if not common_dir or common_dir == "" then
+    source = "repo"
+  else
+    local res = vim.system(
+      { "git", "--git-dir=" .. common_dir, "config", "--get", "remote.origin.url" },
+      {}):wait()
+    local got = vim.trim((res.stdout or ""))
+    if res.code == 0 and got ~= "" then
+      source, url = got, got
+    else
+      -- No remote: key off the repo container. A bare repo's common dir is the
+      -- repo itself (`…/autodb`), a checkout's is `…/autodb/.git`.
+      source = common_dir:gsub("/%.git/?$", "")
+    end
+  end
+  local owner, name = M.identity(source)
+  return { slug = owner .. "__" .. name, url = url, owner = owner, name = name }
+end
+
+---remote_slug is `remote_identity`'s original two-value shape, kept for the
+---callers that only ever wanted the key.
+---@param common_dir string
+---@return string slug, string? url
 function M.remote_slug(common_dir)
-  if not common_dir or common_dir == "" then return M.slug("repo"), nil end
-  local res = vim.system(
-    { "git", "--git-dir=" .. common_dir, "config", "--get", "remote.origin.url" },
-    {}):wait()
-  local url = vim.trim((res.stdout or ""))
-  if res.code == 0 and url ~= "" then return M.slug(url), url end
-  -- No remote: key off the repo container. A bare repo's common dir is the
-  -- repo itself (`…/autodb`), a checkout's is `…/autodb/.git`.
-  local dir = common_dir:gsub("/%.git/?$", "")
-  return M.slug(dir), nil
+  local id = M.remote_identity(common_dir)
+  return id.slug, id.url
 end
 
 ---ensure_dir creates `path` with owner-only permissions and reports success.
