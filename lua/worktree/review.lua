@@ -1055,6 +1055,83 @@ function M.describe(path)
   return meta, nil
 end
 
+---remove deletes a review's canonical JSON and FENCES its revision number.
+---
+---The delete ALONE would be wrong. `max_recorded_revision` — the allocator
+---`save_next` claims from — counts canonical, reserved and tombstoned records
+---alike, precisely so a number is never handed out twice. A plain unlink of the
+---highest revision puts that number back in circulation, and the next review
+---written for the commit becomes a SECOND r<N>: every reference to "r2" then
+---names two different documents, and the pair invariant of ADR-0067 has no way
+---to tell them apart. So the revision is tombstoned as well as deleted.
+---
+---The tombstone is written FIRST. If it fails — a read-only reviews directory
+---rejects it for the same reason it would reject a write — nothing has been
+---deleted yet and the caller can be told; unlink-first would lose the file and
+---free the number in the same step, which is the one outcome with no recovery.
+---A tombstone that lands while the unlink then fails is benign: the file is
+---still listed and still removable, and the number was already spoken for.
+---
+---The paired canonical Markdown (ADR-0067) is deliberately NOT touched. It is
+---the PRIMARY and this JSON is its projection; it lives in the knowledge base
+---rather than in this store, and a projection can be written again from it
+---while durable prose cannot. Its path is returned so a caller can say what
+---remains.
+---@param slug string
+---@param sha string       full or short — only the first 7 characters are used
+---@param revision integer
+---@return boolean ok, string? err, table? detail
+function M.remove(slug, sha, revision)
+  if type(slug) ~= "string" or slug == "" then return false, "remove: slug required" end
+  if type(sha) ~= "string" or sha == "" then return false, "remove: sha required" end
+  local rev = tonumber(revision)
+  if not rev then return false, "remove: revision required" end
+
+  local uv = vim.uv or vim.loop
+  local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
+  if not uv.fs_stat(path) then return false, "no such review: " .. path end
+
+  -- Read the pair reference BEFORE the delete; afterwards there is nothing
+  -- left to read it from.
+  local meta = M.describe(path)
+  local detail = {
+    path = path,
+    document = meta and meta.document or nil,
+    tombstone = M.tombstone_path(slug, sha, rev),
+  }
+
+  local tombstoned, terr = M.retire(slug, sha, rev, nil)
+  if not tombstoned then
+    return false, "the revision could not be fenced, so nothing was deleted: "
+      .. tostring(terr or "unknown"), detail
+  end
+  detail.tombstoned = true
+
+  local ok, uerr = uv.fs_unlink(path)
+  if not ok then
+    return false, "the revision is fenced but the file could not be deleted: "
+      .. tostring(uerr or "unknown"), detail
+  end
+  return true, nil, detail
+end
+
+---remove_path is `remove` addressed by FILE, which is how a panel row knows a
+---review: it holds a path, and for a malformed document the commit sha inside
+---is exactly what cannot be trusted. The filename is the store's identity, so
+---it is what the delete is keyed on — and a file that will not parse is one of
+---the main things a user wants this for.
+---@param path string
+---@return boolean ok, string? err, table? detail
+function M.remove_path(path)
+  if type(path) ~= "string" or path == "" then return false, "remove_path: path required" end
+  local name = path:match("[^/]+$") or path
+  local slug, short, rev = M.parse_filename(name)
+  if not (slug and short and rev) then
+    return false, "not a review filename: " .. name
+  end
+  return M.remove(slug, short, rev)
+end
+
 ---described_for is `list_for` with every file described — the shape a tree needs
 ---to render a commit's review rows AND to badge its changed files, from ONE
 ---read pass over the documents.
