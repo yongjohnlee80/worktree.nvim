@@ -232,6 +232,102 @@ ok("*** reviews_index opens NO review documents ***", index_reads == 0,
 ok("*** reviews_all opens one per review ***", all_reads == total,
   ("%d vs %d"):format(all_reads, total))
 
+print("\n[8] remove deletes the JSON and FENCES the revision")
+-- The property that makes this more than an unlink: `max_recorded_revision`
+-- counts canonical + reserved + tombstoned records, so deleting the highest
+-- revision without a tombstone puts that number back in circulation and the
+-- next review for the commit becomes a SECOND r<N>.
+do
+  local sha = sha1
+  local before_max = review.max_recorded_revision(slug, sha)
+  local victim = write_review(sha, {
+    verdict = "comment", summary = "to be removed",
+    comments = { { path = "auth.go", line = 1, side = "RIGHT", severity = "nit",
+                   body = "removable" } },
+  })
+  ok("[8] fixture: the review was written and claimed the next revision",
+    victim.revision == before_max + 1 and vim.fn.filereadable(victim.json_path) == 1,
+    ("r%d after max r%d"):format(victim.revision, before_max))
+  local doc_before = (review.describe(victim.json_path) or {}).document
+  ok("[8] fixture: it names a paired canonical Markdown",
+    type(doc_before) == "string" and vim.fn.filereadable(doc_before) == 1,
+    tostring(doc_before))
+
+  local rok, rerr, detail = review.remove(slug, sha, victim.revision)
+  ok("[8] *** remove reports success ***", rok == true, tostring(rerr))
+  ok("[8] *** the JSON is gone ***", vim.fn.filereadable(victim.json_path) == 0)
+  ok("[8] it is gone from both listings",
+    #vim.tbl_filter(function(r) return r.path == victim.json_path end,
+      review.list_all(slug)) == 0
+    and #vim.tbl_filter(function(r) return r.revision == victim.revision end,
+      review.list_for(slug, sha)) == 0)
+  ok("[8] *** and the revision is TOMBSTONED, not merely deleted ***",
+    detail ~= nil and detail.tombstoned == true
+    and vim.fn.filereadable(detail.tombstone) == 1, vim.inspect(detail))
+  ok("[8] *** so the allocator still refuses to re-issue that number ***",
+    review.max_recorded_revision(slug, sha) >= victim.revision,
+    ("max r%d vs removed r%d"):format(review.max_recorded_revision(slug, sha), victim.revision))
+  -- CONTROL: the reuse this prevents. Delete the tombstone — the state a plain
+  -- unlink would have left — and the allocator hands the number back.
+  local fenced_max = review.max_recorded_revision(slug, sha)
+  vim.fn.delete(detail.tombstone)
+  ok("[8] *** CONTROL: without the tombstone the number IS re-offered ***",
+    review.max_recorded_revision(slug, sha) < fenced_max,
+    ("%d vs %d"):format(review.max_recorded_revision(slug, sha), fenced_max))
+  -- Put it back and prove the next real write skips the number.
+  local reok = review.retire(slug, sha, victim.revision, nil)
+  ok("[8] fixture: the fence is restored", reok == true)
+  local nxt = write_review(sha, { verdict = "comment", summary = "after the removal" })
+  ok("[8] *** the next review claims a NEW revision, never the removed one ***",
+    nxt.revision > victim.revision, ("r%d after removing r%d"):format(nxt.revision, victim.revision))
+
+  ok("[8] *** the paired canonical Markdown is KEPT — the JSON is its projection ***",
+    vim.fn.filereadable(doc_before) == 1, tostring(doc_before))
+  ok("[8] and remove REPORTS the document it left behind",
+    detail.document == doc_before, tostring(detail.document))
+
+  -- Guards: nothing destructive fires on a bad address.
+  ok("[8] removing a revision that does not exist fails without a tombstone",
+    select(1, review.remove(slug, sha, 4242)) == false
+    and vim.fn.filereadable(review.tombstone_path(slug, sha, 4242)) == 0)
+  ok("[8] guards on slug / sha / revision",
+    select(1, review.remove(nil, sha, 1)) == false
+    and select(1, review.remove(slug, "", 1)) == false
+    and select(1, review.remove(slug, sha, nil)) == false)
+
+  -- remove_path: how a panel row addresses a review, and the one form that
+  -- works for a document whose own commit field cannot be trusted.
+  local bad2 = store.reviews_dir(slug) .. "/" .. review.filename(slug, sha1, 77)
+  vim.fn.writefile({ "{ not json" }, bad2)
+  ok("[8] *** remove_path deletes a MALFORMED review — the main reason to want it ***",
+    select(1, review.remove_path(bad2)) == true and vim.fn.filereadable(bad2) == 0)
+  ok("[8] remove_path refuses a name that is not a review",
+    select(1, review.remove_path("/tmp/not-a-review.txt")) == false)
+  ok("[8] remove_path guards an empty path", select(1, review.remove_path("")) == false)
+
+  -- The frontend verb is CONTAINED: a path outside this repo's store is refused
+  -- before anything is unlinked.
+  local outside = sb .. "/outside.review.json"
+  vim.fn.writefile({ "{}" }, outside)
+  local repo2 = { slug = slug, common_dir = lab .. "/.git", label = "proj" }
+  local cok, cerr = repos.remove_review(repo2, outside)
+  ok("[8] *** repos.remove_review REFUSES a path outside the repo's store ***",
+    cok == false and tostring(cerr):find("refusing to delete outside", 1, true) ~= nil,
+    tostring(cerr))
+  ok("[8] and the file it refused is untouched", vim.fn.filereadable(outside) == 1)
+  local trav = store.reviews_dir(slug) .. "/../../outside.review.json"
+  ok("[8] *** a `..` traversal is refused on the RESOLVED path ***",
+    select(1, repos.remove_review(repo2, trav)) == false
+    and vim.fn.filereadable(outside) == 1)
+  ok("[8] repos.remove_review guards a repo with no slug",
+    select(1, repos.remove_review({}, victim.json_path)) == false)
+  -- And it works through the frontend for a real one.
+  local last = write_review(sha1, { verdict = "comment", summary = "via the surface" })
+  ok("[8] the frontend verb deletes a contained review",
+    select(1, repos.remove_review(repo2, last.json_path)) == true
+    and vim.fn.filereadable(last.json_path) == 0)
+end
+
 vim.fn.delete(sb, "rf")
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail > 0 and 1 or 0)

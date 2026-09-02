@@ -340,6 +340,27 @@ function M.reviews(repo, sha)
   return review.list_for(repo.slug, sha)
 end
 
+---remove_review deletes one review JSON and fences its revision (§11.6).
+---
+---CONTAINED: the path must resolve inside this repo's own reviews directory.
+---A frontend passes back a path it was handed, and a delete keyed on an
+---attacker-or-bug-supplied string is the one operation here with no undo. The
+---check is on the resolved path, not the string, so `..` cannot walk out.
+---@param repo WorktreeRepo
+---@param path string
+---@return boolean ok, string? err, table? detail
+function M.remove_review(repo, path)
+  if not repo or not repo.slug then return false, "remove_review: repo.slug required" end
+  if type(path) ~= "string" or path == "" then return false, "remove_review: path required" end
+  local dir = store.reviews_dir(repo.slug)
+  local resolved = vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
+  local root = vim.fn.resolve(vim.fn.fnamemodify(dir, ":p")):gsub("/$", "")
+  if resolved:sub(1, #root + 1) ~= root .. "/" then
+    return false, "refusing to delete outside " .. root .. ": " .. resolved
+  end
+  return review.remove_path(resolved)
+end
+
 ---reviews_described describes ONE commit's reviews — the rows a commit expands
 ---to, with the severity each carries. `reviews(repo, sha)` stays the cheap
 ---revision listing for callers that need nothing more (the diff view's
