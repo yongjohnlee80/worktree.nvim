@@ -409,6 +409,111 @@ do
   ok("[9] and THAT delete did fence its revision", vim.fn.filereadable(b_tomb) == 1)
 end
 
+print("\n[10] a repo with NO remote can still be reviewed")
+-- Johno, 2026-09-02: submitting a review was impossible on `example`, a bare
+-- repo with no origin. `review.validate` requires identity — a url, or owner
+-- AND name — and `repos.repos()` carried only the joined slug, so the frontend
+-- had nothing to build one from and every submit was refused with "repo
+-- carries no identity". `store.slug` had always computed the pair and thrown
+-- it away.
+do
+  -- SLUG STABILITY FIRST. Existing review directories are named by `slug`, so
+  -- exposing the pair must not change a single key. Any drift here silently
+  -- orphans every review already on disk.
+  local cases = {
+    { "git@github.com:yongjohnlee80/autodb.git", "yongjohnlee80__autodb", "yongjohnlee80", "autodb" },
+    { "ssh://git@github.com/yongjohnlee80/golib", "yongjohnlee80__golib", "yongjohnlee80", "golib" },
+    { "https://github.com/o/r.git/",             "o__r",                 "o",             "r" },
+    { "/home/j/Source/nvim-plugins/autodb",      "nvim-plugins__autodb", "nvim-plugins",  "autodb" },
+    { "example",                                 "local__example",       "local",         "example" },
+    -- The empty identity has always fallen back to `repo` (`or "repo"` in the
+    -- single-segment branch), which is the behaviour this row pins. My first
+    -- attempt asserted `local__` and this guard caught it — which is the point
+    -- of pinning the slug rather than trusting the refactor.
+    { "",                                        "local__repo",          "local",         "repo" },
+  }
+  local stable, broke = true, nil
+  for _, c in ipairs(cases) do
+    if store.slug(c[1]) ~= c[2] then stable = false; broke = c[1] .. " -> " .. store.slug(c[1]) end
+  end
+  ok("[10] *** every slug is byte-identical to before the refactor ***", stable, tostring(broke))
+  local pairs_ok = true
+  for _, c in ipairs(cases) do
+    local o, n = store.identity(c[1])
+    if o ~= c[3] or n ~= c[4] then
+      pairs_ok = false
+      print("      " .. c[1] .. " -> " .. tostring(o) .. " / " .. tostring(n))
+    end
+  end
+  ok("[10] identity() returns the two halves the slug is joined from", pairs_ok)
+  ok("[10] and the slug is exactly those halves joined",
+    (function()
+      local o, n = store.identity("git@github.com:a/b.git")
+      return o .. "__" .. n == store.slug("git@github.com:a/b.git")
+    end)())
+
+  -- A repo with a remote keeps reporting it.
+  local hosted = store.remote_identity(lab .. "/.git")
+  ok("[10] a hosted repo reports its url, owner and name",
+    hosted.url ~= nil and hosted.owner == "yongjohnlee80" and hosted.name == "proj"
+    and hosted.slug == slug, vim.inspect(hosted))
+
+  -- The case that failed: no origin at all.
+  local bare = sb .. "/nolocal"; vim.fn.mkdir(bare, "p")
+  local function GN(...)
+    local a = { "git", "-C", bare, "-c", "user.email=t@t", "-c", "user.name=t" }
+    for _, x in ipairs({ ... }) do a[#a + 1] = x end
+    return vim.system(a, {}):wait()
+  end
+  GN("init", "-q", "-b", "main")
+  vim.fn.writefile({ "x" }, bare .. "/x.go")
+  GN("add", "."); GN("commit", "-qm", "local only")
+  local nsha = vim.trim(GN("rev-parse", "HEAD").stdout or "")
+  ok("[10] fixture: the repo really has no origin",
+    vim.trim(GN("config", "--get", "remote.origin.url").stdout or "") == "")
+
+  local nid = store.remote_identity(bare .. "/.git")
+  ok("[10] *** it has NO url but still has an owner and a name ***",
+    nid.url == nil and nid.owner ~= nil and nid.owner ~= ""
+    and nid.name ~= nil and nid.name ~= "", vim.inspect(nid))
+  ok("[10] named after its container, which is stable and descriptive",
+    nid.name == "nolocal", vim.inspect(nid))
+
+  -- The end-to-end property: a review for it VALIDATES and writes.
+  local doc = review.new({
+    slug = nid.slug, url = nid.url, owner = nid.owner, name = nid.name,
+    commit = nsha, reviewer = "lector", verdict = "comment", summary = "local repos are reviewable",
+  })
+  doc.comments = { { path = "x.go", line = 1, side = "RIGHT", severity = "nit", body = "fine" } }
+  doc.reviewer_slug = "lector"
+  local vok, problems = review.validate(doc)
+  ok("[10] *** a review built from that identity VALIDATES ***", vok == true,
+    vim.inspect(problems))
+  local res, rerr = review.save_pair(nid.slug, doc, MD, { topic = "nolocal" })
+  ok("[10] *** and it writes ***", res ~= nil and vim.fn.filereadable(res.json_path) == 1,
+    tostring(rerr))
+
+  -- CONTROL: without the pair the schema still refuses, so [10] is not passing
+  -- because validation went soft.
+  local blind = review.new({
+    slug = nid.slug, commit = nsha, reviewer = "lector", verdict = "comment",
+  })
+  blind.comments = {}
+  blind.reviewer_slug = "lector"
+  local bok, bproblems = review.validate(blind)
+  ok("[10] *** CONTROL: an identity-less review is STILL refused ***",
+    bok == false and table.concat(bproblems, ";"):find("no identity", 1, true) ~= nil,
+    vim.inspect(bproblems))
+
+  -- And the frontend record carries the pair, which is what the panel reads.
+  local recs = repos.repos(sb)
+  local seen
+  for _, r in ipairs(recs) do if r.slug == nid.slug then seen = r end end
+  ok("[10] *** repos.repos() carries owner and name on the record ***",
+    seen ~= nil and seen.owner == nid.owner and seen.name == nid.name,
+    vim.inspect(seen))
+end
+
 vim.fn.delete(sb, "rf")
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail > 0 and 1 or 0)
