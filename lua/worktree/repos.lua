@@ -340,6 +340,79 @@ function M.reviews(repo, sha)
   return review.list_for(repo.slug, sha)
 end
 
+---reviews_described describes ONE commit's reviews — the rows a commit expands
+---to, with the severity each carries. `reviews(repo, sha)` stays the cheap
+---revision listing for callers that need nothing more (the diff view's
+---annotation merge is one).
+---@param repo WorktreeRepo
+---@param sha string
+---@return table[] reviews
+function M.reviews_described(repo, sha)
+  if not repo or not repo.slug or not sha then return {} end
+  return review.described_for(repo.slug, sha)
+end
+
+---tally_paths merges described reviews into the per-file tally a tree badges
+---with. Pure — re-exported so a frontend holding descriptions need not re-read.
+---@param described table[]
+---@return table<string, { count: integer, worst: string? }>
+function M.tally_paths(described) return review.tally_paths(described) end
+
+---reviews_index lists a repo's review FILES without opening any of them —
+---the cheap half of `reviews_all`, for a caller that needs only a count.
+---
+---One directory scan plus a stat per file. The panel draws the section's count
+---on a collapsed row, and a listing that had to read every document to say "3"
+---would put a per-repaint cost on a row nobody has expanded.
+---@param repo WorktreeRepo
+---@return { slug: string, short: string, revision: integer, path: string, name: string, mtime: integer }[]
+function M.reviews_index(repo)
+  if not repo or not repo.slug then return {} end
+  return review.list_all(repo.slug)
+end
+
+---reviews_dir is where this repo's reviews are stored, for an info view.
+---@param repo WorktreeRepo
+---@return string?
+function M.reviews_dir(repo)
+  if not repo or not repo.slug then return nil end
+  return store.reviews_dir(repo.slug)
+end
+
+---reviews_all lists EVERY review recorded for a repo, described — the
+---repo-wide section (ADR-0060 §11), as opposed to `reviews(repo, sha)` which
+---answers for one commit.
+---
+---This is the listing that survives a rebase. A review names a commit in its
+---filename, so once history is rewritten `reviews(repo, sha)` can no longer
+---find it and the file is invisible in the tree — which is precisely when
+---someone needs to see it and re-point it.
+---@param repo WorktreeRepo
+---@return table[] reviews   `review.describe` records, most recent first
+function M.reviews_all(repo)
+  if not repo or not repo.slug then return {} end
+  local out = {}
+  for _, rec in ipairs(review.list_all(repo.slug)) do
+    out[#out + 1] = review.describe(rec.path) or rec
+  end
+  return out
+end
+
+---review_meta describes ONE review file by path — what an info view prints.
+---@param path string
+---@return table? meta
+function M.review_meta(path) return (review.describe(path)) end
+
+---reviewed_paths tallies which of a commit's files carry review comments, for
+---the tree's per-file feedback badge.
+---@param repo WorktreeRepo
+---@param sha string
+---@return table<string, { count: integer, worst: string? }>
+function M.reviewed_paths(repo, sha)
+  if not repo or not repo.slug or not sha then return {} end
+  return review.reviewed_paths(repo.slug, sha)
+end
+
 ---diff returns a commit's parsed diff, ready for the three-column view.
 ---@param repo WorktreeRepo
 ---@param sha string

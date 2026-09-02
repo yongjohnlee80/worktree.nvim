@@ -929,6 +929,184 @@ function M.latest_revision(slug, sha)
   return all[1] and all[1].revision or 0
 end
 
+---SEVERITY_RANK orders `M.SEVERITIES` so a review can be summarised by its
+---WORST finding — the one thing a reader triages a list of reviews on.
+M.SEVERITY_RANK = { ["must-fix"] = 4, ["should-fix"] = 3, ["nit"] = 2, ["question"] = 1 }
+
+---worst_severity returns the highest-ranked severity in a tally, or nil for a
+---review that carries no comments at all (a summary-only approval).
+---@param severities table<string, integer>
+---@return string?
+function M.worst_severity(severities)
+  local worst, rank = nil, 0
+  for sev, n in pairs(severities or {}) do
+    local r = M.SEVERITY_RANK[tostring(sev)] or 0
+    if (n or 0) > 0 and r > rank then worst, rank = tostring(sev), r end
+  end
+  return worst
+end
+
+---list_all returns every review recorded for a repo, whatever commit it names.
+---
+---`list_for` answers "what reviews does THIS commit have", which is the wrong
+---question after a rebase: the sha the file is named for no longer exists, so
+---the review disappears from every listing at exactly the moment someone needs
+---to find it and re-point it. This one is keyed on the REPO alone, so nothing
+---in the store can hide.
+---
+---Most recently written first. The order comes from the filesystem, not from
+---the documents: `created` lives inside each file and reading all of them to
+---sort would defeat a listing meant to be cheap. `describe` is where the
+---document is opened.
+---@param slug string
+---@return { slug: string, short: string, revision: integer, path: string, name: string, mtime: integer }[]
+function M.list_all(slug)
+  local dir = store.reviews_dir(slug)
+  local out = {}
+  for _, name in ipairs(store.list_files(dir, "%.review%.json$")) do
+    local fslug, short, rev = M.parse_filename(name)
+    if fslug and short and rev then
+      local path = dir .. "/" .. name
+      out[#out + 1] = { slug = fslug, short = short, revision = rev,
+                        path = path, name = name, mtime = store.mtime(path) or 0 }
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.mtime ~= b.mtime then return a.mtime > b.mtime end
+    -- A tie is two files written in the same nanosecond, or two with no stat at
+    -- all; commit then revision keeps the order STABLE rather than arbitrary.
+    if a.short ~= b.short then return a.short < b.short end
+    return a.revision > b.revision
+  end)
+  return out
+end
+
+---describe projects one review FILE into the metadata a panel lists and an
+---info view prints: which commit it belongs to, when it was written, how bad
+---its worst finding is, and which files it touches.
+---
+---TOLERANT, unlike `load`. A file that will not parse, or that fails
+---validation, still yields a record with `err` set and whatever fields could be
+---read. A malformed review the reader can SEE is one they can be told about and
+---can delete; one that vanishes from the listing is one they cannot fix at all.
+---`load` stays strict, because a caller that is about to RENDER comments must
+---not be handed a half-parsed document.
+---
+---`revision` and `short` come from the FILENAME — the store's identity for the
+---file — while `commit`, `created` and the rest come from the document. They
+---can disagree (a hand-copied file, a rename); `revision_mismatch` says so
+---rather than quietly preferring one.
+---@param path string
+---@return table? meta, string? err
+function M.describe(path)
+  if type(path) ~= "string" or path == "" then return nil, "describe: path required" end
+  local name = path:match("[^/]+$") or path
+  local slug, short, rev = M.parse_filename(name)
+  local meta = {
+    path = path, name = name, slug = slug, short = short, revision = rev,
+    comments = 0, resolved = 0, severities = {}, files = {}, file_list = {},
+  }
+
+  local data, rerr = store.read_json(path)
+  if rerr or not data then
+    meta.err = rerr or "unreadable"
+    return meta, meta.err
+  end
+
+  meta.commit   = type(data.commit) == "string" and data.commit or nil
+  meta.base     = type(data.base) == "string" and data.base or nil
+  meta.reviewer = type(data.reviewer) == "string" and data.reviewer or nil
+  meta.created  = type(data.created) == "string" and data.created or nil
+  meta.verdict  = type(data.verdict) == "string" and data.verdict or nil
+  meta.summary  = type(data.summary) == "string" and data.summary or nil
+  meta.document = type(data.document) == "string" and data.document or nil
+  if type(data.revision) == "number" and rev and data.revision ~= rev then
+    meta.revision_mismatch = data.revision
+  end
+
+  local comments = type(data.comments) == "table" and data.comments or {}
+  for _, c in ipairs(comments) do
+    if type(c) == "table" then
+      meta.comments = meta.comments + 1
+      if c.resolved then meta.resolved = meta.resolved + 1 end
+      local sev = tostring(c.severity or "comment")
+      meta.severities[sev] = (meta.severities[sev] or 0) + 1
+      local p = type(c.path) == "string" and c.path or nil
+      if p then
+        local f = meta.files[p]
+        if not f then
+          f = { count = 0, severities = {} }
+          meta.files[p] = f
+          meta.file_list[#meta.file_list + 1] = p
+        end
+        f.count = f.count + 1
+        f.severities[sev] = (f.severities[sev] or 0) + 1
+        f.worst = M.worst_severity(f.severities)
+      end
+    end
+  end
+  table.sort(meta.file_list)
+  meta.worst = M.worst_severity(meta.severities)
+
+  -- Validation runs LAST and only annotates: everything above is already read,
+  -- and a listing that drops malformed files is the failure this guards against.
+  local vok, problems = M.validate(data)
+  if not vok then meta.err = "invalid: " .. table.concat(problems, "; ") end
+  return meta, nil
+end
+
+---described_for is `list_for` with every file described — the shape a tree needs
+---to render a commit's review rows AND to badge its changed files, from ONE
+---read pass over the documents.
+---@param slug string
+---@param sha string
+---@return table[] reviews   `describe` records, newest revision first
+function M.described_for(slug, sha)
+  local out = {}
+  for _, rec in ipairs(M.list_for(slug, sha)) do
+    out[#out + 1] = M.describe(rec.path) or rec
+  end
+  return out
+end
+
+---tally_paths merges described reviews into a per-file tally. PURE — it opens
+---nothing, so a caller that already holds the descriptions pays no second read.
+---
+---Merged across every revision, because a file commented on in r1 still carries
+---feedback when r3 is the latest. A file whose review will not parse still
+---counts what could be read: the badge says "there is feedback here", and that
+---is true of a malformed file too.
+---@param described table[]
+---@return table<string, { count: integer, worst: string? }>
+function M.tally_paths(described)
+  local out = {}
+  for _, meta in ipairs(described or {}) do
+    for path, f in pairs((meta or {}).files or {}) do
+      local acc = out[path]
+      if not acc then
+        acc = { count = 0, severities = {} }
+        out[path] = acc
+      end
+      acc.count = acc.count + (f.count or 0)
+      for sev, n in pairs(f.severities or {}) do
+        acc.severities[sev] = (acc.severities[sev] or 0) + n
+      end
+      acc.worst = M.worst_severity(acc.severities)
+    end
+  end
+  return out
+end
+
+---reviewed_paths tallies which of a COMMIT's files carry review comments —
+---what a tree badges its changed files with. The composition of the two above,
+---for a caller that wants only the tally.
+---@param slug string
+---@param sha string
+---@return table<string, { count: integer, worst: string? }>
+function M.reviewed_paths(slug, sha)
+  return M.tally_paths(M.described_for(slug, sha))
+end
+
 ---by_path groups a review's comments by file, then by line, which is the shape
 ---the diff view needs when it paints one file's annotations.
 ---@param review WorktreeReview
