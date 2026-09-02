@@ -35,14 +35,6 @@ end
 ---touching the user's real state.
 M._root_override = nil
 
----slug turns a repo identity into a filesystem-safe `<owner>__<repo>`.
----
----Accepts anything that names a repo: an SSH remote, an HTTPS remote, or a
----bare local path. A local repo with no remote still needs a stable key, so it
----falls back to the directory name — and the result is sanitised, because this
----string becomes a PATH SEGMENT and must never be able to escape the store.
----@param identity string   remote url, or a filesystem path
----@return string slug
 ---identity parses a repo identity — a remote URL or a local path — into the
 ---OWNER and NAME halves that `slug` joins.
 ---
@@ -97,10 +89,6 @@ function M.slug(identity)
   return owner .. "__" .. repo
 end
 
----remote_slug resolves a repo's slug from its own git config, falling back to
----the common dir's name when the repo has no `origin`.
----@param common_dir string
----@return string slug, string? url
 ---remote_identity resolves everything a caller needs to NAME a repo: the store
 ---slug, the remote URL when there is one, and the owner/name pair either way.
 ---
