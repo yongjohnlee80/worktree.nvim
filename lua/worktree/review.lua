@@ -1055,6 +1055,13 @@ function M.describe(path)
   return meta, nil
 end
 
+---_abs resolves a path for COMPARISON — absolute, symlinks followed. A path
+---that does not exist resolves to itself, which is what lets a CLAIMED file be
+---compared before anything has been created or deleted.
+local function _abs(p)
+  return vim.fn.resolve(vim.fn.fnamemodify(tostring(p or ""), ":p"))
+end
+
 ---remove deletes a review's canonical JSON and FENCES its revision number.
 ---
 ---The delete ALONE would be wrong. `max_recorded_revision` — the allocator
@@ -1128,6 +1135,22 @@ function M.remove_path(path)
   local slug, short, rev = M.parse_filename(name)
   if not (slug and short and rev) then
     return false, "not a review filename: " .. name
+  end
+  -- The reconstructed target must BE the file that was handed in.
+  --
+  -- `M.remove` rebuilds its target from the slug, and the slug comes from the
+  -- BASENAME — so a file sitting in one repo's directory while NAMED for
+  -- another resolves to the other repo's review, and the path a caller
+  -- authorized is not the path that gets deleted. `repos.remove_review` proved
+  -- a path contained in repo A and then tombstoned and unlinked repo B's real
+  -- r1, with the claimed repo-A file absent (lector, worktree#4 must-fix,
+  -- 2026-09-02). Authorization and effect have to be computed from the SAME
+  -- source; this check makes the function's own contract true for EVERY
+  -- caller, not only the one that happened to be audited.
+  local canonical = store.reviews_dir(slug) .. "/" .. M.filename(slug, short, rev)
+  if _abs(canonical) ~= _abs(path) then
+    return false, ("refusing: %s is not the canonical location of %s (that is %s)")
+      :format(path, name, canonical)
   end
   return M.remove(slug, short, rev)
 end

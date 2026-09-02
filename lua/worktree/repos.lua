@@ -358,6 +358,31 @@ function M.remove_review(repo, path)
   if resolved:sub(1, #root + 1) ~= root .. "/" then
     return false, "refusing to delete outside " .. root .. ": " .. resolved
   end
+  -- CONTAINMENT IS NOT IDENTITY, and conflating the two was a cross-repository
+  -- delete. The prefix check above proves WHERE the file sits; the delete is
+  -- keyed on the slug inside its NAME. Those are two different facts, so a
+  -- path under this repo's directory that is NAMED for another repo passed the
+  -- check and then removed the other repo's review — the claimed local file
+  -- did not even have to exist (lector, worktree#4 must-fix, 2026-09-02).
+  --
+  -- So the name's identity is bound to THIS repo, and the authorized path is
+  -- required to be the exact canonical target: one source for the
+  -- authorization and for the effect. `review.remove_path` now re-checks the
+  -- same invariant on its own, and both are kept — this one can say which repo
+  -- the caller confused, which a caller can act on.
+  local name = resolved:match("[^/]+$") or resolved
+  local slug, short, rev = review.parse_filename(name)
+  if not (slug and short and rev) then
+    return false, "not a review filename: " .. name
+  end
+  if slug ~= repo.slug then
+    return false, ("this review is named for %s, not %s: %s"):format(slug, repo.slug, name)
+  end
+  local canonical = vim.fn.resolve(vim.fn.fnamemodify(
+    dir .. "/" .. review.filename(repo.slug, short, rev), ":p"))
+  if canonical ~= resolved then
+    return false, "refusing: not this review's canonical location: " .. resolved
+  end
   return review.remove_path(resolved)
 end
 

@@ -328,6 +328,87 @@ do
     and vim.fn.filereadable(last.json_path) == 0)
 end
 
+print("\n[9] CONTROL: containment is not identity — the cross-repo delete")
+-- lector, worktree#4 must-fix (2026-09-02). `remove_review` proved the supplied
+-- path sat under repo A, then `remove_path` parsed the slug from the BASENAME
+-- and `remove` rebuilt its target under THAT slug — so a path contained in A
+-- while named for B tombstoned and unlinked B's real review, and the claimed
+-- A-side file did not even have to exist. Observed at the public boundary:
+-- {ok:true, claimed_a_existed:false, real_b_survived:false, b_tombstoned:true}.
+-- The prior controls covered an outside path, a `..` traversal and a normal
+-- contained file; a contained path whose FILENAME embeds a different slug is
+-- the discriminating case they all missed.
+do
+  local labB = sb .. "/labB"; vim.fn.mkdir(labB, "p")
+  local function GB(...)
+    local a = { "git", "-C", labB, "-c", "user.email=t@t", "-c", "user.name=t" }
+    for _, x in ipairs({ ... }) do a[#a + 1] = x end
+    return vim.system(a, {}):wait()
+  end
+  GB("init", "-q", "-b", "main")
+  GB("config", "remote.origin.url", "git@github.com:yongjohnlee80/proj-b.git")
+  vim.fn.writefile({ "b" }, labB .. "/b.go")
+  GB("add", "."); GB("commit", "-qm", "b base")
+  local shaB = vim.trim(GB("rev-parse", "HEAD").stdout or "")
+  local slugB = store.remote_slug(labB .. "/.git")
+  ok("[9] fixture: repo B is a DIFFERENT repository", slugB ~= slug and slugB ~= "", slugB)
+
+  local docB = review.new({
+    owner = "yongjohnlee80", name = "proj-b",
+    url = "git@github.com:yongjohnlee80/proj-b.git",
+    commit = shaB, reviewer = "lector", verdict = "comment", summary = "B's own review",
+  })
+  docB.comments = { { path = "b.go", line = 1, side = "RIGHT", severity = "must-fix",
+                      body = "B's finding" } }
+  docB.reviewer_slug = "lector"
+  local resB, berr = review.save_pair(slugB, docB, MD, { topic = "s11b" })
+  assert(resB, "fixture: B's review must save: " .. tostring(berr))
+  local b_tomb = review.tombstone_path(slugB, shaB, resB.revision)
+  ok("[9] fixture: B has a real review and no tombstone",
+    vim.fn.filereadable(resB.json_path) == 1 and vim.fn.filereadable(b_tomb) == 0)
+
+  -- The attack shape: inside repo A's directory, named for repo B.
+  local decoy = store.reviews_dir(slug) .. "/" .. review.filename(slugB, shaB, resB.revision)
+  local repoA = { slug = slug, common_dir = lab .. "/.git", label = "proj" }
+  local repoB = { slug = slugB, common_dir = labB .. "/.git", label = "proj-b" }
+  ok("[9] fixture: the decoy path is INSIDE repo A's store and ABSENT",
+    decoy:sub(1, #store.reviews_dir(slug)) == store.reviews_dir(slug)
+    and vim.fn.filereadable(decoy) == 0, decoy)
+
+  local rok, rerr = repos.remove_review(repoA, decoy)
+  ok("[9] *** the repo-A call is REFUSED ***", rok == false, tostring(rerr))
+  ok("[9] and it names the repo the caller confused",
+    tostring(rerr):find(slugB, 1, true) ~= nil, tostring(rerr))
+  ok("[9] *** repo B's review SURVIVES ***", vim.fn.filereadable(resB.json_path) == 1)
+  ok("[9] *** and NO tombstone was created for repo B ***",
+    vim.fn.filereadable(b_tomb) == 0)
+
+  -- Again with the decoy actually PRESENT in A's directory: the earlier probe
+  -- needed no such file, but a real one must not change the answer either.
+  vim.fn.writefile({ "{}" }, decoy)
+  local rok2, rerr2 = repos.remove_review(repoA, decoy)
+  ok("[9] *** still refused when the decoy really exists ***", rok2 == false, tostring(rerr2))
+  ok("[9] repo B still survives, still untombstoned",
+    vim.fn.filereadable(resB.json_path) == 1 and vim.fn.filereadable(b_tomb) == 0)
+  ok("[9] and the decoy itself was not deleted either", vim.fn.filereadable(decoy) == 1)
+
+  -- The PRIMITIVE refuses on its own, not merely the frontend that was audited.
+  local pok, perr = review.remove_path(decoy)
+  ok("[9] *** review.remove_path refuses a non-canonical location too ***",
+    pok == false and tostring(perr):find("canonical", 1, true) ~= nil, tostring(perr))
+  ok("[9] repo B survives that call as well",
+    vim.fn.filereadable(resB.json_path) == 1 and vim.fn.filereadable(b_tomb) == 0)
+  vim.fn.delete(decoy)
+
+  -- CONTROL: the guard is not a blanket refusal — B's own review is still
+  -- removable through B. Without this, every assertion above would also pass
+  -- if `remove_review` had simply stopped working.
+  local gok, gerr = repos.remove_review(repoB, resB.json_path)
+  ok("[9] *** CONTROL: a genuine canonical review is still removable ***",
+    gok == true and vim.fn.filereadable(resB.json_path) == 0, tostring(gerr))
+  ok("[9] and THAT delete did fence its revision", vim.fn.filereadable(b_tomb) == 1)
+end
+
 vim.fn.delete(sb, "rf")
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail > 0 and 1 or 0)
