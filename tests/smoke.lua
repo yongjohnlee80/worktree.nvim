@@ -1263,6 +1263,57 @@ do
   ok("10h-r1: CONTROL — a healthy worktree reports NO error",
     hmeta.status_err == nil and hmeta.log_err == nil, vim.inspect(hmeta))
   ok("10h-r1: CONTROL — and still yields its nodes", #hnodes >= 1, tostring(#hnodes))
+
+  -- ── PUSH STATE is three-valued (batch item #7) ──
+  -- A commit's `pushed` field must distinguish "on a remote", "local only" and
+  -- "we could not ask". The third is the one that gets lost: a failed git read
+  -- with `pushed = false` would paint every hash orange, and with `true` would
+  -- paint them all purple -- both asserting something nobody established. This
+  -- is r1 SF3's shape in a new field, so it gets the same treatment.
+  do
+    local L = require("auto-core.git.log")
+    local real_unpushed = L.unpushed
+
+    -- FAILED read -> nil, and no colour is painted downstream.
+    L.unpushed = function() return {}, "forced failure" end
+    local fnodes, fmeta = repos.children(repo, feat)
+    L.unpushed = real_unpushed
+    local seen_commit, all_nil = false, true
+    for _, n in ipairs(fnodes) do
+      if n.kind == "commit" then
+        seen_commit = true
+        if n.pushed ~= nil then all_nil = false end
+      end
+    end
+    ok("10h-#7: fixture: the healthy worktree yields commit nodes", seen_commit)
+    ok("10h-#7: *** a FAILED push read leaves `pushed` nil, not false or true ***",
+      all_nil, vim.inspect(vim.tbl_map(function(n) return n.pushed end, fnodes)))
+    ok("10h-#7: and the failure is reported in meta, not swallowed",
+      fmeta.push_err ~= nil, tostring(fmeta.push_err))
+
+    -- LOCAL-ONLY -> false. The fixture repo has no remote, so this is the
+    -- truthful answer and the state a reader most needs.
+    local lnodes, lmeta = repos.children(repo, feat)
+    local any_false = false
+    for _, n in ipairs(lnodes) do
+      if n.kind == "commit" and n.pushed == false then any_false = true end
+    end
+    ok("10h-#7: *** with no remote, commits report pushed == FALSE ***",
+      any_false and lmeta.push_err == nil,
+      vim.inspect(vim.tbl_map(function(n) return n.pushed end, lnodes)))
+
+    -- PUSHED -> true, driven by the primitive rather than by a real push here
+    -- (auto-core's git_write suite covers the git question adversarially).
+    L.unpushed = function() return {}, nil end
+    local pnodes = repos.children(repo, feat)
+    L.unpushed = real_unpushed
+    local all_true = true
+    for _, n in ipairs(pnodes) do
+      if n.kind == "commit" and n.pushed ~= true then all_true = false end
+    end
+    ok("10h-#7: *** an empty unpushed set means every commit is pushed ***",
+      all_true)
+  end
   watch.set(gone, false)
 
   -- ── [10h-r1] the backend delegates git to auto-core (r1 SF4) ──

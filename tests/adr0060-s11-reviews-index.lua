@@ -613,6 +613,36 @@ do
     ok("[11] *** and it validates as a PAIR — document, reviewer and repo agree ***",
       pair_ok == true, vim.inspect(pair_problems))
 
+    -- A DIRECTORY at the document's path is not a primary review.
+    -- `validate_pair` distinguishes "absent" from "present but not a regular
+    -- file", and nothing exercised the second branch -- deleting it changed no
+    -- result, which the mutation matrix reported. It matters because the pair
+    -- invariant is "the Markdown IS the review": a directory there means the
+    -- projection points at something that cannot be read as prose.
+    do
+      local dir_doc = sb .. "/kb-dir/agents/lector/reviews"
+      vim.fn.mkdir(dir_doc, "p")
+      local as_dir = dir_doc .. "/2026-09-03-proj-proj-r1-review.md"
+      vim.fn.mkdir(as_dir, "p")   -- a DIRECTORY where the document belongs
+      local rec = vim.deepcopy(full or {})
+      rec.document = as_dir
+      local dok, dproblems = review.validate_pair(rec, { kb_root = sb .. "/kb-dir" })
+      ok("[11] *** a DIRECTORY at the document path is refused ***",
+        dok == false and vim.iter(dproblems or {}):any(function(p2)
+          return tostring(p2):find("not a regular file", 1, true) ~= nil
+        end), vim.inspect(dproblems))
+      -- CONTROL: the same path as a real FILE validates, so the assertion above
+      -- is about the file KIND and not about the path being wrong.
+      vim.fn.delete(as_dir, "d")
+      vim.fn.writefile({ "# review" }, as_dir)
+      local fok = review.validate_pair(rec, { kb_root = sb .. "/kb-dir" })
+      ok("[11] CONTROL — the same path as a FILE gets past the kind check",
+        fok == true or not vim.iter(select(2, review.validate_pair(rec,
+          { kb_root = sb .. "/kb-dir" })) or {}):any(function(p2)
+            return tostring(p2):find("not a regular file", 1, true) ~= nil
+          end))
+    end
+
     -- CONTROL: an explicit kb_root still wins over the resolver, so callers that
     -- do supply one are unaffected.
     local alt2 = sb .. "/kb-explicit"; vim.fn.mkdir(alt2, "p")
