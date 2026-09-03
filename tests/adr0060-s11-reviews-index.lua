@@ -613,6 +613,40 @@ do
     ok("[11] *** and it validates as a PAIR — document, reviewer and repo agree ***",
       pair_ok == true, vim.inspect(pair_problems))
 
+    -- MF3: a MALFORMED projection is not a projection with an absent document.
+    -- `describe` is tolerant, so a truncated JSON still yields metadata plus an
+    -- error; binding only the first result made "unreadable" look like "known
+    -- absent", and `remove` fenced the revision, deleted the JSON, and returned
+    -- SUCCESS with the Markdown still on disk.
+    do
+      local d4 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "to be broken" })
+      d4.reviewer_slug = "lector"
+      local res4 = review.save_pair(slug, d4, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a valid pair exists to break",
+        res4 ~= nil and res4.json_path ~= nil and res4.md_path ~= nil)
+      -- Truncate the projection so it parses as nothing useful.
+      vim.fn.writefile({ '{"document":' }, res4.json_path)
+      local mok, merr2, mdetail = review.remove(slug, sha2, res4.revision)
+      ok("[11] *** MF3: removing a MALFORMED pair is NOT reported as success ***",
+        mok == false and merr2 ~= nil, tostring(merr2))
+      ok("[11] *** MF3: and the Markdown is reported UNKNOWN, not absent ***",
+        mdetail ~= nil and mdetail.document_unknown == true
+        and mdetail.document_absent ~= true
+        and mdetail.document_removed == false, vim.inspect(mdetail))
+      ok("[11] MF3: the projection IS removed and the revision fenced",
+        mdetail.json_removed == true and mdetail.fenced == true
+        and vim.fn.filereadable(res4.json_path) == 0)
+      ok("[11] MF3: the Markdown really is still there — the report is truthful",
+        vim.fn.filereadable(res4.md_path) == 1, res4.md_path)
+      ok("[11] MF3: the error names the malformed cause",
+        tostring(merr2):find("MALFORMED", 1, true) ~= nil, tostring(merr2))
+      ok("[11] MF3: and the revision stays fenced, so its number is never reused",
+        vim.fn.filereadable(review.tombstone_path(slug, sha2, res4.revision)) == 1)
+    end
+
     -- A DIRECTORY at the document's path is not a primary review.
     -- `validate_pair` distinguishes "absent" from "present but not a regular
     -- file", and nothing exercised the second branch -- deleting it changed no

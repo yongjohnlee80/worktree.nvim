@@ -96,7 +96,7 @@ ok("[1] fixture: three old-format records exist",
   and ds.exists(dir .. "/" .. KEY .. ".r3.tombstone"))
 ok("[1] fixture: the canonical record is MINIFIED, as every release wrote it",
   (select(1, ds.read(canonical)) or ""):find("\n") == nil)
-ok("[1] *** and the SHIPPED reader still parses its filename ***", (function()
+ok("[1] *** and the CURRENT reader still parses its filename ***", (function()
   local slug, short, rev = review.parse_filename(KEY .. ".r1" .. SUFFIX)
   return slug == SLUG and short == SHORT and rev == 1
 end)())
@@ -121,8 +121,6 @@ ok("[2] *** the existing document is readable through the new store ***",
   end)())
 
 print("\n[3] CONTROL RECORDS PARTICIPATE in the next allocation")
-ok("[3] *** the new allocator counts the old .reserve and .tombstone ***",
-  h:max_recorded() == 3, tostring(h:max_recorded()))
 -- PINNED LITERAL, not a comparison against worktree's answer. Before P4b those
 -- were two independent implementations and comparing them was the whole point;
 -- now `review.max_recorded_revision` IS this handle, so that assertion compares
@@ -183,12 +181,69 @@ ok("[4] *** an old EXPIRED reservation IS reaped, on the old field name ***",
     -- lease look live for ~50 years, so this is the unit assertion that matters.
     return n >= 1 and ds.exists(dir .. "/" .. KEY .. ".r2.tombstone")
   end)())
-ok("[4] the shipped reader still recognises the tombstone the new code wrote",
+ok("[4] the current reader still recognises the tombstone the new code wrote",
   ds.exists(dir .. "/" .. KEY .. ".r2.tombstone")
   and review.max_recorded_revision(SLUG, SHA) >= 4)
 
 print("\n[5] A NEW WRITER AND AN OLD FIXTURE INTEROPERATE — no rename, no migration")
-ok("[5] *** the new writer's record is parsed by the SHIPPED filename reader ***",
+-- THE SHIPPED READER, ACTUALLY EXECUTED. The assertions below call
+-- `review.parse_filename` and `review.list_for` from THIS checkout while
+-- describing them as the shipped reader — which is not the same claim, and
+-- after P4b it is a weaker one (lector SF1). So the v0.5.7 modules are
+-- extracted from the TAG into a temp tree and run in a CHILD nvim against the
+-- records the current writer produced. Provenance is the git object, not a copy
+-- someone made.
+local function shipped_reader_reads(dir_, key_, rev_)
+  local tag = "v0.5.7"
+  local probe_root = sb .. "/shipped"
+  local listed = vim.fn.systemlist({ "git", "-C", plugin_root, "ls-tree", "-r",
+    "--name-only", tag .. ":lua" })
+  if vim.v.shell_error ~= 0 or #listed == 0 then
+    return nil, "tag " .. tag .. " is not present in this checkout"
+  end
+  for _, rel in ipairs(listed) do
+    local blob = vim.fn.system({ "git", "-C", plugin_root, "show",
+      tag .. ":lua/" .. rel })
+    if vim.v.shell_error ~= 0 then return nil, "could not read lua/" .. rel end
+    local dest = probe_root .. "/lua/" .. rel
+    vim.fn.mkdir(vim.fn.fnamemodify(dest, ":h"), "p")
+    vim.fn.writefile(vim.split(blob, "\n", { plain = true }), dest)
+  end
+  -- A child nvim, so the shipped modules cannot collide with the loaded ones.
+  local script = sb .. "/shipped-probe.lua"
+  vim.fn.writefile({
+    ("vim.opt.runtimepath:prepend(%q)"):format(probe_root),
+    ("package.path = %q .. package.path"):format(probe_root .. "/lua/?.lua;"),
+    "local ok, review = pcall(require, 'worktree.review')",
+    "if not ok then io.stdout:write('LOADFAIL ' .. tostring(review)) return end",
+    ("local slug, short, rev = review.parse_filename(%q)")
+      :format(key_ .. ".r" .. rev_ .. ".review.json"),
+    "io.stdout:write(('PARSE %s|%s|%s'):format(tostring(slug), tostring(short), tostring(rev)))",
+  }, script)
+  local out = vim.fn.system({ "nvim", "--headless", "-u", "NONE", "-l", script })
+  return vim.trim(out or ""), nil
+end
+do
+  -- The NEW writer's record, read by the OLD parser.
+  local newrev = h:max_recorded() + 1
+  h:claim(newrev, "gate-writer")
+  ds.write_json(h:record_path(newrev), { schema = review.SCHEMA,
+    revision = newrev, commit = SHA, reviewer = "jarvis", verdict = "comment",
+    comments = {} })
+  local said, why = shipped_reader_reads(dir, KEY, newrev)
+  if said == nil then
+    -- A loud SKIP, not a silent pass: the gate says what it could not prove.
+    ok("[5] SKIPPED — the shipped reader could not be extracted: " .. tostring(why),
+      false, "this gate's old-reader proof did not run")
+  else
+    ok("[5] *** the SHIPPED v0.5.7 parser reads the NEW writer's filename ***",
+      said == ("PARSE %s|%s|%d"):format(SLUG, SHORT, newrev), said)
+  end
+end
+-- These use THIS checkout's reader, which is the right thing to check (the
+-- delegation must not break the current parser) but is a different claim from
+-- the shipped-reader proof above. Named for what they actually do.
+ok("[5] *** the new writer's record is parsed by the CURRENT filename reader ***",
   (function()
     local rev = h:max_recorded() + 1
     local claimed, tok = h:claim(rev, "new-writer")
@@ -199,7 +254,7 @@ ok("[5] *** the new writer's record is parsed by the SHIPPED filename reader ***
     local slug, short, parsed = review.parse_filename(name)
     return slug == SLUG and short == SHORT and parsed == rev
   end)())
-ok("[5] *** and the SHIPPED lister finds old and new records together ***",
+ok("[5] *** and the CURRENT lister finds old and new records together ***",
   (function()
     local seen = review.list_for(SLUG, SHA)
     if type(seen) ~= "table" then return false end
@@ -212,7 +267,7 @@ ok("[5] *** and the SHIPPED lister finds old and new records together ***",
   end)(), vim.inspect(review.list_for(SLUG, SHA)):gsub("%s+", " "):sub(1, 200))
 ok("[5] no record was renamed: the original r1 filename is untouched",
   ds.exists(canonical))
-ok("[5] *** the new writer's PRETTY json is still valid to the old reader ***",
+ok("[5] *** the new writer's PRETTY json still decodes through the store ***",
   (function()
     local rev = h:max_recorded()
     local raw = select(1, ds.read(h:record_path(rev))) or ""

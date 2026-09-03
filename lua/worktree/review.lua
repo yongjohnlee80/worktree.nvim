@@ -561,6 +561,37 @@ local function _repo_component(slug)
   return _sanitize_segment(tail) or "repo"
 end
 
+---_orphan_documents finds KB documents that would pair with (slug, revision).
+---
+---Used only when the projection is MALFORMED and therefore cannot name its own
+---pair. Everything it relies on comes from the store's own filename — the repo
+---component and the revision — never from the unreadable record. The reviewer
+---is unknown at that point, so every agent's reviews directory is searched.
+---@param slug string
+---@param revision integer
+---@return string[] paths
+local function _orphan_documents(slug, revision)
+  local kb = _kb_root()
+  local out = {}
+  if type(kb) ~= "string" or kb == "" then return out end
+  local repo = _repo_component(slug)
+  local rev = tonumber(revision)
+  if not rev then return out end
+  -- `<date>-<repo>-<topic>-r<N>-review.md` under `agents/<reviewer>/reviews/`.
+  local pattern = ("%s/agents/*/reviews/*-r%d-review.md"):format(kb, rev)
+  -- Through auto-core: this is a filesystem READ, and a delegate module that
+  -- reaches for `vim.fn.glob` itself is exactly how the I/O AC1 counts grows
+  -- back one call at a time.
+  for _, path in ipairs(require("auto-core.docstore").glob(pattern)) do
+    local name = tostring(path):match("[^/]+$") or ""
+    -- The repo component must agree, or this is another repository's review
+    -- that merely shares a revision number.
+    if name:find("%-" .. vim.pesc(repo) .. "%-") then out[#out + 1] = path end
+  end
+  table.sort(out)
+  return out
+end
+
 ---canonical_document builds the ONE document path a review may carry.
 ---
 ---The STORE owns this, not the caller. ADR-0067 §2.2 rejects a caller-supplied
@@ -1130,12 +1161,20 @@ function M.remove(slug, sha, revision)
 
   -- Read the pair reference BEFORE the delete; afterwards there is nothing
   -- left to read it from.
-  local meta = M.describe(path)
+  -- BIND describe's ERROR. `describe` is tolerant by design: a malformed
+  -- projection still yields metadata plus an error, and the `document` it
+  -- reports is then untrustworthy. Binding only the first result made
+  -- "unreadable" indistinguishable from "known absent", so a truncated JSON was
+  -- fenced and deleted and the call returned SUCCESS with its Markdown still on
+  -- disk (lector MF3). Unknown is not absent, and §2.3a/AC7 require the
+  -- difference to reach the caller.
+  local meta, merr = M.describe(path)
   local detail = {
     path = path,
     document = meta and meta.document or nil,
     tombstone = M.tombstone_path(slug, sha, rev),
   }
+  if merr then detail.describe_error = tostring(merr) end
 
   local tombstoned, terr = M.retire(slug, sha, rev, nil)
   if not tombstoned then
@@ -1169,6 +1208,34 @@ function M.remove(slug, sha, revision)
   -- projection is still removed and the revision still fenced, because those
   -- are already done and correct.
   local doc = meta and meta.document
+  if merr then
+    -- The projection could not be trusted to name its pair, so the document's
+    -- fate is UNKNOWN rather than absent. But "unknown" must be EVIDENCED, not
+    -- assumed: a malformed file that never had a pair is the ordinary cleanup
+    -- case, and reporting a phantom leftover would make that case a failure.
+    --
+    -- The FILENAME is still trustworthy — it is the store's own naming, and it
+    -- yields the repo component and the revision — so the KB is searched for a
+    -- document that would pair with THIS revision. Zero candidates means
+    -- nothing was left behind and the removal is complete; one or more means a
+    -- real orphan, named in the failure.
+    local left = _orphan_documents(slug, rev)
+    detail.document_removed = false
+    detail.json_removed, detail.fenced = true, true
+    detail.describe_error = tostring(merr)
+    if #left == 0 then
+      -- Nothing to leave behind. Success, with the malformed record noted so a
+      -- caller that wants to log it can.
+      detail.document_absent = true
+      return true, nil, detail
+    end
+    detail.document_unknown = true
+    detail.document_candidates = left
+    return false, ("the review JSON was removed and the revision fenced, but it "
+      .. "was MALFORMED (%s), so its Markdown could not be identified from the "
+      .. "record. %d document(s) for r%d remain: %s"):format(
+        tostring(merr), #left, rev, table.concat(left, ", ")), detail
+  end
   if type(doc) ~= "string" or doc == "" then
     detail.document_absent = true
     detail.document_removed = false

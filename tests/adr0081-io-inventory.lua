@@ -78,7 +78,7 @@ local INVENTORY = {
     why = "SESSION STATE: the panel's cwd/buffers/focused snapshot, not a review artifact"
       .. " and not the review-draft store. Whether the family's session state should also"
       .. " move to auto-core is a separate decision, deliberately not folded into ADR-0081.",
-    calls = { fs_stat = 1, ["io.open"] = 2, mkdir = 1 },
+    calls = { fs_stat = 1, ["io.open"] = 2, mkdir = 1, ["os.remove"] = 1 },
   },
 }
 
@@ -90,6 +90,14 @@ local function _scan_file(path)
   if not fd then return nil end
   local src = fd:read("*a") or ""
   fd:close()
+  -- STRIP LINE COMMENTS before counting. The scanner used to count a mention
+  -- in a comment as a call, which it documented as a limitation -- but a
+  -- documented over-count still forces the pin to record calls that do not
+  -- exist, and a pin that records fiction cannot be checked against reality.
+  -- A `--` inside a string literal is a false strip; none of the production
+  -- modules has one, and over-stripping errs toward reporting FEWER calls,
+  -- which the "no unpinned file" assertion catches from the other side.
+  src = src:gsub("%-%-[^\n]*", "")
   local function bump(name) counts[name] = (counts[name] or 0) + 1 end
   -- libuv filesystem calls, through any of the three spellings. NO trailing
   -- `(` is required: `pcall(uv.fs_close, fd)` passes the function by reference
@@ -104,6 +112,29 @@ local function _scan_file(path)
   for _ in src:gmatch("vim%.fn%.mkdir%s*%(") do bump("mkdir") end
   for _ in src:gmatch("vim%.fn%.readfile%s*%(") do bump("readfile") end
   for _ in src:gmatch("vim%.fn%.writefile%s*%(") do bump("writefile") end
+  -- EVERY spelling production admits. The scanner missed `os.remove`, which
+  -- session.lua has used all along, so the inventory and its arithmetic were
+  -- false while the test was green (lector MF4). A blind spelling in a
+  -- review-document path would have gone the same way.
+  -- NO trailing `(` required, for the same reason the libuv patterns dropped
+  -- it: `pcall(os.remove, path)` passes the function by REFERENCE and is every
+  -- bit as much a call site. session.lua does exactly that, which is why the
+  -- first version of this fix still reported zero for it.
+  for _, name in ipairs({
+    "os%.remove", "os%.rename", "os%.tmpname",
+    "io%.lines", "io%.output", "io%.input",
+    "vim%.fn%.delete", "vim%.fn%.rename",
+    "vim%.fn%.glob", "vim%.fn%.globpath",
+  }) do
+    local plain = name:gsub("%%", "")
+    for _ in src:gmatch(name) do bump(plain) end
+  end
+  -- `vim.fn.globpath` also matches the `vim.fn.glob` pattern, so every
+  -- globpath was counted twice -- once under each name. Charge it once.
+  if (counts["vim.fn.globpath"] or 0) > 0 then
+    counts["vim.fn.glob"] = (counts["vim.fn.glob"] or 0) - counts["vim.fn.globpath"]
+    if counts["vim.fn.glob"] <= 0 then counts["vim.fn.glob"] = nil end
+  end
   return counts
 end
 
@@ -119,8 +150,11 @@ do
     "vim.loop.fs_unlink(p)",
     "io.open(p, 'r')",
     "vim.fn.mkdir(d, 'p')",
-    "-- uv.fs_write(fd) in a comment still counts; a scanner that parses Lua",
-    "-- properly would be better, and is not worth it here.",
+    "os.remove(p)",
+    "vim.fn.delete(p)",
+    "vim.fn.glob(p, false, true)",
+    "uv.fs_rename(a, b)  -- a REAL call with a trailing comment",
+    "-- uv.fs_write(fd) is only MENTIONED here and must not be counted",
   }, tmp)
   local c = _scan_file(tmp)
   vim.fn.delete(tmp)
@@ -128,8 +162,13 @@ do
     c.fs_stat == 2, vim.inspect(c))
   ok("[1] counts vim.loop.*", c.fs_unlink == 1)
   ok("[1] counts io.open and vim.fn.mkdir", c["io.open"] == 1 and c.mkdir == 1)
-  ok("[1] counts a commented-out call too (documented limitation)",
-    c.fs_write == 1, vim.inspect(c))
+  ok("[1] *** a call MENTIONED in a comment is NOT counted ***",
+    c.fs_write == nil, vim.inspect(c))
+  ok("[1] *** but a real call sharing a line with a comment IS ***",
+    c.fs_rename == 1, vim.inspect(c))
+  ok("[1] counts the spellings the scanner used to miss",
+    c["os.remove"] == 1 and c["vim.fn.delete"] == 1 and c["vim.fn.glob"] == 1,
+    vim.inspect(c))
   ok("[1] and reports nothing for a file with no I/O", (function()
     local t2 = vim.fn.tempname() .. ".lua"
     vim.fn.writefile({ "local M = {}", "return M" }, t2)
@@ -202,7 +241,7 @@ print(("      delegate (must reach 0 by P6): %d   permitted: %d")
   :format(delegate_total, permitted_total))
 for phase, n in pairs(by_phase) do print(("        %s owns %d"):format(phase, n)) end
 ok("[3] the remaining work is enumerated, not estimated",
-  delegate_total == 0 and permitted_total == 5,
+  delegate_total == 0 and permitted_total == 6,
   ("delegate=%d permitted=%d — if a phase just landed, update this figure too")
     :format(delegate_total, permitted_total))
 -- AC1 IS MET, and by arithmetic: zero raw document-I/O calls remain in
