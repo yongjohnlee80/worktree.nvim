@@ -4,3 +4,7 @@ tags
 
 # Headless nvim test runs drop this at the repo root.
 *.log
+
+# PR bodies drafted for `gh pr create --body-file`. Working notes, not
+# release content.
+PRs/
