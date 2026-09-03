@@ -732,6 +732,37 @@ do
         end)())
     end
 
+    -- MF1 (r5): the traversal check proved only the FIXED PREFIX was readable.
+    -- lector's probe keeps `$KB_ROOT/agents` readable and denies only
+    -- `agents/lector`, so the wildcard selected the reviewer and the literal
+    -- `reviews` beneath it could not be reached -- empty and silent again, one
+    -- level below where the previous fix looked.
+    do
+      local d8 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "nested denial" })
+      d8.reviewer_slug = "lector"
+      local res8 = review.save_pair(slug, d8, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a fourth valid pair exists", res8 ~= nil)
+      vim.fn.writefile({ '{"document":' }, res8.json_path)
+
+      -- ONLY the reviewer's directory is denied; `agents` stays readable.
+      vim.fn.system({ "chmod", "000", alt .. "/agents/lector" })
+      local nok, nerr, ndetail = review.remove(slug, sha2, res8.revision)
+      vim.fn.system({ "chmod", "755", alt .. "/agents/lector" })
+
+      ok("[11] *** MF1(r5): a NESTED denial is not a clean removal either ***",
+        nok == false and ndetail ~= nil and ndetail.document_unknown == true
+        and ndetail.document_absent ~= true
+        and ndetail.document_searched ~= true, vim.inspect(ndetail))
+      ok("[11] MF1(r5): and the failure names the directory it could not read",
+        tostring(ndetail.document_search_failed):find("lector", 1, true) ~= nil,
+        tostring(ndetail.document_search_failed))
+      ok("[11] MF1(r5): the Markdown really is still there",
+        vim.fn.filereadable(res8.md_path) == 1, res8.md_path)
+    end
+
     -- A DIRECTORY at the document's path is not a primary review.
     -- `validate_pair` distinguishes "absent" from "present but not a regular
     -- file", and nothing exercised the second branch -- deleting it changed no
