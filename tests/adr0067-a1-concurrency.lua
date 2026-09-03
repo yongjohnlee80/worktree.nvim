@@ -14,6 +14,33 @@ local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
+-- auto-core must be on the rtp of the PARENT and of every CHILD process.
+-- worktree.store is a delegation now (ADR-0081 P4a), so a process without
+-- auto-core is not running a smaller version of this plugin -- it is running a
+-- different program, and before P4a the old `io.open` fallback silently made
+-- that look fine. Two suites had never had auto-core on their rtp at all; the
+-- fallback was hiding it.
+local plugins = vim.fn.fnamemodify(root, ":h:h")
+local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
+local branch_dir = vim.fn.fnamemodify(root, ":t")
+local AUTO_CORE
+for _, p in ipairs({
+  LAZY .. "/auto-core.nvim",
+  plugins .. "/auto-core.nvim/main",
+  plugins .. "/auto-core.nvim/" .. branch_dir,  -- same-branch sibling wins
+}) do
+  if vim.fn.isdirectory(p) == 1 then AUTO_CORE = p end
+end
+if AUTO_CORE then vim.opt.runtimepath:prepend(AUTO_CORE) end
+-- Passed to every child nvim, so the templates below need no edits.
+local AC_ARGS = AUTO_CORE and { "--cmd", "set runtimepath^=" .. AUTO_CORE } or {}
+local function nvim_argv(script)
+  local a = { "nvim", "--headless", "-u", "NONE" }
+  for _, x in ipairs(AC_ARGS) do a[#a + 1] = x end
+  a[#a + 1] = "-l"; a[#a + 1] = script
+  return a
+end
+
 local sb = vim.fn.tempname() .. "-a1conc"
 vim.env.XDG_STATE_HOME = sb .. "/state"
 vim.env.XDG_CONFIG_HOME = sb .. "/config"
@@ -35,6 +62,11 @@ local SLUG = "o__r"
 
 -- A writer, as a standalone script run by a REAL second nvim.
 local WRITER = [[
+-- A START SENTINEL, before anything can fail. Its absence means this child
+-- never executed Lua at all -- a launch or runtime-isolation problem -- while
+-- its presence with no OK means the child ran and the store refused. Without
+-- it, both cases looked like "empty stdout" (lector MF7).
+io.stderr:write("CHILD-START\n")
 local root = "%s"
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. package.path
@@ -63,30 +95,83 @@ do
   local a = writer_script(sha, "alpha")
   local b = writer_script(sha, "beta")
   -- Started together so their reservations genuinely contend.
-  local ja = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", a }, { text = true })
-  local jb = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", b }, { text = true })
+  local ja = vim.system(nvim_argv(a), { text = true })
+  local jb = vim.system(nvim_argv(b), { text = true })
   local ra, rb = ja:wait(), jb:wait()
   local outa, outb = vim.trim(ra.stdout or ""), vim.trim(rb.stdout or "")
-  ok("both writers succeeded", outa:find("^OK") and outb:find("^OK"),
-    outa .. " | " .. outb)
-  local revs = review.list_for(SLUG, sha)
-  ok("*** two distinct revisions exist ***", #revs == 2,
-    vim.inspect(vim.tbl_map(function(r) return r.revision end, revs)))
-  local docs, bodies = {}, {}
-  for _, r in ipairs(revs) do
-    local d = review.load(SLUG, sha, r.revision)
-    docs[#docs + 1] = d and d.document
-    if d and d.document then
-      bodies[#bodies + 1] = table.concat(vim.fn.readfile(d.document), "")
-    end
+
+  -- DIAGNOSTICS ON FAILURE, and enough of them to tell a child that never ran
+  -- from a store that raced (lector MF7). This suite aborted intermittently
+  -- with no summary line, and the evidence needed to explain it -- the child's
+  -- exit code, its signal, its stderr, the argv it was launched with -- was
+  -- discarded before the abort. An empty stdout and a crashed allocator looked
+  -- identical, so nine clean re-runs proved nothing either way.
+  local function child_detail(tag, res, script)
+    return ("%s: code=%s signal=%s stdout=%q stderr=%q argv=%s script=%s")
+      :format(tag, tostring(res.code), tostring(res.signal),
+              vim.trim(res.stdout or ""), vim.trim(res.stderr or ""),
+              vim.inspect(nvim_argv(script)):gsub("%s+", " "), script)
   end
-  ok("*** each JSON names its OWN document — no shared Markdown ***",
-    #docs == 2 and docs[1] ~= docs[2], vim.inspect(docs))
-  ok("and both documents exist with distinct content",
-    #bodies == 2 and bodies[1] ~= bodies[2], vim.inspect(bodies))
-  ok("neither reservation survives its commit",
-    vim.fn.filereadable(review.reserve_path(SLUG, sha, revs[1].revision)) == 0
-    and vim.fn.filereadable(review.reserve_path(SLUG, sha, revs[2].revision)) == 0)
+  -- CLASSIFY the failure rather than leaving it to a re-run. Lector asks
+  -- whether the intermittent abort is child launch/runtime isolation or the
+  -- store; the harness can answer that itself from what each child reported.
+  local function classify(res)
+    local started = tostring(res.stderr or ""):find("CHILD-START", 1, true) ~= nil
+    if not started then return "never-started" end
+    if res.signal and res.signal ~= 0 then return "killed-by-signal" end
+    if vim.trim(res.stdout or ""):find("^OK") then return "ok" end
+    if res.code ~= 0 then return "exited-nonzero" end
+    return "ran-but-refused"
+  end
+  local ca, cb = classify(ra), classify(rb)
+  local both_ok = (ca == "ok") and (cb == "ok")
+  ok("both writers succeeded", both_ok,
+    ("A=%s B=%s\n      %s\n      %s"):format(ca, cb,
+      child_detail("A", ra, a), child_detail("B", rb, b)))
+  if not both_ok then
+    -- Stated as its own assertion so a failing run SAYS which cause it was,
+    -- in the summary, instead of leaving it to whoever reads the log.
+    local environmental = (ca == "never-started" or ca == "killed-by-signal"
+      or cb == "never-started" or cb == "killed-by-signal")
+    ok(("the failure is a STORE fault, not child launch/isolation (A=%s B=%s)")
+      :format(ca, cb), not environmental,
+      environmental
+        and "ENVIRONMENTAL: a child did not start or was killed — this gate did"
+            .. " not exercise the allocator at all"
+        or "the children ran; the store is the suspect")
+  end
+
+  local revs = review.list_for(SLUG, sha)
+  local two = #revs == 2
+  ok("*** two distinct revisions exist ***", two,
+    vim.inspect(vim.tbl_map(function(r) return r.revision end, revs))
+    .. (two and "" or ("  " .. child_detail("A", ra, a)
+                       .. "  ||  " .. child_detail("B", rb, b))))
+
+  -- STOP HERE when the two-writer PRECONDITION failed. Everything below reads
+  -- `revs[1]` and `revs[2]`; indexing a missing revision is what turned four
+  -- failed assertions into an aborted suite with no summary at all, which is
+  -- strictly less information than the failures themselves.
+  if not two then
+    ok("SKIPPED the pair assertions: the two-writer precondition failed above",
+      false, "not run — fix the precondition first")
+  else
+    local docs, bodies = {}, {}
+    for _, r in ipairs(revs) do
+      local d = review.load(SLUG, sha, r.revision)
+      docs[#docs + 1] = d and d.document
+      if d and d.document then
+        bodies[#bodies + 1] = table.concat(vim.fn.readfile(d.document), "")
+      end
+    end
+    ok("*** each JSON names its OWN document — no shared Markdown ***",
+      #docs == 2 and docs[1] ~= docs[2], vim.inspect(docs))
+    ok("and both documents exist with distinct content",
+      #bodies == 2 and bodies[1] ~= bodies[2], vim.inspect(bodies))
+    ok("neither reservation survives its commit",
+      vim.fn.filereadable(review.reserve_path(SLUG, sha, revs[1].revision)) == 0
+      and vim.fn.filereadable(review.reserve_path(SLUG, sha, revs[2].revision)) == 0)
+  end
 end
 
 io.stdout:write("\n[2] a process KILLED at each phase leaves only a tolerable remnant\n")
@@ -100,11 +185,20 @@ do
   -- because there was no JSON at all. Only the positive controls exposed it.
   local phases = {
     { name = "after the reservation",
-      extra = 'local real = store.create_exclusive\n'
-        .. 'store.create_exclusive = function(p, b)\n'
-        .. '  local r = real(p, b)\n'
+      -- Patched at auto-core's primitive, not worktree's. ADR-0081 P4b moved
+      -- the reservation claim into `auto-core.docstore.revisions`, so a writer
+      -- no longer reaches `store.create_exclusive` to reserve -- and this
+      -- injection silently stopped firing, which the positive control caught.
+      -- The test follows the property to where it now lives; the property
+      -- itself (a writer killed after reserving leaves no unpaired JSON) is
+      -- unchanged. Both returns are preserved: dropping the error would make a
+      -- refused claim look like a successful one.
+      extra = 'local _ds = require("auto-core.docstore")\n'
+        .. 'local real = _ds.create_exclusive\n'
+        .. '_ds.create_exclusive = function(p, b)\n'
+        .. '  local r, e = real(p, b)\n'
         .. '  if tostring(p):find("%.reserve$") then (vim.uv or vim.loop).kill((vim.uv or vim.loop).os_getpid(), 9) end\n'
-        .. '  return r\nend' },
+        .. '  return r, e\nend' },
     { name = "after the JSON commit",
       -- The remnant here is a COMPLETE pair: the commit point has passed, so
       -- only the reservation can be left over. Absent from r1, and it is the
@@ -126,7 +220,7 @@ do
     local sha = string.rep(tostring(i + 1), 40)
     local tag = "killed" .. i
     local sc = writer_script(sha, tag, ph.extra)
-    vim.system({ "nvim", "--headless", "-u", "NONE", "-l", sc }, { text = true }):wait()
+    vim.system(nvim_argv(sc), { text = true }):wait()
     local revs = review.list_for(SLUG, sha)
     local unpaired = false
     for _, r in ipairs(revs) do
@@ -292,8 +386,8 @@ io.stdout:write(tostring(review.cleanup("%s", "%s")) .. "\n")
 ]]):format(root, store._root_override, SLUG, sha2)
   local cp = vim.fn.tempname() .. "-clean.lua"
   vim.fn.writefile(vim.split(CLEAN, "\n"), cp)
-  local j1 = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", cp }, { text = true })
-  local j2 = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", cp }, { text = true })
+  local j1 = vim.system(nvim_argv(cp), { text = true })
+  local j2 = vim.system(nvim_argv(cp), { text = true })
   local o1, o2 = j1:wait(), j2:wait()
   local n1 = tonumber(vim.trim(o1.stdout or "")) or -1
   local n2 = tonumber(vim.trim(o2.stdout or "")) or -1

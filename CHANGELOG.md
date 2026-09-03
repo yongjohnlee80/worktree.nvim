@@ -2,6 +2,71 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.8] — 2026-09-03 — ADR-0081: worktree delegates document I/O, keeps the git meaning
+
+Patch. Every public function keeps its signature and its return
+convention; the mechanics behind them moved.
+
+**A gap to record rather than paper over:** this file's previous entry is
+`v0.4.10`, and the tags between it and here — the whole `v0.5.x` line —
+shipped without entries. They are in the git history; they are not
+documented here. That is a real gap in this changelog, noted so the next
+reader is not misled into thinking `v0.4.10` was the previous release.
+
+### Changed
+
+- **All document I/O now goes through `auto-core.docstore`** (ADR-0081
+  §2.1). 32 raw filesystem calls in production code became 0, counted by
+  a contract check rather than asserted. `store`'s leaf functions, the
+  revision allocator, and `review`'s pair mechanics all delegate; worktree
+  keeps what it owns — the review schema, `document` validation, the
+  Markdown/JSON pairing choreography, the canonical filename grammar, and
+  the ADR-0067 §2.3a delete contract.
+- **No local fallbacks.** The old `io.open` paths beside the auto-core
+  calls are gone. A missing hard dependency is a loud failure, because a
+  fallback re-creates the duplicate implementation the move exists to
+  delete — and the one it falls back to is always the weaker of the two.
+  Removing them also revealed that two test suites had never had auto-core
+  on their runtimepath at all: the fallback had been hiding it, so they
+  were exercising a configuration no user runs.
+- `LOCK_WAIT_MS` and `LOCK_POLL_MS` remain published here and are PASSED
+  to auto-core on every call rather than copied, so setting them still
+  drives both the retry loop and the figure quoted in a refusal.
+
+### Added
+
+- Commit nodes carry `pushed`: `true` on the remote, `false` local-only,
+  and **`nil` when the read failed** — a third state, because reporting
+  every commit as pushed because git errored is the panel asserting
+  something nobody established. "Pushed" means pushed to `origin`, not
+  reachable from any remote.
+- `tests/adr0081-migration-gate.lua` — the ADR-0081 §3.1 gate, whose
+  fixtures were produced by running the shipped `v0.5.7` writer and frozen
+  as literals, and which EXECUTES the `v0.5.7` reader extracted from the
+  git tag in a child process. **Verdict: no compatibility read path is
+  needed** — filenames are byte-identical and old minified JSON decodes
+  unchanged.
+- `tests/adr0081-io-inventory.lua` — the AC1 contract check, pinning every
+  raw filesystem call per file with a scope and a reason, failing on an
+  increase *or* a decrease.
+
+### Fixed
+
+- `remove` validates the recorded `document` path before any unlink. A
+  tampered review JSON could previously turn a delete into an **arbitrary
+  file deletion**, and the same path reported success when only half the
+  pair was gone.
+- A **malformed** projection is no longer treated as one with a
+  known-absent document. It was fenced, deleted, and reported as success
+  with its Markdown still on disk. The projection is still removed — an
+  unreadable record should not survive — but the document's fate is
+  reported, and "left behind" is evidenced from the store's own filename
+  rather than assumed.
+- Reviews are written as pretty, stable-key-order JSON. A write-side
+  change only; existing minified records decode unchanged.
+- `describe` projects `reviewer_slug` and `repo`, without which the
+  document validator cannot check the path it is handed.
+
 ## [v0.4.10] — 2026-06-14 — ADR-0041 Batch D: retire `git_legacy.lua`, auto-core is now a hard dependency
 
 **Breaking (dependency policy):** `auto-core.nvim ≥ 0.1.58` is now a **hard

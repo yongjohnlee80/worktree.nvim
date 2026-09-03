@@ -51,6 +51,7 @@ M.REQUIRED = {
   "git.log.rev_exists",
   "git.log.working_changes",
   "git.log.commit_files",
+  "git.log.unpushed",
   "git.graph.fan_out",
   "git.graph.show_diff",
   "git.graph.working_diff",
@@ -300,12 +301,33 @@ function M.children(repo, wt, opts)
     rev = rev, base = base, limit = opts.limit, skip = opts.skip,
   })
   log_err = rerr
+
+  -- PUSH STATE, one read for the whole window rather than one per row (Johno,
+  -- 2026-09-03: "the commit tree should indicate if it's pushed to the origin
+  -- or simply commited locally").
+  --
+  -- THREE states, not two. If the read FAILS, `pushed` stays nil — "unknown" —
+  -- because an empty unpushed set and a failed call are indistinguishable
+  -- otherwise, and reporting every commit as pushed because git errored is the
+  -- panel asserting by omission. That exact shape was r1 SF3 in this function:
+  -- a failed read rendered as "no commits, clean tree".
+  local unpushed, uerr = core.git.log.unpushed(repo.common_dir, { rev = rev })
   for _, c in ipairs(commits) do
+    -- Assigned with an `if`, NOT with `(not uerr) and (...) or nil`. That
+    -- idiom collapses FALSE to nil in Lua, so an actually-unpushed commit came
+    -- back as "unknown" and the panel painted nothing — losing the one state
+    -- Johno asked for most. A three-valued field cannot be written with
+    -- `and`/`or`.
+    local pushed
+    if not uerr then pushed = (unpushed[c.sha] ~= true) end
     nodes[#nodes + 1] = {
       kind = "commit", sha = c.sha, short = c.short,
       label = c.short .. "  " .. c.subject, commit = c,
+      -- nil when the read failed; true/false when it did not.
+      pushed = pushed,
     }
   end
+  meta.push_err = uerr
   meta.rev = rev
   meta.status_err = status_err
   meta.log_err = log_err

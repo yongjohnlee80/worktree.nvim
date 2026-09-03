@@ -256,6 +256,13 @@ do
   local rok, rerr, detail = review.remove(slug, sha, victim.revision)
   ok("[8] *** remove reports success ***", rok == true, tostring(rerr))
   ok("[8] *** the JSON is gone ***", vim.fn.filereadable(victim.json_path) == 0)
+  -- The PAIR is deleted, not just the projection (Johno, 2026-09-03 — the two
+  -- files ARE one review). §11.6 originally KEPT the Markdown; this reverses it.
+  ok("[8] *** and the paired Markdown is gone too ***",
+    vim.fn.filereadable(doc_before) == 0, tostring(doc_before))
+  ok("[8] *** remove reports that it removed the document ***",
+    detail ~= nil and detail.document == doc_before and detail.document_removed == true,
+    vim.inspect(detail))
   ok("[8] it is gone from both listings",
     #vim.tbl_filter(function(r) return r.path == victim.json_path end,
       review.list_all(slug)) == 0
@@ -281,10 +288,11 @@ do
   ok("[8] *** the next review claims a NEW revision, never the removed one ***",
     nxt.revision > victim.revision, ("r%d after removing r%d"):format(nxt.revision, victim.revision))
 
-  ok("[8] *** the paired canonical Markdown is KEPT — the JSON is its projection ***",
-    vim.fn.filereadable(doc_before) == 1, tostring(doc_before))
-  ok("[8] and remove REPORTS the document it left behind",
-    detail.document == doc_before, tostring(detail.document))
+  -- (The pair-both-gone assertions moved up beside the JSON check.) A CONTROL
+  -- that the delete is not a no-op that merely reported success: neither half
+  -- of the removed review is readable, and describe finds nothing for it.
+  ok("[8] *** neither half of the removed review remains ***",
+    vim.fn.filereadable(victim.json_path) == 0 and vim.fn.filereadable(doc_before) == 0)
 
   -- Guards: nothing destructive fires on a bad address.
   ok("[8] removing a revision that does not exist fails without a tombstone",
@@ -605,6 +613,186 @@ do
     ok("[11] *** and it validates as a PAIR — document, reviewer and repo agree ***",
       pair_ok == true, vim.inspect(pair_problems))
 
+    -- MF3: a MALFORMED projection is not a projection with an absent document.
+    -- `describe` is tolerant, so a truncated JSON still yields metadata plus an
+    -- error; binding only the first result made "unreadable" look like "known
+    -- absent", and `remove` fenced the revision, deleted the JSON, and returned
+    -- SUCCESS with the Markdown still on disk.
+    do
+      local d4 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "to be broken" })
+      d4.reviewer_slug = "lector"
+      local res4 = review.save_pair(slug, d4, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a valid pair exists to break",
+        res4 ~= nil and res4.json_path ~= nil and res4.md_path ~= nil)
+      -- Truncate the projection so it parses as nothing useful.
+      vim.fn.writefile({ '{"document":' }, res4.json_path)
+      local mok, merr2, mdetail = review.remove(slug, sha2, res4.revision)
+      ok("[11] *** MF3: removing a MALFORMED pair is NOT reported as success ***",
+        mok == false and merr2 ~= nil, tostring(merr2))
+      ok("[11] *** MF3: and the Markdown is reported UNKNOWN, not absent ***",
+        mdetail ~= nil and mdetail.document_unknown == true
+        and mdetail.document_absent ~= true
+        and mdetail.document_removed == false, vim.inspect(mdetail))
+      ok("[11] MF3: the projection IS removed and the revision fenced",
+        mdetail.json_removed == true and mdetail.fenced == true
+        and vim.fn.filereadable(res4.json_path) == 0)
+      ok("[11] MF3: the Markdown really is still there — the report is truthful",
+        vim.fn.filereadable(res4.md_path) == 1, res4.md_path)
+      ok("[11] MF3: the error names the malformed cause",
+        tostring(merr2):find("MALFORMED", 1, true) ~= nil, tostring(merr2))
+      ok("[11] MF3: and the revision stays fenced, so its number is never reused",
+        vim.fn.filereadable(review.tombstone_path(slug, sha2, res4.revision)) == 1)
+    end
+
+    -- MF1 (r3): "could not look" is not "found nothing". With the KB root
+    -- unresolvable, the search cannot run -- and returning an empty list for
+    -- both cases meant a malformed pair was fenced, deleted, and reported as a
+    -- COMPLETE removal with its Markdown still on disk.
+    do
+      local d5 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "search failure" })
+      d5.reviewer_slug = "lector"
+      local res5 = review.save_pair(slug, d5, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a second valid pair exists", res5 ~= nil)
+      vim.fn.writefile({ '{"document":' }, res5.json_path)
+
+      -- Make the KB root unresolvable for the duration.
+      local saved_kb  = vim.env.AUTO_AGENTS_KB_ROOT
+      local saved_rd  = vim.env.AUTO_AGENTS_KB_READ
+      local saved_wr  = vim.env.AUTO_AGENTS_KB_WRITE
+      vim.env.AUTO_AGENTS_KB_ROOT, vim.env.AUTO_AGENTS_KB_READ,
+        vim.env.AUTO_AGENTS_KB_WRITE = nil, nil, nil
+      local sok, serr, sdetail = review.remove(slug, sha2, res5.revision)
+      vim.env.AUTO_AGENTS_KB_ROOT, vim.env.AUTO_AGENTS_KB_READ,
+        vim.env.AUTO_AGENTS_KB_WRITE = saved_kb, saved_rd, saved_wr
+
+      ok("[11] *** MF1: a search that could NOT RUN is not a clean removal ***",
+        sok == false and sdetail ~= nil and sdetail.document_unknown == true
+        and sdetail.document_absent ~= true, vim.inspect(sdetail))
+      ok("[11] MF1: and it says the search itself failed",
+        sdetail.document_search_failed ~= nil
+        and tostring(serr):find("could not be searched", 1, true) ~= nil,
+        tostring(serr))
+      ok("[11] MF1: the Markdown really is still there",
+        vim.fn.filereadable(res5.md_path) == 1)
+      ok("[11] CONTROL — with the KB resolvable, the same shape SEARCHES",
+        (function()
+          -- Same malformed situation, KB available: the search runs and finds
+          -- the real orphan, so this is about the search STATUS and not about
+          -- malformed records always failing.
+          local _, _, d6 = review.remove(slug, sha2, res5.revision)
+          return d6 == nil or d6.document_search_failed == nil
+        end)())
+    end
+
+    -- MF1 (r4): the SAME conflation survived one layer down, in
+    -- `auto-core.docstore.glob`. lector's probe keeps the KB root resolvable
+    -- and makes `$KB_ROOT/agents` UNREADABLE: `vim.fn.glob` reports no error,
+    -- so the search returned what "nothing matched" returns, and `remove`
+    -- reported ok=true / document_absent=true with the Markdown still there.
+    -- Fixing the caller was not enough; the primitive had to report it too.
+    do
+      local d7 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "unreadable agents" })
+      d7.reviewer_slug = "lector"
+      local res7 = review.save_pair(slug, d7, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a third valid pair exists", res7 ~= nil)
+      vim.fn.writefile({ '{"document":' }, res7.json_path)
+
+      -- The root RESOLVES; only the traversal is denied.
+      vim.fn.system({ "chmod", "000", alt .. "/agents" })
+      local uok, uerr, udetail = review.remove(slug, sha2, res7.revision)
+      vim.fn.system({ "chmod", "755", alt .. "/agents" })
+
+      ok("[11] *** MF1(r4): an UNREADABLE search root is not a clean removal ***",
+        uok == false and udetail ~= nil and udetail.document_unknown == true
+        and udetail.document_absent ~= true
+        and udetail.document_searched ~= true, vim.inspect(udetail))
+      ok("[11] MF1(r4): and it names the traversal failure",
+        tostring(udetail.document_search_failed):find("traversed", 1, true) ~= nil
+        or tostring(uerr):find("could not be searched", 1, true) ~= nil,
+        tostring(udetail.document_search_failed) .. " | " .. tostring(uerr))
+      ok("[11] MF1(r4): the Markdown really is still there",
+        vim.fn.filereadable(res7.md_path) == 1, res7.md_path)
+      ok("[11] CONTROL — with the root READABLE the same shape finds the orphan",
+        (function()
+          local _, cerr2, cdetail = review.remove(slug, sha2, res7.revision)
+          -- The projection is already gone from the failed attempt, so this
+          -- reports "no such review" -- what matters is that it does NOT
+          -- report a search failure.
+          return (cdetail == nil or cdetail.document_search_failed == nil)
+            and tostring(cerr2):find("traversed", 1, true) == nil
+        end)())
+    end
+
+    -- MF1 (r5): the traversal check proved only the FIXED PREFIX was readable.
+    -- lector's probe keeps `$KB_ROOT/agents` readable and denies only
+    -- `agents/lector`, so the wildcard selected the reviewer and the literal
+    -- `reviews` beneath it could not be reached -- empty and silent again, one
+    -- level below where the previous fix looked.
+    do
+      local d8 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "nested denial" })
+      d8.reviewer_slug = "lector"
+      local res8 = review.save_pair(slug, d8, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a fourth valid pair exists", res8 ~= nil)
+      vim.fn.writefile({ '{"document":' }, res8.json_path)
+
+      -- ONLY the reviewer's directory is denied; `agents` stays readable.
+      vim.fn.system({ "chmod", "000", alt .. "/agents/lector" })
+      local nok, nerr, ndetail = review.remove(slug, sha2, res8.revision)
+      vim.fn.system({ "chmod", "755", alt .. "/agents/lector" })
+
+      ok("[11] *** MF1(r5): a NESTED denial is not a clean removal either ***",
+        nok == false and ndetail ~= nil and ndetail.document_unknown == true
+        and ndetail.document_absent ~= true
+        and ndetail.document_searched ~= true, vim.inspect(ndetail))
+      ok("[11] MF1(r5): and the failure names the directory it could not read",
+        tostring(ndetail.document_search_failed):find("lector", 1, true) ~= nil,
+        tostring(ndetail.document_search_failed))
+      ok("[11] MF1(r5): the Markdown really is still there",
+        vim.fn.filereadable(res8.md_path) == 1, res8.md_path)
+    end
+
+    -- A DIRECTORY at the document's path is not a primary review.
+    -- `validate_pair` distinguishes "absent" from "present but not a regular
+    -- file", and nothing exercised the second branch -- deleting it changed no
+    -- result, which the mutation matrix reported. It matters because the pair
+    -- invariant is "the Markdown IS the review": a directory there means the
+    -- projection points at something that cannot be read as prose.
+    do
+      local dir_doc = sb .. "/kb-dir/agents/lector/reviews"
+      vim.fn.mkdir(dir_doc, "p")
+      local as_dir = dir_doc .. "/2026-09-03-proj-proj-r1-review.md"
+      vim.fn.mkdir(as_dir, "p")   -- a DIRECTORY where the document belongs
+      local rec = vim.deepcopy(full or {})
+      rec.document = as_dir
+      local dok, dproblems = review.validate_pair(rec, { kb_root = sb .. "/kb-dir" })
+      ok("[11] *** a DIRECTORY at the document path is refused ***",
+        dok == false and vim.iter(dproblems or {}):any(function(p2)
+          return tostring(p2):find("not a regular file", 1, true) ~= nil
+        end), vim.inspect(dproblems))
+      -- CONTROL: the same path as a real FILE validates, so the assertion above
+      -- is about the file KIND and not about the path being wrong.
+      vim.fn.delete(as_dir, "d")
+      vim.fn.writefile({ "# review" }, as_dir)
+      local fok = review.validate_pair(rec, { kb_root = sb .. "/kb-dir" })
+      ok("[11] CONTROL — the same path as a FILE gets past the kind check",
+        fok == true or not vim.iter(select(2, review.validate_pair(rec,
+          { kb_root = sb .. "/kb-dir" })) or {}):any(function(p2)
+            return tostring(p2):find("not a regular file", 1, true) ~= nil
+          end))
+    end
+
     -- CONTROL: an explicit kb_root still wins over the resolver, so callers that
     -- do supply one are unaffected.
     local alt2 = sb .. "/kb-explicit"; vim.fn.mkdir(alt2, "p")
@@ -623,6 +811,129 @@ do
   vim.env.AUTO_AGENTS_KB_ROOT  = kb_root_before
   vim.env.AUTO_AGENTS_KB_READ  = kb_read_before
   vim.env.AUTO_AGENTS_KB_WRITE = kb_write_before
+end
+
+print("\n[12] review JSON is written pretty, with stable key order")
+-- Johno, 2026-09-03: a review store holds tens of small documents, not
+-- millions, so a human-readable multi-line file beats a minified one, and a
+-- stable key order keeps a store's history diffing cleanly.
+do
+  local enc = store.encode_pretty({ b = 2, a = "x",
+    comments = { { line = 1, path = "a.go" } }, empty = {} })
+  ok("[12] *** output is multi-line, not a single minified line ***",
+    enc:find("\n", 1, true) ~= nil, enc)
+  -- Ten keys, whole order compared. The two-key form of this assertion was
+  -- FLAKY: LuaJIT's `pairs` order for string keys varies between processes
+  -- (measured: 1 run in 6 emitted `a` before `b` unprompted), so it passed
+  -- roughly one run in six with the sort deleted.
+  ok("[12] *** keys are sorted, so a store's history diffs cleanly ***", (function()
+    local wide = { revision = 1, repo = "r", path = "p", note = "n", line = 2,
+                   kind = "k", id = "i", hash = "h", file = "f", date = "d" }
+    local emitted = {}
+    for k in store.encode_pretty(wide):gmatch('\n  "([%w_]+)":') do
+      emitted[#emitted + 1] = k
+    end
+    local want = {}
+    for k in pairs(wide) do want[#want + 1] = k end
+    table.sort(want)
+    return #emitted == 10 and table.concat(emitted, ",") == table.concat(want, ",")
+  end)(), enc)
+  ok("[12] it is valid JSON that round-trips", (function()
+    local ok_d, d = pcall(vim.json.decode, enc)
+    return ok_d and d.a == "x" and d.b == 2 and d.comments[1].path == "a.go"
+  end)())
+  ok("[12] two-space indent", enc:find('\n  "a"', 1, true) ~= nil, enc)
+
+  -- End to end: a saved review is pretty on disk.
+  local d = review.new({ owner = "yongjohnlee80", name = "proj",
+    url = "git@github.com:yongjohnlee80/proj.git", commit = sha1,
+    reviewer = "lector", verdict = "comment", summary = "pretty on disk" })
+  d.comments = { { path = "auth.go", line = 1, side = "RIGHT", severity = "nit", body = "b" } }
+  d.reviewer_slug = "lector"
+  local res = review.save_pair(slug, d, MD, { topic = "pretty" })
+  ok("[12] fixture: the review saved", res ~= nil)
+  local raw = table.concat(vim.fn.readfile(res.json_path), "\n")
+  ok("[12] *** the review file on disk is multi-line ***",
+    #vim.fn.readfile(res.json_path) > 5, tostring(#vim.fn.readfile(res.json_path)))
+  ok("[12] and still parses to the review it wrote",
+    (vim.json.decode(raw) or {}).commit == sha1)
+end
+
+print("\n[13] a TAMPERED document path is never unlinked (ADR-0081 MF1)")
+-- lector, ADR-0081 MF1. `describe()` is deliberately tolerant, so it surfaces
+-- the `document` field of a malformed or tampered JSON. The first cut of
+-- `remove` passed that value straight to `fs_unlink` — so a review file whose
+-- `document` pointed anywhere on disk was an ARBITRARY FILE DELETION. The
+-- document must be proved to be this review's canonical paired path first, and
+-- half a pair must never report success.
+do
+  local victim = sb .. "/victim-do-not-delete.txt"
+  vim.fn.writefile({ "a file that has nothing to do with any review" }, victim)
+
+  local prey = write_review(sha1, {
+    verdict = "comment", summary = "its document will be tampered with",
+    comments = { { path = "auth.go", line = 1, side = "RIGHT", severity = "nit",
+                   body = "x" } },
+  })
+  local real_doc = (review.describe(prey.json_path) or {}).document
+  ok("[13] fixture: the pair was written with a real document",
+    type(real_doc) == "string" and vim.fn.filereadable(real_doc) == 1, tostring(real_doc))
+
+  -- Tamper: repoint `document` at the unrelated file.
+  local raw = vim.json.decode(table.concat(vim.fn.readfile(prey.json_path), "\n"))
+  raw.document = victim
+  vim.fn.writefile(vim.split(store.encode_pretty(raw), "\n"), prey.json_path)
+  ok("[13] fixture: the JSON now claims an unrelated file as its document",
+    (review.describe(prey.json_path) or {}).document == victim)
+
+  local rok, rerr, detail = review.remove(slug, sha1, prey.revision)
+  ok("[13] *** the VICTIM file still exists — it was never unlinked ***",
+    vim.fn.filereadable(victim) == 1, victim)
+  ok("[13] *** and remove REFUSES to report success on a half pair ***",
+    rok == false and tostring(rerr):find("NOT deleted", 1, true) ~= nil, tostring(rerr))
+  ok("[13] the refusal is reported structurally, with the path it refused",
+    detail ~= nil and detail.document_refused == victim
+    and detail.document_removed == false, vim.inspect(detail))
+  ok("[13] the projection is still removed and the revision still fenced",
+    vim.fn.filereadable(prey.json_path) == 0
+    and detail.json_removed == true and detail.fenced == true
+    and vim.fn.filereadable(detail.tombstone) == 1, vim.inspect(detail))
+  ok("[13] and the review's own real Markdown is untouched by the refusal",
+    vim.fn.filereadable(real_doc) == 1, tostring(real_doc))
+
+  -- The OTHER half of §2.3a step 4: a VALID document that cannot be deleted.
+  -- The mutation matrix showed this guard was unexercised — reverting it changed
+  -- nothing, which means it was untested code in a destructive path. Made
+  -- unlinkable by removing write permission from the containing directory, so
+  -- the file still exists and still VALIDATES; only the unlink fails.
+  do
+    local stuck = write_review(sha1, { verdict = "comment", summary = "undeletable doc" })
+    local stuck_doc = (review.describe(stuck.json_path) or {}).document
+    local dir = vim.fn.fnamemodify(stuck_doc, ":h")
+    vim.fn.system({ "chmod", "500", dir })
+    local sok, serr, sdetail = review.remove(slug, sha1, stuck.revision)
+    vim.fn.system({ "chmod", "700", dir })   -- restore before asserting
+    ok("[13] *** a valid document that cannot be unlinked is NOT success ***",
+      sok == false and tostring(serr):find("could not be deleted", 1, true) ~= nil,
+      tostring(serr))
+    ok("[13] and the partial failure names fenced / json_removed / the remaining path",
+      sdetail ~= nil and sdetail.fenced == true and sdetail.json_removed == true
+      and sdetail.document_removed == false and sdetail.document_error ~= nil,
+      vim.inspect(sdetail))
+    ok("[13] the JSON really is gone and the document really does remain",
+      vim.fn.filereadable(stuck.json_path) == 0
+      and vim.fn.filereadable(stuck_doc) == 1, tostring(stuck_doc))
+  end
+
+  -- CONTROL: a VALID pair still deletes both and reports success, so the guard
+  -- is not a blanket refusal.
+  local good = write_review(sha1, { verdict = "comment", summary = "valid pair" })
+  local good_doc = (review.describe(good.json_path) or {}).document
+  local gok, gerr, gdetail = review.remove(slug, sha1, good.revision)
+  ok("[13] *** CONTROL: a valid pair is still removed, both halves, success ***",
+    gok == true and vim.fn.filereadable(good.json_path) == 0
+    and vim.fn.filereadable(good_doc) == 0 and gdetail.document_removed == true,
+    tostring(gerr) .. " " .. vim.inspect(gdetail))
 end
 
 vim.fn.delete(sb, "rf")

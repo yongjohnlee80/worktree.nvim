@@ -261,122 +261,105 @@ M.TOMBSTONE_SUFFIX = ".tombstone"
 ---reuse, and a stat-to-unlink interleaving that deleted a live successor. A
 ---lease has no such failure mode — its worst case is a slow writer losing a
 ---revision number it had not committed.
-M.LEASE_SECONDS = 120
+---Sourced from auto-core, so the documented figure and the one the allocator
+---enforces cannot drift apart. Still published here because callers and the
+---migration gate read `review.LEASE_SECONDS`.
+M.LEASE_SECONDS = (function()
+  local ok, ds = pcall(require, "auto-core.docstore")
+  if ok and type(ds) == "table" and ds.revisions then return ds.revisions.LEASE_SECONDS end
+  return 120
+end)()
 
-local function _base(slug, sha, revision)
-  local short = tostring(sha or ""):sub(1, 7)
-  return string.format("%s@%s.r%d", slug, short, tonumber(revision) or 1)
+---### P4b — revisioned identity DELEGATES (ADR-0081 §2.2a)
+---
+---worktree keeps what it owns: the mapping from `(repo, commit)` to a logical
+---KEY, and the canonical filename grammar. auto-core owns the mechanics —
+---exclusive claim, lease, retirement, monotonic non-reuse, record persistence —
+---behind a validated handle.
+---
+---The composed paths are byte-identical to the ones this module used to build
+---itself, which is not an assumption: `tests/adr0081-migration-gate.lua` asserts
+---it against records produced by the SHIPPED v0.5.7 writer.
+local function _key(slug, sha)
+  return string.format("%s@%s", tostring(slug or ""), tostring(sha or ""):sub(1, 7))
+end
+
+---_handle opens the allocator for one (slug, commit).
+---
+---Raises when the identity cannot be expressed in the record grammar. That is
+---deliberate and it is a bug fix, not a regression: the only identities auto-core
+---refuses are ones that would compose an AMBIGUOUS filename — a slug carrying a
+---`.r<digits>` segment, say — and such a name was already ambiguous when this
+---module built it by hand. A silent wrong answer is the worse outcome.
+local function _handle(slug, sha)
+  local ok_rv, rv = pcall(function() return require("auto-core.docstore").revisions end)
+  if not ok_rv or type(rv) ~= "table" or type(rv.open) ~= "function" then
+    error("worktree.review: auto-core.docstore.revisions is required"
+      .. " (auto-core >= v0.2.12)", 0)
+  end
+  local h, err = rv.open({
+    dir = store.reviews_dir(slug),
+    key = _key(slug, sha),
+    suffix = ".review.json",
+  })
+  if not h then
+    error(("worktree.review: this repo/commit cannot be expressed as a review"
+      .. " record identity: %s"):format(tostring(err)), 0)
+  end
+  return h
 end
 
 ---reserve_path / tombstone_path — the two non-canonical record names.
 function M.reserve_path(slug, sha, revision)
-  return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.RESERVE_SUFFIX
+  return _handle(slug, sha):reserve_path(revision)
 end
 
 function M.tombstone_path(slug, sha, revision)
-  return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.TOMBSTONE_SUFFIX
+  return _handle(slug, sha):tombstone_path(revision)
 end
 
 ---_now is seconds since the epoch.
----
----Declared BEFORE `_token`, which uses it. As a local below its use site it
----was simply nil there, so the entire fallback branch crashed the moment
----`uv.random` was unavailable — verified, `token_fallback_pcall=false`.
 local function _now() return os.time() end
 
----_token mints an UNGUESSABLE reservation owner.
+---_token mints an UNGUESSABLE reservation owner, from auto-core.
 ---
 ---Not a pid and not a name: a guessable token is a lock anyone can forge, and
 ---ownership is the only thing standing between a cleanup pass and a live
----writer's claim.
+---writer's claim. The `uv.random` call and its collision-avoidance fallback live
+---in auto-core now — one implementation, and the one place its fallback is
+---documented as NOT a CSPRNG.
 local function _token()
-  local ok, bytes = pcall(function()
-    return (vim.uv or vim.loop).random(16)
-  end)
-  if ok and type(bytes) == "string" and #bytes > 0 then
-    return (bytes:gsub(".", function(c) return string.format("%02x", c:byte()) end))
-  end
-  -- Fallback when libuv has no `random`. `math.random` is NOT a CSPRNG and
-  -- this does not establish unguessability — it is a collision-avoidance
-  -- fallback, seeded per call so two writers starting in the same second do
-  -- not mint the same token. The security claim rests on `uv.random`; where it
-  -- is unavailable, treat the token as a uniqueness tag only.
-  local t = { tostring(vim.fn.getpid()), tostring(_now()) }
-  math.randomseed((_now() * 1000 + vim.fn.getpid()) % 2147483647)
-  for _ = 1, 16 do t[#t + 1] = string.format("%02x", math.random(0, 255)) end
-  return table.concat(t, "-")
+  return require("auto-core.docstore").revisions.token()
 end
 
----max_recorded_revision is the allocation maximum over ALL THREE record kinds.
+---max_recorded_revision is the highest number this commit has ever used.
 ---
----`latest_revision` scans canonical files alone and is unchanged — it answers
----"what is the newest review", which is a different question. Allocating from
----it re-offers a number that is reserved or tombstoned but never committed,
----which would hand a crashed writer's revision to the next one.
----@param slug string
----@param sha string
----@return integer  0 when nothing is recorded
+---Committed, reserved and tombstoned alike — auto-core scans every accepted
+---tail for the key, so a deleted record's number is still spent and a crashed
+---writer's reservation is not handed to the next writer.
+---@return integer
 function M.max_recorded_revision(slug, sha)
-  local short = tostring(sha or ""):sub(1, 7)
-  local dir = store.reviews_dir(slug)
-  local highest = 0
-  for _, name in ipairs(store.list_files(dir)) do
-    local rev = name:match("^.+@" .. short .. "%.r(%d+)%.review%.json$")
-      or name:match("^.+@" .. short .. "%.r(%d+)%" .. M.RESERVE_SUFFIX .. "$")
-      or name:match("^.+@" .. short .. "%.r(%d+)%" .. M.TOMBSTONE_SUFFIX .. "$")
-    rev = tonumber(rev)
-    if rev and rev > highest then highest = rev end
-  end
-  return highest
-end
-
----_read_reservation returns the decoded reservation at `rev`, or nil.
-local function _read_reservation(slug, sha, rev)
-  local data = store.read_json(M.reserve_path(slug, sha, rev))
-  if type(data) ~= "table" then return nil end
-  return data
+  return _handle(slug, sha):max_recorded()
 end
 
 ---_owns reports whether `token` still holds the reservation AND the revision has
 ---not been tombstoned underneath it.
 local function _owns(slug, sha, rev, token)
-  if vim.uv and vim.uv.fs_stat(M.tombstone_path(slug, sha, rev)) then return false end
-  local r = _read_reservation(slug, sha, rev)
-  return r ~= nil and r.owner == token
+  return _handle(slug, sha):owns(rev, token)
 end
 
 ---retire fences a revision so it can never be handed out again.
 ---
 ---Tombstoning can itself fail — a read-only reviews directory rejects the
 ---tombstone for the same reason it rejected the JSON — so this is an ATTEMPT,
----not a guarantee. The reservation is the fallback fence: it already
----participates in `max_recorded_revision`, so retaining it keeps the number out
----of circulation just as well. The only difference is whether the fence
----survives a cleanup pass.
----@return boolean tombstoned, string? err
+---not a guarantee. auto-core reports the two facts separately: whether a
+---tombstone was written, and whether the number is fenced at all (the surviving
+---reservation counts, and its presence is CONFIRMED rather than assumed).
+---
+---The third return is additive; existing callers binding two are unaffected.
+---@return boolean tombstoned, string? err, boolean? fenced
 function M.retire(slug, sha, rev, token)
-  local ok, err = store.create_exclusive(
-    M.tombstone_path(slug, sha, rev),
-    vim.json.encode({ retired_at = _now(), by = token }))
-  if ok then
-    -- The tombstone fences the revision, so releasing our OWN reservation is
-    -- now safe. Ownership is compared directly rather than through `_owns`,
-    -- which also refuses any tombstoned revision — so routing through it here
-    -- meant the branch could never run and every retire leaked its reservation.
-    if token then
-      local r = _read_reservation(slug, sha, rev)
-      if r and r.owner == token then
-        pcall(function() (vim.uv or vim.loop).fs_unlink(M.reserve_path(slug, sha, rev)) end)
-      end
-    end
-    return true, nil
-  end
-  -- Taken by another writer's tombstone is success for our purposes: the
-  -- revision is fenced either way.
-  if not err and (vim.uv and vim.uv.fs_stat(M.tombstone_path(slug, sha, rev))) then
-    return true, nil
-  end
-  return false, err or "tombstone could not be created"
+  return _handle(slug, sha):retire(rev, token)
 end
 
 ---cleanup tombstones reservations whose lease has expired.
@@ -385,26 +368,17 @@ end
 ---canonical JSON yet" is not — that is also the state of every live writer
 ---between reserving and committing, and a cleanup built on it reaps running
 ---submitters.
----@return integer retired
+---
+---Committedness is decided across EVERY tail for the key, not just
+---`.review.json`: one classifier answers "spent?" and "committed?" or a store
+---holding two formats tombstones a revision the other one committed.
+---
+---The second return is additive: a report carrying `indeterminate` (a
+---reservation present but unreadable — kept as a fence, never reaped) plus
+---`errors` and `fenced`.
+---@return integer retired, table? report
 function M.cleanup(slug, sha)
-  local short = tostring(sha or ""):sub(1, 7)
-  local dir = store.reviews_dir(slug)
-  local n = 0
-  for _, name in ipairs(store.list_files(dir)) do
-    local rev = tonumber(name:match("^.+@" .. short .. "%.r(%d+)%" .. M.RESERVE_SUFFIX .. "$"))
-    if rev then
-      -- Never tombstone a revision that already committed: the pair is
-      -- complete and the tombstone would be pure noise.
-      local canonical = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
-      local committed = vim.uv and vim.uv.fs_stat(canonical) ~= nil
-      local r = _read_reservation(slug, sha, rev)
-      local expired = r and type(r.lease_until) == "number" and r.lease_until < _now()
-      if not committed and expired then
-        if M.retire(slug, sha, rev, nil) then n = n + 1 end
-      end
-    end
-  end
-  return n
+  return _handle(slug, sha):cleanup()
 end
 
 ---new builds a valid, empty review for a commit.
@@ -477,7 +451,7 @@ function M.save(slug, review, opts)
     -- stat-then-replacing-write, so two writers that both observed absence both
     -- returned success and the later rename destroyed the earlier review.
     -- Reproduced with a real second process. The exclusive create IS the gate.
-    local ok_enc, encoded = pcall(vim.json.encode, review)
+    local ok_enc, encoded = pcall(store.encode_pretty, review)
     if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
     local claimed, cerr = store.create_exclusive(path, encoded)
     if claimed then return path, nil end
@@ -519,7 +493,7 @@ function M.save_next(slug, review, opts)
     end
 
     local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, review.commit, rev)
-    local ok_enc, encoded = pcall(vim.json.encode, review)
+    local ok_enc, encoded = pcall(store.encode_pretty, review)
     if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
 
     local claimed, err = store.create_exclusive(path, encoded)
@@ -585,6 +559,52 @@ end
 local function _repo_component(slug)
   local tail = tostring(slug or ""):match("__(.+)$") or tostring(slug or "")
   return _sanitize_segment(tail) or "repo"
+end
+
+---_orphan_documents finds KB documents that would pair with (slug, revision).
+---
+---Used only when the projection is MALFORMED and therefore cannot name its own
+---pair. Everything it relies on comes from the store's own filename — the repo
+---component and the revision — never from the unreadable record. The reviewer
+---is unknown at that point, so every agent's reviews directory is searched.
+---@param slug string
+---@param revision integer
+---@return string[] paths
+---@return string[] paths, boolean searched, string? why
+local function _orphan_documents(slug, revision)
+  local kb = _kb_root()
+  local out = {}
+  -- "NOTHING FOUND" AND "COULD NOT LOOK" ARE DIFFERENT ANSWERS. Both returned
+  -- an empty list, so a `remove` whose KB root could not be resolved reported
+  -- ok=true / document_absent=true after fencing and deleting a malformed
+  -- projection, with the paired Markdown still on disk — the very outcome the
+  -- evidence was introduced to prevent (lector r3 MF1). The search status is a
+  -- second return, and the caller must branch on it.
+  if type(kb) ~= "string" or kb == "" then
+    return out, false, "the KB root could not be resolved, so no search was possible"
+  end
+  local repo = _repo_component(slug)
+  local rev = tonumber(revision)
+  if not rev then return out, false, "the revision is not a number" end
+  -- `<date>-<repo>-<topic>-r<N>-review.md` under `agents/<reviewer>/reviews/`.
+  local pattern = ("%s/agents/*/reviews/*-r%d-review.md"):format(kb, rev)
+  -- Through auto-core: this is a filesystem READ, and a delegate module that
+  -- reaches for `vim.fn.glob` itself is exactly how the I/O AC1 counts grows
+  -- back one call at a time.
+  local hits, gerr = require("auto-core.docstore").glob(pattern)
+  if gerr then
+    -- The search itself failed, which is not the same as finding nothing. The
+    -- status propagates all the way to `remove`'s result (lector r4).
+    return out, false, gerr
+  end
+  for _, path in ipairs(hits) do
+    local name = tostring(path):match("[^/]+$") or ""
+    -- The repo component must agree, or this is another repository's review
+    -- that merely shares a revision number.
+    if name:find("%-" .. vim.pesc(repo) .. "%-") then out[#out + 1] = path end
+  end
+  table.sort(out)
+  return out, true, nil
 end
 
 ---canonical_document builds the ONE document path a review may carry.
@@ -724,11 +744,16 @@ function M.validate_pair(review, opts)
     revision = review.revision,
   })
   problems = problems or {}
-  local st = review.document and (vim.uv or vim.loop).fs_stat(
+  local _ds = require("auto-core.docstore")
+  -- `kind` rather than a raw stat: auto-core answers what is at a path, so the
+  -- two distinct problems below stay distinguishable without this module
+  -- handling stat tables. `exists` was not enough -- it cannot tell a directory
+  -- sitting where the document belongs from the document itself.
+  local kind = review.document and _ds.kind(
     vim.fs and vim.fs.normalize(review.document) or review.document) or nil
-  if not st then
+  if not kind then
     problems[#problems + 1] = "document does not exist: " .. tostring(review.document)
-  elseif st.type ~= "file" then
+  elseif kind ~= "file" then
     -- A directory at the document's path is not a primary review.
     problems[#problems + 1] = "document is not a regular file: " .. tostring(review.document)
   end
@@ -830,12 +855,14 @@ function M.save_pair(slug, review, content, opts)
   local start = M.max_recorded_revision(slug, sha) + 1
   local token = _token()
 
+  -- ONE handle for the whole loop: the choreography below is worktree's, the
+  -- claim is auto-core's. `claim` refuses a tombstoned revision itself, so the
+  -- separate stat-then-create this used to do is gone — that pair was two
+  -- decisions where one atomic step will do.
+  local handle = _handle(slug, sha)
   for rev = start, start + attempts - 1 do
-    local tomb = (vim.uv or vim.loop).fs_stat(M.tombstone_path(slug, sha, rev))
-    if not tomb then
-      local claimed = store.create_exclusive(M.reserve_path(slug, sha, rev),
-        vim.json.encode({ owner = token, created_at = _now(),
-                          lease_until = _now() + M.LEASE_SECONDS }))
+    do
+      local claimed = handle:claim(rev, token)
       if claimed then
         local md_path, mderr = M.canonical_document({
           kb_root = kb, reviewer_slug = review.reviewer_slug, slug = slug,
@@ -877,7 +904,9 @@ function M.save_pair(slug, review, content, opts)
           M.retire(slug, sha, rev, token)
           return nil, "invalid review: " .. table.concat(vproblems, "; ")
         end
-        local ok_enc, encoded = pcall(vim.json.encode, review)
+        -- Pretty, stable-ordered JSON: the reviewer opens this file, and a
+        -- store diffs cleanly across rewrites (Johno, 2026-09-03).
+        local ok_enc, encoded = pcall(store.encode_pretty, review)
         if not ok_enc then
           M.retire(slug, sha, rev, token)
           return nil, "encode failed: " .. tostring(encoded)
@@ -911,7 +940,11 @@ function M.save_pair(slug, review, content, opts)
                 .. "; reservation retained as the fence)") or "")
         end
 
-        pcall(function() (vim.uv or vim.loop).fs_unlink(M.reserve_path(slug, sha, rev)) end)
+        -- Our own reservation, released now that the pair is committed. Through
+        -- auto-core, which reports a failure instead of swallowing it -- though
+        -- a leftover reservation here is benign: it only keeps a spent number
+        -- spent, which is already true.
+        handle:release(rev, token)
         return { json_path = json_path, md_path = md_path, revision = rev }, nil
       end
     end
@@ -1055,6 +1088,14 @@ function M.describe(path)
   meta.verdict  = type(data.verdict) == "string" and data.verdict or nil
   meta.summary  = type(data.summary) == "string" and data.summary or nil
   meta.document = type(data.document) == "string" and data.document or nil
+  -- `reviewer_slug` and `repo` are part of the record, and a projection that
+  -- drops them cannot be used to VALIDATE anything: `validate_pair` rejects a
+  -- described record for exactly this reason (lector, worktree#6 r0), and the
+  -- pair-deletion check of ADR-0081 §2.3a needs the reviewer slug to rebuild the
+  -- canonical document path. Projecting them keeps the described record usable
+  -- for validation instead of only for display.
+  meta.reviewer_slug = type(data.reviewer_slug) == "string" and data.reviewer_slug or nil
+  meta.repo = type(data.repo) == "table" and data.repo or nil
   if type(data.revision) == "number" and rev and data.revision ~= rev then
     meta.revision_mismatch = data.revision
   end
@@ -1129,18 +1170,26 @@ function M.remove(slug, sha, revision)
   local rev = tonumber(revision)
   if not rev then return false, "remove: revision required" end
 
-  local uv = vim.uv or vim.loop
+  local ds = require("auto-core.docstore")
   local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
-  if not uv.fs_stat(path) then return false, "no such review: " .. path end
+  if not ds.exists(path) then return false, "no such review: " .. path end
 
   -- Read the pair reference BEFORE the delete; afterwards there is nothing
   -- left to read it from.
-  local meta = M.describe(path)
+  -- BIND describe's ERROR. `describe` is tolerant by design: a malformed
+  -- projection still yields metadata plus an error, and the `document` it
+  -- reports is then untrustworthy. Binding only the first result made
+  -- "unreadable" indistinguishable from "known absent", so a truncated JSON was
+  -- fenced and deleted and the call returned SUCCESS with its Markdown still on
+  -- disk (lector MF3). Unknown is not absent, and §2.3a/AC7 require the
+  -- difference to reach the caller.
+  local meta, merr = M.describe(path)
   local detail = {
     path = path,
     document = meta and meta.document or nil,
     tombstone = M.tombstone_path(slug, sha, rev),
   }
+  if merr then detail.describe_error = tostring(merr) end
 
   local tombstoned, terr = M.retire(slug, sha, rev, nil)
   if not tombstoned then
@@ -1149,11 +1198,122 @@ function M.remove(slug, sha, revision)
   end
   detail.tombstoned = true
 
-  local ok, uerr = uv.fs_unlink(path)
+  -- auto-core's delete distinguishes ENOENT from every other failure, so a
+  -- file that is merely unreadable is no longer reported as already gone --
+  -- which matters most here, where the answer becomes "the pair is deleted".
+  local ok, uerr = ds.delete(path)
   if not ok then
     return false, "the revision is fenced but the file could not be deleted: "
       .. tostring(uerr or "unknown"), detail
   end
+
+  -- The PAIR is deleted, not just the projection (Johno, 2026-09-03: the two
+  -- files ARE one review). ADR-0081 §2.3a governs the ordering and the honesty
+  -- of a partial result.
+  --
+  -- The document path is VALIDATED before it is touched. `describe()` is
+  -- deliberately tolerant, so it will surface the `document` field of a
+  -- malformed or TAMPERED JSON — and the first cut of this code handed that
+  -- value straight to `fs_unlink`, which made a review file whose `document`
+  -- pointed anywhere on disk into an arbitrary file deletion (lector, ADR-0081
+  -- MF1). A tolerantly-parsed field must never reach an unlink. So the claimed
+  -- document must be exactly the canonical paired document for THIS review:
+  -- same reviewer slug, same repo component, same revision, contained under the
+  -- resolved KB root. Anything else is refused and reported as an orphan — the
+  -- projection is still removed and the revision still fenced, because those
+  -- are already done and correct.
+  local doc = meta and meta.document
+  if merr then
+    -- The projection could not be trusted to name its pair, so the document's
+    -- fate is UNKNOWN rather than absent. But "unknown" must be EVIDENCED, not
+    -- assumed: a malformed file that never had a pair is the ordinary cleanup
+    -- case, and reporting a phantom leftover would make that case a failure.
+    --
+    -- The FILENAME is still trustworthy — it is the store's own naming, and it
+    -- yields the repo component and the revision — so the KB is searched for a
+    -- document that would pair with THIS revision. Zero candidates means
+    -- nothing was left behind and the removal is complete; one or more means a
+    -- real orphan, named in the failure.
+    local left, searched, why = _orphan_documents(slug, rev)
+    detail.document_removed = false
+    detail.json_removed, detail.fenced = true, true
+    detail.describe_error = tostring(merr)
+    if not searched then
+      -- COULD NOT LOOK. Not the same as finding nothing: the document's fate
+      -- is genuinely unknown and the caller is told so, rather than being
+      -- reassured by an empty search that never ran.
+      detail.document_unknown = true
+      detail.document_search_failed = tostring(why or "unknown")
+      return false, ("the review JSON was removed and the revision fenced, but "
+        .. "it was MALFORMED (%s) and its Markdown could not be searched for "
+        .. "(%s), so a paired document may still exist"):format(
+          tostring(merr), tostring(why or "unknown")), detail
+    end
+    if #left == 0 then
+      -- Searched, and nothing is there. Success, with the malformed record
+      -- noted so a caller that wants to log it can.
+      detail.document_absent = true
+      detail.document_searched = true
+      return true, nil, detail
+    end
+    detail.document_unknown = true
+    detail.document_candidates = left
+    return false, ("the review JSON was removed and the revision fenced, but it "
+      .. "was MALFORMED (%s), so its Markdown could not be identified from the "
+      .. "record. %d document(s) for r%d remain: %s"):format(
+        tostring(merr), #left, rev, table.concat(left, ", ")), detail
+  end
+  if type(doc) ~= "string" or doc == "" then
+    detail.document_absent = true
+    detail.document_removed = false
+  else
+    -- Validate with the DOMAIN validator that already exists, rather than
+    -- rebuilding the filename grammar here. `check_document_path` is written for
+    -- exactly this: normalised containment under `$KB_ROOT/agents/<reviewer>/
+    -- reviews/`, the `<date>-<repo>-<topic>-r<N>-review.md` shape, agreement of
+    -- the repo component, and agreement of the revision — which is MF1's
+    -- requirement verbatim.
+    --
+    -- My first cut re-derived the date and topic from the filename and compared
+    -- against `canonical_document`. It rejected every VALID pair, because the
+    -- greedy topic capture swallowed the repo component too. Re-implementing a
+    -- grammar that already has a validator is how that happens.
+    local dok, dproblems = M.check_document_path(doc, {
+      kb_root = _kb_root(), reviewer_slug = meta.reviewer_slug,
+      slug = slug, revision = rev,
+    })
+    local cerr = (not dok) and table.concat(dproblems or {}, "; ") or nil
+    if dok then
+      if ds.exists(doc) then
+        local dok, derr = ds.delete(doc)
+        detail.document_removed = dok and true or false
+        if not dok then
+          -- HALF a pair is not success. The JSON is gone and the revision is
+          -- fenced, but the promised artifacts are not all removed, so the
+          -- caller is told so explicitly (§2.3a step 4).
+          detail.json_removed, detail.fenced = true, true
+          detail.document_error = tostring(derr or "unknown")
+          return false, ("the review JSON was removed and the revision fenced, but "
+            .. "its Markdown could not be deleted (%s). It remains at %s")
+            :format(tostring(derr or "unknown"), doc), detail
+        end
+      else
+        detail.document_removed = false
+        detail.document_absent = true
+      end
+    else
+      -- Not this review's canonical document: refuse to touch it, and say so.
+      detail.document_removed = false
+      detail.document_refused = doc
+      detail.document_refusal = cerr
+        or "the recorded document is not this review's canonical paired path"
+      detail.json_removed, detail.fenced = true, true
+      return false, ("the review JSON was removed and the revision fenced, but the "
+        .. "recorded document was NOT deleted: %s (%s)")
+        :format(doc, detail.document_refusal), detail
+    end
+  end
+  detail.json_removed, detail.fenced = true, true
   return true, nil, detail
 end
 

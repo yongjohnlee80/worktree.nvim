@@ -11,6 +11,33 @@ local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
+-- auto-core must be on the rtp of the PARENT and of every CHILD process.
+-- worktree.store is a delegation now (ADR-0081 P4a), so a process without
+-- auto-core is not running a smaller version of this plugin -- it is running a
+-- different program, and before P4a the old `io.open` fallback silently made
+-- that look fine. Two suites had never had auto-core on their rtp at all; the
+-- fallback was hiding it.
+local plugins = vim.fn.fnamemodify(root, ":h:h")
+local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
+local branch_dir = vim.fn.fnamemodify(root, ":t")
+local AUTO_CORE
+for _, p in ipairs({
+  LAZY .. "/auto-core.nvim",
+  plugins .. "/auto-core.nvim/main",
+  plugins .. "/auto-core.nvim/" .. branch_dir,  -- same-branch sibling wins
+}) do
+  if vim.fn.isdirectory(p) == 1 then AUTO_CORE = p end
+end
+if AUTO_CORE then vim.opt.runtimepath:prepend(AUTO_CORE) end
+-- Passed to every child nvim, so the templates below need no edits.
+local AC_ARGS = AUTO_CORE and { "--cmd", "set runtimepath^=" .. AUTO_CORE } or {}
+local function nvim_argv(script)
+  local a = { "nvim", "--headless", "-u", "NONE" }
+  for _, x in ipairs(AC_ARGS) do a[#a + 1] = x end
+  a[#a + 1] = "-l"; a[#a + 1] = script
+  return a
+end
+
 local sb = vim.fn.tempname() .. "-a1"
 vim.env.XDG_STATE_HOME = sb .. "/state"
 vim.env.XDG_CONFIG_HOME = sb .. "/config"
