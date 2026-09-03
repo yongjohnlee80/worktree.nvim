@@ -591,7 +591,13 @@ local function _orphan_documents(slug, revision)
   -- Through auto-core: this is a filesystem READ, and a delegate module that
   -- reaches for `vim.fn.glob` itself is exactly how the I/O AC1 counts grows
   -- back one call at a time.
-  for _, path in ipairs(require("auto-core.docstore").glob(pattern)) do
+  local hits, gerr = require("auto-core.docstore").glob(pattern)
+  if gerr then
+    -- The search itself failed, which is not the same as finding nothing. The
+    -- status propagates all the way to `remove`'s result (lector r4).
+    return out, false, gerr
+  end
+  for _, path in ipairs(hits) do
     local name = tostring(path):match("[^/]+$") or ""
     -- The repo component must agree, or this is another repository's review
     -- that merely shares a revision number.

@@ -690,6 +690,48 @@ do
         end)())
     end
 
+    -- MF1 (r4): the SAME conflation survived one layer down, in
+    -- `auto-core.docstore.glob`. lector's probe keeps the KB root resolvable
+    -- and makes `$KB_ROOT/agents` UNREADABLE: `vim.fn.glob` reports no error,
+    -- so the search returned what "nothing matched" returns, and `remove`
+    -- reported ok=true / document_absent=true with the Markdown still there.
+    -- Fixing the caller was not enough; the primitive had to report it too.
+    do
+      local d7 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "unreadable agents" })
+      d7.reviewer_slug = "lector"
+      local res7 = review.save_pair(slug, d7, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a third valid pair exists", res7 ~= nil)
+      vim.fn.writefile({ '{"document":' }, res7.json_path)
+
+      -- The root RESOLVES; only the traversal is denied.
+      vim.fn.system({ "chmod", "000", alt .. "/agents" })
+      local uok, uerr, udetail = review.remove(slug, sha2, res7.revision)
+      vim.fn.system({ "chmod", "755", alt .. "/agents" })
+
+      ok("[11] *** MF1(r4): an UNREADABLE search root is not a clean removal ***",
+        uok == false and udetail ~= nil and udetail.document_unknown == true
+        and udetail.document_absent ~= true
+        and udetail.document_searched ~= true, vim.inspect(udetail))
+      ok("[11] MF1(r4): and it names the traversal failure",
+        tostring(udetail.document_search_failed):find("traversed", 1, true) ~= nil
+        or tostring(uerr):find("could not be searched", 1, true) ~= nil,
+        tostring(udetail.document_search_failed) .. " | " .. tostring(uerr))
+      ok("[11] MF1(r4): the Markdown really is still there",
+        vim.fn.filereadable(res7.md_path) == 1, res7.md_path)
+      ok("[11] CONTROL — with the root READABLE the same shape finds the orphan",
+        (function()
+          local _, cerr2, cdetail = review.remove(slug, sha2, res7.revision)
+          -- The projection is already gone from the failed attempt, so this
+          -- reports "no such review" -- what matters is that it does NOT
+          -- report a search failure.
+          return (cdetail == nil or cdetail.document_search_failed == nil)
+            and tostring(cerr2):find("traversed", 1, true) == nil
+        end)())
+    end
+
     -- A DIRECTORY at the document's path is not a primary review.
     -- `validate_pair` distinguishes "absent" from "present but not a regular
     -- file", and nothing exercised the second branch -- deleting it changed no
