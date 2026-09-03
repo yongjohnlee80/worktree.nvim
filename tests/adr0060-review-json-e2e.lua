@@ -14,9 +14,15 @@ local plugins = vim.fn.fnamemodify(plugin_root, ":h:h")
 local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
 -- Installed copies FIRST, development worktrees LAST: `prepend` pushes to the
 -- front, so the last existing entry wins and this suite tests THIS checkout.
+-- The SAME-BRANCH sibling worktree is what pairs a cross-repo change with its
+-- other half before either merges (ADR-0081 AC9's paired-worktree harness).
+-- Without it this suite loaded the INSTALLED auto-core, which does not have the
+-- store worktree now delegates to.
+local branch_dir = vim.fn.fnamemodify(plugin_root, ":t")
 for _, p in ipairs({
   LAZY .. "/auto-core.nvim",
   plugins .. "/auto-core.nvim/main",
+  plugins .. "/auto-core.nvim/" .. branch_dir,
   plugin_root,
 }) do
   if vim.fn.isdirectory(p) == 1 then vim.opt.runtimepath:prepend(p) end

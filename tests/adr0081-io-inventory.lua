@@ -37,23 +37,34 @@ end
 --                 because "permitted" with no reason is how scope creeps.
 local INVENTORY = {
   ["store.lua"] = {
-    scope = "delegate", phase = "P4a",
-    why = "the leaf persistence layer; becomes a thin delegation to auto-core.docstore",
-    calls = {
-      fs_stat = 5, fs_open = 2, fs_write = 2, fs_close = 3, fs_unlink = 4,
-      fs_fstat = 1, fs_fsync = 1, fs_link = 1, fs_scandir = 1,
-      fs_scandir_next = 1, ["io.open"] = 2, mkdir = 1,
-    },
+    scope = "delegate", phase = "P4a — DONE 2026-09-03",
+    why = "the leaf persistence layer, now a thin delegation to auto-core.docstore."
+      .. " 24 raw calls became 0: ensure_dir, encode_pretty, write_json, read_json,"
+      .. " mtime, with_lock, create_exclusive and list_files all delegate, and the"
+      .. " lock's three test seams re-export auto-core's. Public signatures, return"
+      .. " conventions and LOCK_WAIT_MS's authority are unchanged, which is what the"
+      .. " existing suites prove.",
+    calls = {},
   },
   ["review.lua"] = {
-    scope = "delegate", phase = "P4c",
-    why = "review-document mechanics: the pair's stats, unlinks and the rename",
-    calls = { fs_stat = 5, fs_unlink = 2 },
+    scope = "delegate", phase = "P4b/P4c — DONE 2026-09-03",
+    why = "review-document mechanics. 7 raw calls became 0: the allocator (reserve,"
+      .. " tombstone, max-recorded, owns, retire, cleanup, token) delegates to an"
+      .. " auto-core revision HANDLE opened from worktree's own key and suffix, and"
+      .. " save_pair's stat-then-create pair became one atomic `handle:claim`."
+      .. " remove()'s stat and both unlinks are auto-core calls, so a file that is"
+      .. " merely unreadable is no longer reported as already gone. worktree keeps"
+      .. " the filename grammar, the pairing choreography, `document` validation and"
+      .. " the §2.3a contract.",
+    calls = {},
   },
   ["init.lua"] = {
-    scope = "delegate", phase = "P6",
-    why = "a LOCAL atomic-write fallback duplicating auto-core.fs.atomic (AC6: no local duplicate)",
-    calls = { ["io.open"] = 1 },
+    scope = "delegate", phase = "P6 — DONE 2026-09-03",
+    why = "the gitfile write had a LOCAL io.open fallback beside its auto-core call --"
+      .. " a second implementation that could only run in a configuration no user"
+      .. " has, and the weaker of the two when it did (no temp-fsync-rename). Now a"
+      .. " single auto-core call.",
+    calls = {},
   },
   ["watch.lua"] = {
     scope = "permitted", phase = nil,
@@ -191,11 +202,13 @@ print(("      delegate (must reach 0 by P6): %d   permitted: %d")
   :format(delegate_total, permitted_total))
 for phase, n in pairs(by_phase) do print(("        %s owns %d"):format(phase, n)) end
 ok("[3] the remaining work is enumerated, not estimated",
-  delegate_total == 32 and permitted_total == 5,
+  delegate_total == 0 and permitted_total == 5,
   ("delegate=%d permitted=%d — if a phase just landed, update this figure too")
     :format(delegate_total, permitted_total))
--- At P6 this assertion becomes `delegate_total == 0`, and AC1 is met by
--- arithmetic rather than by assertion.
+-- AC1 IS MET, and by arithmetic: zero raw document-I/O calls remain in
+-- worktree's production code. The five permitted ones are named and reasoned
+-- above. If this number ever rises, the phase that raised it has to say why
+-- here, in the same commit.
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail > 0 and 1 or 0)

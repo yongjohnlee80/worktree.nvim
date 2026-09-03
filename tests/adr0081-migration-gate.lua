@@ -123,10 +123,17 @@ ok("[2] *** the existing document is readable through the new store ***",
 print("\n[3] CONTROL RECORDS PARTICIPATE in the next allocation")
 ok("[3] *** the new allocator counts the old .reserve and .tombstone ***",
   h:max_recorded() == 3, tostring(h:max_recorded()))
-ok("[3] *** and agrees with the SHIPPED implementation exactly ***",
-  h:max_recorded() == review.max_recorded_revision(SLUG, SHA),
-  ("new=%s shipped=%s"):format(h:max_recorded(),
-    review.max_recorded_revision(SLUG, SHA)))
+-- PINNED LITERAL, not a comparison against worktree's answer. Before P4b those
+-- were two independent implementations and comparing them was the whole point;
+-- now `review.max_recorded_revision` IS this handle, so that assertion compares
+-- a function with itself and would pass however wrong both were. The frozen
+-- fixture is r1 committed + r2 reserved + r3 tombstoned, so the maximum is 3 --
+-- and 3 is what a reader can verify from the fixture literals above.
+ok("[3] *** the maximum is the PINNED 3, from the frozen fixture ***",
+  h:max_recorded() == 3, tostring(h:max_recorded()))
+ok("[3] and worktree's public accessor returns the same number (delegation wired)",
+  review.max_recorded_revision(SLUG, SHA) == 3,
+  tostring(review.max_recorded_revision(SLUG, SHA)))
 ok("[3] *** so the next revision is r4 — no old number is re-issued ***",
   (function()
     local rev, tok = h:claim_next()
@@ -151,10 +158,12 @@ ok("[4] the old reservation decodes with its fields intact", (function()
   return type(r) == "table" and r.owner == "old-token"
     and r.created_at == 1788000000 and r.lease_until == 1788000120
 end)())
-ok("[4] *** lease_until is ABSOLUTE EPOCH SECONDS in both implementations ***",
-  rv.LEASE_SECONDS == review.LEASE_SECONDS
-  and rv.LEASE_SECONDS == 120,
-  ("new=%s shipped=%s"):format(rv.LEASE_SECONDS, review.LEASE_SECONDS))
+-- `review.LEASE_SECONDS` is sourced FROM auto-core since P4b, so equality
+-- between them is now tautological. The load-bearing half is the pinned value:
+-- 120 SECONDS, matching what v0.5.7 wrote into the frozen reservation above.
+ok("[4] *** the lease is 120 ABSOLUTE EPOCH SECONDS, as v0.5.7 wrote it ***",
+  rv.LEASE_SECONDS == 120 and review.LEASE_SECONDS == 120,
+  ("auto-core=%s worktree=%s"):format(rv.LEASE_SECONDS, review.LEASE_SECONDS))
 ok("[4] *** an old LIVE reservation is not reaped by the new cleanup ***",
   (function()
     -- 1788000120 is in the past relative to now, so make it live first: the

@@ -261,122 +261,105 @@ M.TOMBSTONE_SUFFIX = ".tombstone"
 ---reuse, and a stat-to-unlink interleaving that deleted a live successor. A
 ---lease has no such failure mode — its worst case is a slow writer losing a
 ---revision number it had not committed.
-M.LEASE_SECONDS = 120
+---Sourced from auto-core, so the documented figure and the one the allocator
+---enforces cannot drift apart. Still published here because callers and the
+---migration gate read `review.LEASE_SECONDS`.
+M.LEASE_SECONDS = (function()
+  local ok, ds = pcall(require, "auto-core.docstore")
+  if ok and type(ds) == "table" and ds.revisions then return ds.revisions.LEASE_SECONDS end
+  return 120
+end)()
 
-local function _base(slug, sha, revision)
-  local short = tostring(sha or ""):sub(1, 7)
-  return string.format("%s@%s.r%d", slug, short, tonumber(revision) or 1)
+---### P4b — revisioned identity DELEGATES (ADR-0081 §2.2a)
+---
+---worktree keeps what it owns: the mapping from `(repo, commit)` to a logical
+---KEY, and the canonical filename grammar. auto-core owns the mechanics —
+---exclusive claim, lease, retirement, monotonic non-reuse, record persistence —
+---behind a validated handle.
+---
+---The composed paths are byte-identical to the ones this module used to build
+---itself, which is not an assumption: `tests/adr0081-migration-gate.lua` asserts
+---it against records produced by the SHIPPED v0.5.7 writer.
+local function _key(slug, sha)
+  return string.format("%s@%s", tostring(slug or ""), tostring(sha or ""):sub(1, 7))
+end
+
+---_handle opens the allocator for one (slug, commit).
+---
+---Raises when the identity cannot be expressed in the record grammar. That is
+---deliberate and it is a bug fix, not a regression: the only identities auto-core
+---refuses are ones that would compose an AMBIGUOUS filename — a slug carrying a
+---`.r<digits>` segment, say — and such a name was already ambiguous when this
+---module built it by hand. A silent wrong answer is the worse outcome.
+local function _handle(slug, sha)
+  local ok_rv, rv = pcall(function() return require("auto-core.docstore").revisions end)
+  if not ok_rv or type(rv) ~= "table" or type(rv.open) ~= "function" then
+    error("worktree.review: auto-core.docstore.revisions is required"
+      .. " (auto-core >= v0.2.12)", 0)
+  end
+  local h, err = rv.open({
+    dir = store.reviews_dir(slug),
+    key = _key(slug, sha),
+    suffix = ".review.json",
+  })
+  if not h then
+    error(("worktree.review: this repo/commit cannot be expressed as a review"
+      .. " record identity: %s"):format(tostring(err)), 0)
+  end
+  return h
 end
 
 ---reserve_path / tombstone_path — the two non-canonical record names.
 function M.reserve_path(slug, sha, revision)
-  return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.RESERVE_SUFFIX
+  return _handle(slug, sha):reserve_path(revision)
 end
 
 function M.tombstone_path(slug, sha, revision)
-  return store.reviews_dir(slug) .. "/" .. _base(slug, sha, revision) .. M.TOMBSTONE_SUFFIX
+  return _handle(slug, sha):tombstone_path(revision)
 end
 
 ---_now is seconds since the epoch.
----
----Declared BEFORE `_token`, which uses it. As a local below its use site it
----was simply nil there, so the entire fallback branch crashed the moment
----`uv.random` was unavailable — verified, `token_fallback_pcall=false`.
 local function _now() return os.time() end
 
----_token mints an UNGUESSABLE reservation owner.
+---_token mints an UNGUESSABLE reservation owner, from auto-core.
 ---
 ---Not a pid and not a name: a guessable token is a lock anyone can forge, and
 ---ownership is the only thing standing between a cleanup pass and a live
----writer's claim.
+---writer's claim. The `uv.random` call and its collision-avoidance fallback live
+---in auto-core now — one implementation, and the one place its fallback is
+---documented as NOT a CSPRNG.
 local function _token()
-  local ok, bytes = pcall(function()
-    return (vim.uv or vim.loop).random(16)
-  end)
-  if ok and type(bytes) == "string" and #bytes > 0 then
-    return (bytes:gsub(".", function(c) return string.format("%02x", c:byte()) end))
-  end
-  -- Fallback when libuv has no `random`. `math.random` is NOT a CSPRNG and
-  -- this does not establish unguessability — it is a collision-avoidance
-  -- fallback, seeded per call so two writers starting in the same second do
-  -- not mint the same token. The security claim rests on `uv.random`; where it
-  -- is unavailable, treat the token as a uniqueness tag only.
-  local t = { tostring(vim.fn.getpid()), tostring(_now()) }
-  math.randomseed((_now() * 1000 + vim.fn.getpid()) % 2147483647)
-  for _ = 1, 16 do t[#t + 1] = string.format("%02x", math.random(0, 255)) end
-  return table.concat(t, "-")
+  return require("auto-core.docstore").revisions.token()
 end
 
----max_recorded_revision is the allocation maximum over ALL THREE record kinds.
+---max_recorded_revision is the highest number this commit has ever used.
 ---
----`latest_revision` scans canonical files alone and is unchanged — it answers
----"what is the newest review", which is a different question. Allocating from
----it re-offers a number that is reserved or tombstoned but never committed,
----which would hand a crashed writer's revision to the next one.
----@param slug string
----@param sha string
----@return integer  0 when nothing is recorded
+---Committed, reserved and tombstoned alike — auto-core scans every accepted
+---tail for the key, so a deleted record's number is still spent and a crashed
+---writer's reservation is not handed to the next writer.
+---@return integer
 function M.max_recorded_revision(slug, sha)
-  local short = tostring(sha or ""):sub(1, 7)
-  local dir = store.reviews_dir(slug)
-  local highest = 0
-  for _, name in ipairs(store.list_files(dir)) do
-    local rev = name:match("^.+@" .. short .. "%.r(%d+)%.review%.json$")
-      or name:match("^.+@" .. short .. "%.r(%d+)%" .. M.RESERVE_SUFFIX .. "$")
-      or name:match("^.+@" .. short .. "%.r(%d+)%" .. M.TOMBSTONE_SUFFIX .. "$")
-    rev = tonumber(rev)
-    if rev and rev > highest then highest = rev end
-  end
-  return highest
-end
-
----_read_reservation returns the decoded reservation at `rev`, or nil.
-local function _read_reservation(slug, sha, rev)
-  local data = store.read_json(M.reserve_path(slug, sha, rev))
-  if type(data) ~= "table" then return nil end
-  return data
+  return _handle(slug, sha):max_recorded()
 end
 
 ---_owns reports whether `token` still holds the reservation AND the revision has
 ---not been tombstoned underneath it.
 local function _owns(slug, sha, rev, token)
-  if vim.uv and vim.uv.fs_stat(M.tombstone_path(slug, sha, rev)) then return false end
-  local r = _read_reservation(slug, sha, rev)
-  return r ~= nil and r.owner == token
+  return _handle(slug, sha):owns(rev, token)
 end
 
 ---retire fences a revision so it can never be handed out again.
 ---
 ---Tombstoning can itself fail — a read-only reviews directory rejects the
 ---tombstone for the same reason it rejected the JSON — so this is an ATTEMPT,
----not a guarantee. The reservation is the fallback fence: it already
----participates in `max_recorded_revision`, so retaining it keeps the number out
----of circulation just as well. The only difference is whether the fence
----survives a cleanup pass.
----@return boolean tombstoned, string? err
+---not a guarantee. auto-core reports the two facts separately: whether a
+---tombstone was written, and whether the number is fenced at all (the surviving
+---reservation counts, and its presence is CONFIRMED rather than assumed).
+---
+---The third return is additive; existing callers binding two are unaffected.
+---@return boolean tombstoned, string? err, boolean? fenced
 function M.retire(slug, sha, rev, token)
-  local ok, err = store.create_exclusive(
-    M.tombstone_path(slug, sha, rev),
-    vim.json.encode({ retired_at = _now(), by = token }))
-  if ok then
-    -- The tombstone fences the revision, so releasing our OWN reservation is
-    -- now safe. Ownership is compared directly rather than through `_owns`,
-    -- which also refuses any tombstoned revision — so routing through it here
-    -- meant the branch could never run and every retire leaked its reservation.
-    if token then
-      local r = _read_reservation(slug, sha, rev)
-      if r and r.owner == token then
-        pcall(function() (vim.uv or vim.loop).fs_unlink(M.reserve_path(slug, sha, rev)) end)
-      end
-    end
-    return true, nil
-  end
-  -- Taken by another writer's tombstone is success for our purposes: the
-  -- revision is fenced either way.
-  if not err and (vim.uv and vim.uv.fs_stat(M.tombstone_path(slug, sha, rev))) then
-    return true, nil
-  end
-  return false, err or "tombstone could not be created"
+  return _handle(slug, sha):retire(rev, token)
 end
 
 ---cleanup tombstones reservations whose lease has expired.
@@ -385,26 +368,17 @@ end
 ---canonical JSON yet" is not — that is also the state of every live writer
 ---between reserving and committing, and a cleanup built on it reaps running
 ---submitters.
----@return integer retired
+---
+---Committedness is decided across EVERY tail for the key, not just
+---`.review.json`: one classifier answers "spent?" and "committed?" or a store
+---holding two formats tombstones a revision the other one committed.
+---
+---The second return is additive: a report carrying `indeterminate` (a
+---reservation present but unreadable — kept as a fence, never reaped) plus
+---`errors` and `fenced`.
+---@return integer retired, table? report
 function M.cleanup(slug, sha)
-  local short = tostring(sha or ""):sub(1, 7)
-  local dir = store.reviews_dir(slug)
-  local n = 0
-  for _, name in ipairs(store.list_files(dir)) do
-    local rev = tonumber(name:match("^.+@" .. short .. "%.r(%d+)%" .. M.RESERVE_SUFFIX .. "$"))
-    if rev then
-      -- Never tombstone a revision that already committed: the pair is
-      -- complete and the tombstone would be pure noise.
-      local canonical = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
-      local committed = vim.uv and vim.uv.fs_stat(canonical) ~= nil
-      local r = _read_reservation(slug, sha, rev)
-      local expired = r and type(r.lease_until) == "number" and r.lease_until < _now()
-      if not committed and expired then
-        if M.retire(slug, sha, rev, nil) then n = n + 1 end
-      end
-    end
-  end
-  return n
+  return _handle(slug, sha):cleanup()
 end
 
 ---new builds a valid, empty review for a commit.
@@ -724,11 +698,16 @@ function M.validate_pair(review, opts)
     revision = review.revision,
   })
   problems = problems or {}
-  local st = review.document and (vim.uv or vim.loop).fs_stat(
+  local _ds = require("auto-core.docstore")
+  -- `kind` rather than a raw stat: auto-core answers what is at a path, so the
+  -- two distinct problems below stay distinguishable without this module
+  -- handling stat tables. `exists` was not enough -- it cannot tell a directory
+  -- sitting where the document belongs from the document itself.
+  local kind = review.document and _ds.kind(
     vim.fs and vim.fs.normalize(review.document) or review.document) or nil
-  if not st then
+  if not kind then
     problems[#problems + 1] = "document does not exist: " .. tostring(review.document)
-  elseif st.type ~= "file" then
+  elseif kind ~= "file" then
     -- A directory at the document's path is not a primary review.
     problems[#problems + 1] = "document is not a regular file: " .. tostring(review.document)
   end
@@ -830,12 +809,14 @@ function M.save_pair(slug, review, content, opts)
   local start = M.max_recorded_revision(slug, sha) + 1
   local token = _token()
 
+  -- ONE handle for the whole loop: the choreography below is worktree's, the
+  -- claim is auto-core's. `claim` refuses a tombstoned revision itself, so the
+  -- separate stat-then-create this used to do is gone — that pair was two
+  -- decisions where one atomic step will do.
+  local handle = _handle(slug, sha)
   for rev = start, start + attempts - 1 do
-    local tomb = (vim.uv or vim.loop).fs_stat(M.tombstone_path(slug, sha, rev))
-    if not tomb then
-      local claimed = store.create_exclusive(M.reserve_path(slug, sha, rev),
-        vim.json.encode({ owner = token, created_at = _now(),
-                          lease_until = _now() + M.LEASE_SECONDS }))
+    do
+      local claimed = handle:claim(rev, token)
       if claimed then
         local md_path, mderr = M.canonical_document({
           kb_root = kb, reviewer_slug = review.reviewer_slug, slug = slug,
@@ -913,7 +894,11 @@ function M.save_pair(slug, review, content, opts)
                 .. "; reservation retained as the fence)") or "")
         end
 
-        pcall(function() (vim.uv or vim.loop).fs_unlink(M.reserve_path(slug, sha, rev)) end)
+        -- Our own reservation, released now that the pair is committed. Through
+        -- auto-core, which reports a failure instead of swallowing it -- though
+        -- a leftover reservation here is benign: it only keeps a spent number
+        -- spent, which is already true.
+        handle:release(rev, token)
         return { json_path = json_path, md_path = md_path, revision = rev }, nil
       end
     end
@@ -1139,9 +1124,9 @@ function M.remove(slug, sha, revision)
   local rev = tonumber(revision)
   if not rev then return false, "remove: revision required" end
 
-  local uv = vim.uv or vim.loop
+  local ds = require("auto-core.docstore")
   local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
-  if not uv.fs_stat(path) then return false, "no such review: " .. path end
+  if not ds.exists(path) then return false, "no such review: " .. path end
 
   -- Read the pair reference BEFORE the delete; afterwards there is nothing
   -- left to read it from.
@@ -1159,7 +1144,10 @@ function M.remove(slug, sha, revision)
   end
   detail.tombstoned = true
 
-  local ok, uerr = uv.fs_unlink(path)
+  -- auto-core's delete distinguishes ENOENT from every other failure, so a
+  -- file that is merely unreadable is no longer reported as already gone --
+  -- which matters most here, where the answer becomes "the pair is deleted".
+  local ok, uerr = ds.delete(path)
   if not ok then
     return false, "the revision is fenced but the file could not be deleted: "
       .. tostring(uerr or "unknown"), detail
@@ -1202,8 +1190,8 @@ function M.remove(slug, sha, revision)
     })
     local cerr = (not dok) and table.concat(dproblems or {}, "; ") or nil
     if dok then
-      if uv.fs_stat(doc) then
-        local dok, derr = uv.fs_unlink(doc)
+      if ds.exists(doc) then
+        local dok, derr = ds.delete(doc)
         detail.document_removed = dok and true or false
         if not dok then
           -- HALF a pair is not success. The JSON is gone and the revision is

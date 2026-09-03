@@ -14,6 +14,33 @@ local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
+-- auto-core must be on the rtp of the PARENT and of every CHILD process.
+-- worktree.store is a delegation now (ADR-0081 P4a), so a process without
+-- auto-core is not running a smaller version of this plugin -- it is running a
+-- different program, and before P4a the old `io.open` fallback silently made
+-- that look fine. Two suites had never had auto-core on their rtp at all; the
+-- fallback was hiding it.
+local plugins = vim.fn.fnamemodify(root, ":h:h")
+local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
+local branch_dir = vim.fn.fnamemodify(root, ":t")
+local AUTO_CORE
+for _, p in ipairs({
+  LAZY .. "/auto-core.nvim",
+  plugins .. "/auto-core.nvim/main",
+  plugins .. "/auto-core.nvim/" .. branch_dir,  -- same-branch sibling wins
+}) do
+  if vim.fn.isdirectory(p) == 1 then AUTO_CORE = p end
+end
+if AUTO_CORE then vim.opt.runtimepath:prepend(AUTO_CORE) end
+-- Passed to every child nvim, so the templates below need no edits.
+local AC_ARGS = AUTO_CORE and { "--cmd", "set runtimepath^=" .. AUTO_CORE } or {}
+local function nvim_argv(script)
+  local a = { "nvim", "--headless", "-u", "NONE" }
+  for _, x in ipairs(AC_ARGS) do a[#a + 1] = x end
+  a[#a + 1] = "-l"; a[#a + 1] = script
+  return a
+end
+
 local sb = vim.fn.tempname() .. "-a1conc"
 vim.env.XDG_STATE_HOME = sb .. "/state"
 vim.env.XDG_CONFIG_HOME = sb .. "/config"
@@ -63,8 +90,8 @@ do
   local a = writer_script(sha, "alpha")
   local b = writer_script(sha, "beta")
   -- Started together so their reservations genuinely contend.
-  local ja = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", a }, { text = true })
-  local jb = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", b }, { text = true })
+  local ja = vim.system(nvim_argv(a), { text = true })
+  local jb = vim.system(nvim_argv(b), { text = true })
   local ra, rb = ja:wait(), jb:wait()
   local outa, outb = vim.trim(ra.stdout or ""), vim.trim(rb.stdout or "")
   ok("both writers succeeded", outa:find("^OK") and outb:find("^OK"),
@@ -100,11 +127,20 @@ do
   -- because there was no JSON at all. Only the positive controls exposed it.
   local phases = {
     { name = "after the reservation",
-      extra = 'local real = store.create_exclusive\n'
-        .. 'store.create_exclusive = function(p, b)\n'
-        .. '  local r = real(p, b)\n'
+      -- Patched at auto-core's primitive, not worktree's. ADR-0081 P4b moved
+      -- the reservation claim into `auto-core.docstore.revisions`, so a writer
+      -- no longer reaches `store.create_exclusive` to reserve -- and this
+      -- injection silently stopped firing, which the positive control caught.
+      -- The test follows the property to where it now lives; the property
+      -- itself (a writer killed after reserving leaves no unpaired JSON) is
+      -- unchanged. Both returns are preserved: dropping the error would make a
+      -- refused claim look like a successful one.
+      extra = 'local _ds = require("auto-core.docstore")\n'
+        .. 'local real = _ds.create_exclusive\n'
+        .. '_ds.create_exclusive = function(p, b)\n'
+        .. '  local r, e = real(p, b)\n'
         .. '  if tostring(p):find("%.reserve$") then (vim.uv or vim.loop).kill((vim.uv or vim.loop).os_getpid(), 9) end\n'
-        .. '  return r\nend' },
+        .. '  return r, e\nend' },
     { name = "after the JSON commit",
       -- The remnant here is a COMPLETE pair: the commit point has passed, so
       -- only the reservation can be left over. Absent from r1, and it is the
@@ -126,7 +162,7 @@ do
     local sha = string.rep(tostring(i + 1), 40)
     local tag = "killed" .. i
     local sc = writer_script(sha, tag, ph.extra)
-    vim.system({ "nvim", "--headless", "-u", "NONE", "-l", sc }, { text = true }):wait()
+    vim.system(nvim_argv(sc), { text = true }):wait()
     local revs = review.list_for(SLUG, sha)
     local unpaired = false
     for _, r in ipairs(revs) do
@@ -292,8 +328,8 @@ io.stdout:write(tostring(review.cleanup("%s", "%s")) .. "\n")
 ]]):format(root, store._root_override, SLUG, sha2)
   local cp = vim.fn.tempname() .. "-clean.lua"
   vim.fn.writefile(vim.split(CLEAN, "\n"), cp)
-  local j1 = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", cp }, { text = true })
-  local j2 = vim.system({ "nvim", "--headless", "-u", "NONE", "-l", cp }, { text = true })
+  local j1 = vim.system(nvim_argv(cp), { text = true })
+  local j2 = vim.system(nvim_argv(cp), { text = true })
   local o1, o2 = j1:wait(), j2:wait()
   local n1 = tonumber(vim.trim(o1.stdout or "")) or -1
   local n2 = tonumber(vim.trim(o2.stdout or "")) or -1

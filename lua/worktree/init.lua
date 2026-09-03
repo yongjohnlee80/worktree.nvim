@@ -818,17 +818,15 @@ end
 -- Delegate to auto-core's temp→fsync→rename primitive when available
 -- (>= 0.1.58); keep the raw write only as the soft-dep fallback.
 local function write_gitfile(dir, bare_rel)
-  local path = dir .. "/.git"
-  local content = "gitdir: ./" .. bare_rel .. "\n"
-  local ok_atomic, atomic = pcall(require, "auto-core.fs.atomic")
-  if ok_atomic and type(atomic.write) == "function" then
-    return atomic.write(path, content)
-  end
-  local f, err = io.open(path, "w")
-  if not f then return false, err or "unknown error" end
-  f:write(content)
-  f:close()
-  return true
+  -- P6 (ADR-0081): the local `io.open` fallback that used to sit beside this
+  -- call is gone. auto-core is a hard dependency, so the fallback could only
+  -- ever run in a configuration no user has -- and a second implementation
+  -- beside the real one is exactly what AC6 forbids. Worse, the fallback was
+  -- the WEAKER of the two (no temp-fsync-rename), so the only situation it
+  -- covered was one where it would quietly do a worse job. The same shape in
+  -- worktree.store was hiding two suites that had never loaded auto-core at all.
+  return require("auto-core.fs.atomic").write(
+    dir .. "/.git", "gitdir: ./" .. bare_rel .. "\n")
 end
 M._write_gitfile = write_gitfile -- ADR-0041 test hook
 
