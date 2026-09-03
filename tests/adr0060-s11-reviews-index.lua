@@ -588,10 +588,22 @@ do
       res ~= nil and vim.fn.filereadable(res.json_path) == 1, tostring(serr))
     ok("[11] *** and the Markdown landed under the RESOLVED root ***",
       res ~= nil and res.md_path:sub(1, #alt) == alt, res and res.md_path)
-    ok("[11] the pair validates as a pair",
-      res ~= nil and select(1, review.validate_pair(
-        (review.describe(res.json_path) or {}), { kb_root = alt })) ~= nil,
-      res and res.md_path)
+    -- The PAIR invariant, asserted so it can fail. This was written as
+    -- `select(1, validate_pair(...)) ~= nil`, and `validate_pair` returns a
+    -- BOOLEAN first — so both true and false satisfied `~= nil` and the
+    -- assertion could not express failure. Worse, it was fed
+    -- `review.describe()` metadata, which omits `reviewer_slug` and `repo` and
+    -- is therefore REJECTED by `validate_pair`: it was passing on input that
+    -- should fail (lector, worktree#6 r0 should-fix).
+    --
+    -- The full record is what carries the fields the pair check needs, so it is
+    -- loaded rather than projected, and the boolean is compared to `true`.
+    local full, lerr = review.load(slug, sha2, res and res.revision or 0)
+    ok("[11] the written review loads back as a full record",
+      full ~= nil and full.document ~= nil, tostring(lerr))
+    local pair_ok, pair_problems = review.validate_pair(full or {}, { kb_root = alt })
+    ok("[11] *** and it validates as a PAIR — document, reviewer and repo agree ***",
+      pair_ok == true, vim.inspect(pair_problems))
 
     -- CONTROL: an explicit kb_root still wins over the resolver, so callers that
     -- do supply one are unaffected.
