@@ -514,6 +514,105 @@ do
     vim.inspect(seen))
 end
 
+print("\n[11] the KB root resolves with $AUTO_AGENTS_KB_ROOT UNSET")
+-- The environment that broke the feature and that no suite could see. Every
+-- test in this family sets AUTO_AGENTS_KB_ROOT — and must, since `save_pair`
+-- writes a real document and inheriting the live value writes into the real
+-- knowledge base. That isolation is exactly what hid the defect: the editor
+-- process has no such variable, `save_pair` read it raw, and every submit from
+-- the panel died at the preflight while every agent and every test passed.
+--
+-- So this section isolates through a LATER hop of the same chain. auto-core
+-- resolves KB_ROOT as $AUTO_AGENTS_KB_ROOT > $AUTO_AGENTS_KB_READ[0] >
+-- $AUTO_AGENTS_KB_WRITE > auto-agents.kb.root(); unsetting the first two and
+-- pointing the third at a temp dir keeps the test safe while proving the
+-- RESOLVER is consulted rather than the raw variable — a raw read of
+-- AUTO_AGENTS_KB_ROOT cannot see a value that arrives via KB_WRITE, which is
+-- what makes the assertion discriminating.
+--
+-- EVERY hop before the chosen one must be neutralised, and the isolation is
+-- ASSERTED BEFORE anything is written. The first cut of this section unset only
+-- AUTO_AGENTS_KB_ROOT, so KB_READ[0] — inherited from an agent environment —
+-- won the chain and the test wrote a Markdown review into the REAL knowledge
+-- base. Isolating one variable out of four is not isolation, and the guard
+-- below is what turns that from a silent leak into a failed fixture.
+do
+  local kb_root_before  = vim.env.AUTO_AGENTS_KB_ROOT
+  local kb_read_before  = vim.env.AUTO_AGENTS_KB_READ
+  local kb_write_before = vim.env.AUTO_AGENTS_KB_WRITE
+  local alt = sb .. "/kb-via-resolver"
+  vim.fn.mkdir(alt, "p")
+  vim.env.AUTO_AGENTS_KB_ROOT  = nil
+  vim.env.AUTO_AGENTS_KB_READ  = nil
+  vim.env.AUTO_AGENTS_KB_WRITE = alt
+
+  ok("[11] fixture: the variable the old code read is UNSET",
+    (vim.env.AUTO_AGENTS_KB_ROOT == nil or vim.env.AUTO_AGENTS_KB_ROOT == ""),
+    tostring(vim.env.AUTO_AGENTS_KB_ROOT))
+  local vok, vars = pcall(require, "auto-core.todo.vars")
+  ok("[11] fixture: auto-core's resolver is available", vok and type(vars.get) == "function")
+  local resolved = select(2, pcall(vars.get, "KB_ROOT"))
+  ok("[11] *** and it answers from a later hop in the chain ***",
+    resolved == alt, tostring(resolved))
+  -- FAIL-FAST: never exercise a real write against an unproven root. `sb` is
+  -- this suite's temp sandbox, so anything resolving outside it would be the
+  -- live knowledge base.
+  local isolated = type(resolved) == "string" and resolved:sub(1, #sb) == sb
+  ok("[11] *** the resolved root is INSIDE the sandbox — isolation proven first ***",
+    isolated, tostring(resolved))
+  if not isolated then
+    print("  ABORT [11]: refusing to write — the resolved KB root is outside the sandbox")
+  end
+
+  if isolated then
+
+    -- canonical_document with NO kb_root supplied: the unit that refused before.
+    local doc, derr = review.canonical_document({
+      reviewer_slug = "lector", revision = 1, slug = slug, topic = "resolver",
+      kb_root = nil,
+    })
+    ok("[11] canonical_document still requires an explicit root (it is pure)",
+      doc == nil and tostring(derr):find("KB_ROOT", 1, true) ~= nil, tostring(derr))
+
+    -- save_pair with NO kb_root: this is the path the panel takes.
+    local d2 = review.new({
+      owner = "yongjohnlee80", name = "proj", url = "git@github.com:yongjohnlee80/proj.git",
+      commit = sha2, reviewer = "lector", verdict = "comment",
+      summary = "written with AUTO_AGENTS_KB_ROOT unset",
+    })
+    d2.comments = { { path = "auth.go", line = 1, side = "RIGHT", severity = "nit",
+                      body = "resolved through auto-core, not the raw env" } }
+    d2.reviewer_slug = "lector"
+    local res, serr = review.save_pair(slug, d2, MD, { topic = "resolver" })
+    ok("[11] *** save_pair writes with NO kb_root and NO $AUTO_AGENTS_KB_ROOT ***",
+      res ~= nil and vim.fn.filereadable(res.json_path) == 1, tostring(serr))
+    ok("[11] *** and the Markdown landed under the RESOLVED root ***",
+      res ~= nil and res.md_path:sub(1, #alt) == alt, res and res.md_path)
+    ok("[11] the pair validates as a pair",
+      res ~= nil and select(1, review.validate_pair(
+        (review.describe(res.json_path) or {}), { kb_root = alt })) ~= nil,
+      res and res.md_path)
+
+    -- CONTROL: an explicit kb_root still wins over the resolver, so callers that
+    -- do supply one are unaffected.
+    local alt2 = sb .. "/kb-explicit"; vim.fn.mkdir(alt2, "p")
+    local d3 = review.new({
+      owner = "yongjohnlee80", name = "proj", url = "git@github.com:yongjohnlee80/proj.git",
+      commit = sha2, reviewer = "lector", verdict = "comment", summary = "explicit root",
+    })
+    d3.comments = {}
+    d3.reviewer_slug = "lector"
+    local res3 = review.save_pair(slug, d3, MD, { topic = "explicit", kb_root = alt2 })
+    ok("[11] *** CONTROL: an explicit kb_root still overrides the resolver ***",
+      res3 ~= nil and res3.md_path:sub(1, #alt2) == alt2, res3 and res3.md_path)
+
+  end
+
+  vim.env.AUTO_AGENTS_KB_ROOT  = kb_root_before
+  vim.env.AUTO_AGENTS_KB_READ  = kb_read_before
+  vim.env.AUTO_AGENTS_KB_WRITE = kb_write_before
+end
+
 vim.fn.delete(sb, "rf")
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail > 0 and 1 or 0)

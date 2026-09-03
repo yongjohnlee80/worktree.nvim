@@ -546,6 +546,41 @@ end
 
 M.sanitize_segment = _sanitize_segment
 
+---_kb_root resolves the knowledge-base root for a caller that did not supply
+---one, through auto-core's canonical variable resolver.
+---
+---It used to read `vim.env.AUTO_AGENTS_KB_ROOT` directly, and that is why the
+---repos panel could never write a review. That variable is injected into AGENT
+---spawn environments only, so the raw read succeeded for every agent and every
+---test and failed for the editor — the one caller a user drives. A caller that
+---forgot `kb_root` therefore lost the whole feature rather than a degraded path,
+---silently, in the one environment nothing exercises (2026-09-03).
+---
+---`auto-core.todo.vars` resolves `KB_ROOT` as `$AUTO_AGENTS_KB_ROOT` →
+---`$AUTO_AGENTS_KB_READ[0]` → `$AUTO_AGENTS_KB_WRITE` →
+---`auto-agents.kb.root()`, and that last hop exists precisely for "when the
+---panel runs in the parent nvim (not an agent)". Its FIRST hop is the env var
+---this replaced, so nothing an agent relied on changes — the chain only adds
+---the cases the raw read could not see.
+---
+---auto-core is already a hard dependency of this plugin, so this adds nothing
+---to the dependency graph. It deliberately does NOT reach for `auto-agents`:
+---auto-core owns that hop, and every auto-family plugin depends on auto-core
+---alone (Johno, 2026-09-03).
+---@return string?
+local function _kb_root()
+  local ok, vars = pcall(require, "auto-core.todo.vars")
+  if ok and type(vars) == "table" and type(vars.get) == "function" then
+    local okv, v = pcall(vars.get, "KB_ROOT")
+    if okv and type(v) == "string" and v ~= "" then return v end
+  end
+  -- An auto-core without the resolver: the raw variable is still better than
+  -- nothing, and is what an agent process has.
+  local env = vim.env.AUTO_AGENTS_KB_ROOT
+  if type(env) == "string" and env ~= "" then return env end
+  return nil
+end
+
 ---_repo_component is the `<repo>` half of the canonical document name.
 local function _repo_component(slug)
   local tail = tostring(slug or ""):match("__(.+)$") or tostring(slug or "")
@@ -612,7 +647,7 @@ function M.check_document_path(doc, opts)
   if type(doc) ~= "string" or doc == "" then
     return false, { "document missing — a review must name its primary Markdown" }
   end
-  local kb = opts.kb_root or vim.env.AUTO_AGENTS_KB_ROOT
+  local kb = opts.kb_root or _kb_root()
   if type(kb) ~= "string" or kb == "" then
     problems[#problems + 1] = "cannot resolve $KB_ROOT to contain the document"
   end
@@ -769,7 +804,7 @@ function M.save_pair(slug, review, content, opts)
   local sha = review.commit
   if type(sha) ~= "string" then return nil, "review.commit required" end
 
-  local kb = opts.kb_root or vim.env.AUTO_AGENTS_KB_ROOT
+  local kb = opts.kb_root or _kb_root()
 
   -- ── PREFLIGHT: everything knowable before a revision is won ──
   -- `document` is not set yet, so the schema is checked without the for_write
