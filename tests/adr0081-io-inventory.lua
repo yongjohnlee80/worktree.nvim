@@ -240,12 +240,16 @@ end
 print(("      delegate (must reach 0 by P6): %d   permitted: %d")
   :format(delegate_total, permitted_total))
 for phase, n in pairs(by_phase) do print(("        %s owns %d"):format(phase, n)) end
+-- The COUNT is the contract; the prose above quotes it, and a comment that
+-- disagrees with its own assertion is how a reader learns to ignore both. The
+-- explanatory sentence said "five" for a while after the sixth was pinned
+-- (lector r3 SF1), so the number now appears in the failure detail too.
 ok("[3] the remaining work is enumerated, not estimated",
   delegate_total == 0 and permitted_total == 6,
   ("delegate=%d permitted=%d — if a phase just landed, update this figure too")
     :format(delegate_total, permitted_total))
 -- AC1 IS MET, and by arithmetic: zero raw document-I/O calls remain in
--- worktree's production code. The five permitted ones are named and reasoned
+-- worktree's production code. The six permitted ones are named and reasoned
 -- above. If this number ever rises, the phase that raised it has to say why
 -- here, in the same commit.
 

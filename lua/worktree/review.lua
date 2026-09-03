@@ -570,13 +570,22 @@ end
 ---@param slug string
 ---@param revision integer
 ---@return string[] paths
+---@return string[] paths, boolean searched, string? why
 local function _orphan_documents(slug, revision)
   local kb = _kb_root()
   local out = {}
-  if type(kb) ~= "string" or kb == "" then return out end
+  -- "NOTHING FOUND" AND "COULD NOT LOOK" ARE DIFFERENT ANSWERS. Both returned
+  -- an empty list, so a `remove` whose KB root could not be resolved reported
+  -- ok=true / document_absent=true after fencing and deleting a malformed
+  -- projection, with the paired Markdown still on disk — the very outcome the
+  -- evidence was introduced to prevent (lector r3 MF1). The search status is a
+  -- second return, and the caller must branch on it.
+  if type(kb) ~= "string" or kb == "" then
+    return out, false, "the KB root could not be resolved, so no search was possible"
+  end
   local repo = _repo_component(slug)
   local rev = tonumber(revision)
-  if not rev then return out end
+  if not rev then return out, false, "the revision is not a number" end
   -- `<date>-<repo>-<topic>-r<N>-review.md` under `agents/<reviewer>/reviews/`.
   local pattern = ("%s/agents/*/reviews/*-r%d-review.md"):format(kb, rev)
   -- Through auto-core: this is a filesystem READ, and a delegate module that
@@ -589,7 +598,7 @@ local function _orphan_documents(slug, revision)
     if name:find("%-" .. vim.pesc(repo) .. "%-") then out[#out + 1] = path end
   end
   table.sort(out)
-  return out
+  return out, true, nil
 end
 
 ---canonical_document builds the ONE document path a review may carry.
@@ -1219,14 +1228,26 @@ function M.remove(slug, sha, revision)
     -- document that would pair with THIS revision. Zero candidates means
     -- nothing was left behind and the removal is complete; one or more means a
     -- real orphan, named in the failure.
-    local left = _orphan_documents(slug, rev)
+    local left, searched, why = _orphan_documents(slug, rev)
     detail.document_removed = false
     detail.json_removed, detail.fenced = true, true
     detail.describe_error = tostring(merr)
+    if not searched then
+      -- COULD NOT LOOK. Not the same as finding nothing: the document's fate
+      -- is genuinely unknown and the caller is told so, rather than being
+      -- reassured by an empty search that never ran.
+      detail.document_unknown = true
+      detail.document_search_failed = tostring(why or "unknown")
+      return false, ("the review JSON was removed and the revision fenced, but "
+        .. "it was MALFORMED (%s) and its Markdown could not be searched for "
+        .. "(%s), so a paired document may still exist"):format(
+          tostring(merr), tostring(why or "unknown")), detail
+    end
     if #left == 0 then
-      -- Nothing to leave behind. Success, with the malformed record noted so a
-      -- caller that wants to log it can.
+      -- Searched, and nothing is there. Success, with the malformed record
+      -- noted so a caller that wants to log it can.
       detail.document_absent = true
+      detail.document_searched = true
       return true, nil, detail
     end
     detail.document_unknown = true

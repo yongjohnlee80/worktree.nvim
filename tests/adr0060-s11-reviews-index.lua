@@ -647,6 +647,49 @@ do
         vim.fn.filereadable(review.tombstone_path(slug, sha2, res4.revision)) == 1)
     end
 
+    -- MF1 (r3): "could not look" is not "found nothing". With the KB root
+    -- unresolvable, the search cannot run -- and returning an empty list for
+    -- both cases meant a malformed pair was fenced, deleted, and reported as a
+    -- COMPLETE removal with its Markdown still on disk.
+    do
+      local d5 = review.new({ owner = "yongjohnlee80", name = "proj",
+        url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
+        reviewer = "lector", verdict = "comment", summary = "search failure" })
+      d5.reviewer_slug = "lector"
+      local res5 = review.save_pair(slug, d5, "# review\n\nbody\n",
+        { topic = "proj", kb_root = alt })
+      ok("[11] fixture: a second valid pair exists", res5 ~= nil)
+      vim.fn.writefile({ '{"document":' }, res5.json_path)
+
+      -- Make the KB root unresolvable for the duration.
+      local saved_kb  = vim.env.AUTO_AGENTS_KB_ROOT
+      local saved_rd  = vim.env.AUTO_AGENTS_KB_READ
+      local saved_wr  = vim.env.AUTO_AGENTS_KB_WRITE
+      vim.env.AUTO_AGENTS_KB_ROOT, vim.env.AUTO_AGENTS_KB_READ,
+        vim.env.AUTO_AGENTS_KB_WRITE = nil, nil, nil
+      local sok, serr, sdetail = review.remove(slug, sha2, res5.revision)
+      vim.env.AUTO_AGENTS_KB_ROOT, vim.env.AUTO_AGENTS_KB_READ,
+        vim.env.AUTO_AGENTS_KB_WRITE = saved_kb, saved_rd, saved_wr
+
+      ok("[11] *** MF1: a search that could NOT RUN is not a clean removal ***",
+        sok == false and sdetail ~= nil and sdetail.document_unknown == true
+        and sdetail.document_absent ~= true, vim.inspect(sdetail))
+      ok("[11] MF1: and it says the search itself failed",
+        sdetail.document_search_failed ~= nil
+        and tostring(serr):find("could not be searched", 1, true) ~= nil,
+        tostring(serr))
+      ok("[11] MF1: the Markdown really is still there",
+        vim.fn.filereadable(res5.md_path) == 1)
+      ok("[11] CONTROL — with the KB resolvable, the same shape SEARCHES",
+        (function()
+          -- Same malformed situation, KB available: the search runs and finds
+          -- the real orphan, so this is about the search STATUS and not about
+          -- malformed records always failing.
+          local _, _, d6 = review.remove(slug, sha2, res5.revision)
+          return d6 == nil or d6.document_search_failed == nil
+        end)())
+    end
+
     -- A DIRECTORY at the document's path is not a primary review.
     -- `validate_pair` distinguishes "absent" from "present but not a regular
     -- file", and nothing exercised the second branch -- deleting it changed no
