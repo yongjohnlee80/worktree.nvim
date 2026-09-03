@@ -477,7 +477,7 @@ function M.save(slug, review, opts)
     -- stat-then-replacing-write, so two writers that both observed absence both
     -- returned success and the later rename destroyed the earlier review.
     -- Reproduced with a real second process. The exclusive create IS the gate.
-    local ok_enc, encoded = pcall(vim.json.encode, review)
+    local ok_enc, encoded = pcall(store.encode_pretty, review)
     if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
     local claimed, cerr = store.create_exclusive(path, encoded)
     if claimed then return path, nil end
@@ -519,7 +519,7 @@ function M.save_next(slug, review, opts)
     end
 
     local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, review.commit, rev)
-    local ok_enc, encoded = pcall(vim.json.encode, review)
+    local ok_enc, encoded = pcall(store.encode_pretty, review)
     if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
 
     local claimed, err = store.create_exclusive(path, encoded)
@@ -877,7 +877,9 @@ function M.save_pair(slug, review, content, opts)
           M.retire(slug, sha, rev, token)
           return nil, "invalid review: " .. table.concat(vproblems, "; ")
         end
-        local ok_enc, encoded = pcall(vim.json.encode, review)
+        -- Pretty, stable-ordered JSON: the reviewer opens this file, and a
+        -- store diffs cleanly across rewrites (Johno, 2026-09-03).
+        local ok_enc, encoded = pcall(store.encode_pretty, review)
         if not ok_enc then
           M.retire(slug, sha, rev, token)
           return nil, "encode failed: " .. tostring(encoded)
@@ -1055,6 +1057,14 @@ function M.describe(path)
   meta.verdict  = type(data.verdict) == "string" and data.verdict or nil
   meta.summary  = type(data.summary) == "string" and data.summary or nil
   meta.document = type(data.document) == "string" and data.document or nil
+  -- `reviewer_slug` and `repo` are part of the record, and a projection that
+  -- drops them cannot be used to VALIDATE anything: `validate_pair` rejects a
+  -- described record for exactly this reason (lector, worktree#6 r0), and the
+  -- pair-deletion check of ADR-0081 §2.3a needs the reviewer slug to rebuild the
+  -- canonical document path. Projecting them keeps the described record usable
+  -- for validation instead of only for display.
+  meta.reviewer_slug = type(data.reviewer_slug) == "string" and data.reviewer_slug or nil
+  meta.repo = type(data.repo) == "table" and data.repo or nil
   if type(data.revision) == "number" and rev and data.revision ~= rev then
     meta.revision_mismatch = data.revision
   end
@@ -1154,6 +1164,74 @@ function M.remove(slug, sha, revision)
     return false, "the revision is fenced but the file could not be deleted: "
       .. tostring(uerr or "unknown"), detail
   end
+
+  -- The PAIR is deleted, not just the projection (Johno, 2026-09-03: the two
+  -- files ARE one review). ADR-0081 §2.3a governs the ordering and the honesty
+  -- of a partial result.
+  --
+  -- The document path is VALIDATED before it is touched. `describe()` is
+  -- deliberately tolerant, so it will surface the `document` field of a
+  -- malformed or TAMPERED JSON — and the first cut of this code handed that
+  -- value straight to `fs_unlink`, which made a review file whose `document`
+  -- pointed anywhere on disk into an arbitrary file deletion (lector, ADR-0081
+  -- MF1). A tolerantly-parsed field must never reach an unlink. So the claimed
+  -- document must be exactly the canonical paired document for THIS review:
+  -- same reviewer slug, same repo component, same revision, contained under the
+  -- resolved KB root. Anything else is refused and reported as an orphan — the
+  -- projection is still removed and the revision still fenced, because those
+  -- are already done and correct.
+  local doc = meta and meta.document
+  if type(doc) ~= "string" or doc == "" then
+    detail.document_absent = true
+    detail.document_removed = false
+  else
+    -- Validate with the DOMAIN validator that already exists, rather than
+    -- rebuilding the filename grammar here. `check_document_path` is written for
+    -- exactly this: normalised containment under `$KB_ROOT/agents/<reviewer>/
+    -- reviews/`, the `<date>-<repo>-<topic>-r<N>-review.md` shape, agreement of
+    -- the repo component, and agreement of the revision — which is MF1's
+    -- requirement verbatim.
+    --
+    -- My first cut re-derived the date and topic from the filename and compared
+    -- against `canonical_document`. It rejected every VALID pair, because the
+    -- greedy topic capture swallowed the repo component too. Re-implementing a
+    -- grammar that already has a validator is how that happens.
+    local dok, dproblems = M.check_document_path(doc, {
+      kb_root = _kb_root(), reviewer_slug = meta.reviewer_slug,
+      slug = slug, revision = rev,
+    })
+    local cerr = (not dok) and table.concat(dproblems or {}, "; ") or nil
+    if dok then
+      if uv.fs_stat(doc) then
+        local dok, derr = uv.fs_unlink(doc)
+        detail.document_removed = dok and true or false
+        if not dok then
+          -- HALF a pair is not success. The JSON is gone and the revision is
+          -- fenced, but the promised artifacts are not all removed, so the
+          -- caller is told so explicitly (§2.3a step 4).
+          detail.json_removed, detail.fenced = true, true
+          detail.document_error = tostring(derr or "unknown")
+          return false, ("the review JSON was removed and the revision fenced, but "
+            .. "its Markdown could not be deleted (%s). It remains at %s")
+            :format(tostring(derr or "unknown"), doc), detail
+        end
+      else
+        detail.document_removed = false
+        detail.document_absent = true
+      end
+    else
+      -- Not this review's canonical document: refuse to touch it, and say so.
+      detail.document_removed = false
+      detail.document_refused = doc
+      detail.document_refusal = cerr
+        or "the recorded document is not this review's canonical paired path"
+      detail.json_removed, detail.fenced = true, true
+      return false, ("the review JSON was removed and the revision fenced, but the "
+        .. "recorded document was NOT deleted: %s (%s)")
+        :format(doc, detail.document_refusal), detail
+    end
+  end
+  detail.json_removed, detail.fenced = true, true
   return true, nil, detail
 end
 

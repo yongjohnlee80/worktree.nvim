@@ -142,10 +142,62 @@ end
 ---@param path string
 ---@param value any
 ---@return boolean ok, string? err
+---encode_pretty renders a value as INDENTED JSON with stable key order.
+---
+---`vim.json.encode` produces a single minified line with keys in hash order —
+---fine for a wire format, poor for a file a human opens and a git history that
+---should diff cleanly. A review store holds tens of small documents, not
+---millions, so the few extra bytes buy readability and a stable order across
+---rewrites (Johno, 2026-09-03).
+---
+---Two-space indent, keys sorted, arrays kept in order. It handles exactly the
+---JSON value shapes a review carries — table, string, number, boolean, nil — and
+---leans on `vim.json.encode` for scalar escaping so string quoting stays
+---correct. `vim.json.encode(nil)` yields "null", so an explicit nil check keeps
+---an absent field from becoming the string "null".
+---@param value any
+---@param indent string?  internal — current indentation
+---@return string
+function M.encode_pretty(value, indent)
+  indent = indent or ""
+  local child = indent .. "  "
+  local t = type(value)
+  if t == "table" then
+    -- An array iff its keys are exactly 1..n with no holes.
+    local n, is_array = 0, true
+    for k in pairs(value) do
+      n = n + 1
+      if type(k) ~= "number" then is_array = false end
+    end
+    if is_array and n == #value then
+      if n == 0 then return "[]" end
+      local parts = {}
+      for _, v in ipairs(value) do
+        parts[#parts + 1] = child .. M.encode_pretty(v, child)
+      end
+      return "[\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "]"
+    end
+    local keys = {}
+    for k in pairs(value) do keys[#keys + 1] = tostring(k) end
+    if #keys == 0 then return "{}" end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+      parts[#parts + 1] = child .. vim.json.encode(k) .. ": "
+        .. M.encode_pretty(value[k], child)
+    end
+    return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
+  end
+  -- Scalars: let vim.json.encode handle escaping and number/bool formatting.
+  return vim.json.encode(value)
+end
+
+---write_json writes `value` as pretty, stable-ordered JSON.
 function M.write_json(path, value)
   if not path or path == "" then return false, "no path" end
-  local ok_enc, encoded = pcall(vim.json.encode, value)
+  local ok_enc, encoded = pcall(M.encode_pretty, value)
   if not ok_enc then return false, "encode failed: " .. tostring(encoded) end
+  encoded = encoded .. "\n"
   if not M.ensure_dir(vim.fn.fnamemodify(path, ":h")) then
     return false, "could not create " .. vim.fn.fnamemodify(path, ":h")
   end
