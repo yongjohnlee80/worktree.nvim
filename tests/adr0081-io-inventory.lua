@@ -80,6 +80,33 @@ local INVENTORY = {
       .. " move to auto-core is a separate decision, deliberately not folded into ADR-0081.",
     calls = { fs_stat = 1, ["io.open"] = 2, mkdir = 1, ["os.remove"] = 1 },
   },
+  ["credentials.lua"] = {
+    scope = "permitted", phase = nil,
+    why = "CREDENTIAL STORAGE (ADR-0083 §2.5.1/§2.5.2): mode-0600 worktree-auth.json and"
+      .. " exclusive ephemeral curl config for header isolation. Not a review artifact or draft.",
+    calls = {
+      fs_chmod = 1,
+      fs_close = 2,
+      fs_fstat = 1,
+      fs_open = 1,
+      fs_unlink = 2,
+      fs_write = 1,
+    },
+  },
+  ["pr.lua"] = {
+    scope = "permitted", phase = nil,
+    why = "PR RECEIPT & LOCK STORE (ADR-0083 §2.6 Action 4): exclusive file locking with"
+      .. " live-owner immunity and atomic receipt persistence. Not a review artifact or draft.",
+    calls = {
+      fs_close = 1,
+      fs_open = 2,
+      fs_rename = 1,
+      fs_unlink = 3,
+      fs_write = 1,
+      readfile = 1,
+      ["vim.fn.globpath"] = 1,
+    },
+  },
 }
 
 -- ── SCAN ──
@@ -245,11 +272,11 @@ for phase, n in pairs(by_phase) do print(("        %s owns %d"):format(phase, n)
 -- explanatory sentence said "five" for a while after the sixth was pinned
 -- (lector r3 SF1), so the number now appears in the failure detail too.
 ok("[3] the remaining work is enumerated, not estimated",
-  delegate_total == 0 and permitted_total == 6,
+  delegate_total == 0 and permitted_total == 24,
   ("delegate=%d permitted=%d — if a phase just landed, update this figure too")
     :format(delegate_total, permitted_total))
 -- AC1 IS MET, and by arithmetic: zero raw document-I/O calls remain in
--- worktree's production code. The six permitted ones are named and reasoned
+-- worktree's production code. The twenty-four permitted ones are named and reasoned
 -- above. If this number ever rises, the phase that raised it has to say why
 -- here, in the same commit.
 

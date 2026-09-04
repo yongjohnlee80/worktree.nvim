@@ -1096,6 +1096,7 @@ function M.describe(path)
   -- for validation instead of only for display.
   meta.reviewer_slug = type(data.reviewer_slug) == "string" and data.reviewer_slug or nil
   meta.repo = type(data.repo) == "table" and data.repo or nil
+  meta.pr = (data.pr ~= nil) and data.pr or nil
   if type(data.revision) == "number" and rev and data.revision ~= rev then
     meta.revision_mismatch = data.revision
   end
