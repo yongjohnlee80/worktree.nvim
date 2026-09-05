@@ -24,14 +24,39 @@ local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
 -- or worse, pass while exercising a different copy of the code.
 local siblings = vim.fn.fnamemodify(plugin_root, ":h:h")
 local branch_dir = vim.fn.fnamemodify(plugin_root, ":t")
+-- Pick ONE auto-core. Later candidates still win (a same-branch sibling beats
+-- a generic checkout), but only among those that can actually SERVE the
+-- request: worktree.store delegates to auto-core.docstore (ADR-0081 P4a), and
+-- repos.lua calls git.log.unpushed. An auto-core predating those is not an
+-- older dependency, it is one that cannot answer at all.
+--
+-- The hazard the comment above warns about is exactly what happened: a stale
+-- `auto-core.nvim/main` sibling won over a current lazy copy, and this suite
+-- aborted mid-run on `attempt to call field 'unpushed' (a nil value)` -- a
+-- silent partial run, on a machine where a perfectly good auto-core sat
+-- earlier in this very list.
+local function ac_serves(p)
+  return vim.fn.isdirectory(p .. "/lua/auto-core/docstore") == 1
+    or vim.fn.filereadable(p .. "/lua/auto-core/docstore.lua") == 1
+end
+local AUTO_CORE
 for _, p in ipairs({
-  LAZY .. "/plenary.nvim",
   LAZY .. "/auto-core.nvim",
   siblings .. "/auto-core.nvim/main",
   siblings .. "/auto-core.nvim/" .. branch_dir,
-  plugin_root,
 }) do
   if vim.fn.isdirectory(p) == 1 then
+    -- qualifying candidates win outright; otherwise keep the first seen so a
+    -- genuine absence still fails loudly rather than silently skipping.
+    if ac_serves(p) or not AUTO_CORE then AUTO_CORE = p end
+  end
+end
+for _, p in ipairs({
+  LAZY .. "/plenary.nvim",
+  AUTO_CORE,
+  plugin_root,
+}) do
+  if p and vim.fn.isdirectory(p) == 1 then
     vim.opt.runtimepath:prepend(p)
   end
 end
