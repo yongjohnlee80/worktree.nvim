@@ -408,6 +408,94 @@ do
     vim.fn.filereadable(resB.json_path) == 1 and vim.fn.filereadable(b_tomb) == 0)
   vim.fn.delete(decoy)
 
+  -- ── STUBBED ISOLATION: repos.remove_review's frontend identity block ──
+  -- Both the frontend (repos.remove_review) and the primitive (review.remove_path)
+  -- refuse a cross-repo decoy, so without stubbing the delegate, mutating the
+  -- frontend guard leaves the suite green (lector r1 note). The frontend is kept
+  -- because it can say WHICH repo was confused (diagnosis argument); stubbing
+  -- review.remove_path isolates the frontend so that "refused BEFORE delegating"
+  -- is directly observable and falsifiable under single-guard mutation.
+  do
+    local orig_remove_path = review.remove_path
+    local calls = {}
+    local pcall_ok, pcall_err = pcall(function()
+      review.remove_path = function(...)
+        calls[#calls + 1] = { ... }
+        return true, nil
+      end
+
+      -- 1. Cross-repo decoy: in repo A's store, named for repo B.
+      local decoy_name = review.filename(slugB, shaB, resB.revision)
+      local s_ok, s_err = repos.remove_review(repoA, decoy)
+      ok("[9] *** stubbed: frontend REFUSES cross-repo decoy before delegating ***",
+        s_ok == false and #calls == 0,
+        ("ok=%s calls=%d err=%s"):format(tostring(s_ok), #calls, tostring(s_err)))
+      ok("[9] stubbed: frontend error matches EXACT slug-mismatch message",
+        s_err == ("this review is named for %s, not %s: %s"):format(slugB, repoA.slug, decoy_name),
+        tostring(s_err))
+
+      -- 2. Symmetric case: in repo B's store, named for repo A.
+      local nameA = review.filename(slug, sha1, 1)
+      local decoyB = store.reviews_dir(slugB) .. "/" .. nameA
+      local sym_ok, sym_err = repos.remove_review(repoB, decoyB)
+      ok("[9] *** stubbed: symmetric case (in B named for A) refused before delegating ***",
+        sym_ok == false and #calls == 0,
+        ("ok=%s calls=%d err=%s"):format(tostring(sym_ok), #calls, tostring(sym_err)))
+      ok("[9] stubbed: symmetric error matches EXACT slug-mismatch message",
+        sym_err == ("this review is named for %s, not %s: %s"):format(slug, repoB.slug, nameA),
+        tostring(sym_err))
+
+      -- 3. Canonical-mismatch: in repo A's store, named for repo A, but non-canonical path (nested).
+      local sub_dir = store.reviews_dir(slug) .. "/subdir"
+      vim.fn.mkdir(sub_dir, "p")
+      local canon_bad = sub_dir .. "/" .. nameA
+      local resolved_bad = vim.fn.resolve(vim.fn.fnamemodify(canon_bad, ":p"))
+      local cm_ok, cm_err = repos.remove_review(repoA, canon_bad)
+      ok("[9] *** stubbed: canonical-mismatch path refused before delegating ***",
+        cm_ok == false and #calls == 0,
+        ("ok=%s calls=%d err=%s"):format(tostring(cm_ok), #calls, tostring(cm_err)))
+      ok("[9] stubbed: canonical-mismatch error matches EXACT frontend message (not primitive's)",
+        cm_err == "refusing: not this review's canonical location: " .. resolved_bad,
+        tostring(cm_err))
+      vim.fn.delete(sub_dir, "d")
+
+      -- 4. Unparseable review filename inside the store.
+      local unparseable = store.reviews_dir(slug) .. "/not-a-review.json"
+      local unp_ok, unp_err = repos.remove_review(repoA, unparseable)
+      ok("[9] stubbed: unparseable filename refused before delegating",
+        unp_ok == false and #calls == 0,
+        ("ok=%s calls=%d err=%s"):format(tostring(unp_ok), #calls, tostring(unp_err)))
+      ok("[9] stubbed: unparseable filename error matches EXACT message",
+        unp_err == "not a review filename: not-a-review.json",
+        tostring(unp_err))
+
+      -- 5. Outside store and traversal boundaries do not reach the delegate.
+      local outside_s9 = sb .. "/outside-s9.review.json"
+      vim.fn.writefile({ "{}" }, outside_s9)
+      local trav_s9 = store.reviews_dir(slug) .. "/../../outside-s9.review.json"
+      local out_ok, _ = repos.remove_review(repoA, outside_s9)
+      local trav_ok, _ = repos.remove_review(repoA, trav_s9)
+      ok("[9] stubbed: outside-store path refused before delegating",
+        out_ok == false and #calls == 0)
+      ok("[9] stubbed: traversal path refused before delegating",
+        trav_ok == false and #calls == 0)
+      vim.fn.delete(outside_s9)
+
+      -- 6. POSITIVE CONTROL: genuine canonical review reaches the delegate exactly once.
+      local pos_ok, pos_err = repos.remove_review(repoB, resB.json_path)
+      ok("[9] *** stubbed POSITIVE CONTROL: canonical review reaches delegate ***",
+        pos_ok == true and #calls == 1,
+        ("ok=%s calls=%d err=%s"):format(tostring(pos_ok), #calls, tostring(pos_err)))
+      ok("[9] stubbed POSITIVE CONTROL: delegate received resolved canonical path",
+        calls[1] and calls[1][1] == vim.fn.resolve(vim.fn.fnamemodify(resB.json_path, ":p")))
+      ok("[9] stubbed POSITIVE CONTROL: produces no identity error",
+        pos_err == nil and not tostring(pos_err):find("named for", 1, true))
+    end)
+    -- Restore must survive any failure/error in the test block.
+    review.remove_path = orig_remove_path
+    if not pcall_ok then error(pcall_err) end
+  end
+
   -- CONTROL: the guard is not a blanket refusal — B's own review is still
   -- removable through B. Without this, every assertion above would also pass
   -- if `remove_review` had simply stopped working.
