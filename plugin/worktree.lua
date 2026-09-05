@@ -117,6 +117,32 @@ vim.api.nvim_create_user_command("WorktreePostPRFeedback", function(opts)
   end
 end, { nargs = "?", desc = "Worktree: post review feedback to PR (ADR-0083)" })
 
+vim.api.nvim_create_user_command("WorktreeRecoverPRLock", function(opts)
+  local pr_mod = require("worktree.pr")
+  local repo_mod = require("worktree.repos")
+  local repos = repo_mod.repos()
+  local r = repos and repos[1]
+  local forge, owner, name = pr_mod.parse_remote_url(r and r.url or "")
+  local repo_slug = (owner and name) and (owner .. "/" .. name) or (r and r.slug or "repo")
+  local pr_num = tonumber(opts.args)
+  local force = opts.bang
+  local function go(num)
+    local ok, err = pr_mod.recover_lock(forge or "github", repo_slug, num, { force = force })
+    if ok then
+      vim.notify(string.format("worktree: recovered lock for PR #%s", tostring(num)), vim.log.levels.INFO)
+    else
+      vim.notify(string.format("worktree: failed to recover lock for PR #%s: %s", tostring(num), tostring(err)), vim.log.levels.ERROR)
+    end
+  end
+  if pr_num then
+    go(pr_num)
+  else
+    vim.ui.input({ prompt = "Recover lock for PR #: " }, function(input)
+      if input and input ~= "" then go(tonumber(input) or input) end
+    end)
+  end
+end, { bang = true, nargs = "?", desc = "Worktree: recover stale PR review lock (ADR-0083)" })
+
 -- Capture the startup cwd as the workspace root.
 --
 -- Two paths because lazy.nvim can source plugin/ either BEFORE

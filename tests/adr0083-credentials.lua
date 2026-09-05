@@ -42,11 +42,24 @@ vim.fn.mkdir(tmp_dir, "p")
 local test_auth_path = tmp_dir .. "/test-worktree-auth.json"
 creds._custom_config_path = test_auth_path
 
--- 1. Default allowlist validation
+-- 1. Default allowlist validation (MF2)
 for _, cmd in ipairs({ "pass", "op", "gh", "secret-tool", "keyctl", "security" }) do
   ok("default allowlist contains " .. cmd, creds.is_allowlisted(cmd) == true)
-  ok("default allowlist matches full path /usr/bin/" .. cmd, creds.is_allowlisted("/usr/bin/" .. cmd) == true)
+  local sys = vim.fn.exepath(cmd)
+  if sys ~= "" then
+    ok("default allowlist matches real system path " .. sys, creds.is_allowlisted(sys) == true)
+  end
 end
+
+-- Gold's exact execution matrix (MF2)
+ok("MF2: cat is rejected", creds.is_allowlisted("cat") == false)
+ok("MF2: echo is rejected", creds.is_allowlisted("echo") == false)
+ok("MF2: gopass is rejected", creds.is_allowlisted("gopass") == false)
+ok("MF2: bw is rejected", creds.is_allowlisted("bw") == false)
+ok("MF2: /tmp/evil/pass is rejected", creds.is_allowlisted("/tmp/evil/pass") == false)
+ok("MF2: /home/johno/evil/gh is rejected", creds.is_allowlisted("/home/johno/evil/gh") == false)
+ok("MF2: ./pass is rejected", creds.is_allowlisted("./pass") == false)
+ok("MF2: ../../../tmp/pass is rejected", creds.is_allowlisted("../../../tmp/pass") == false)
 
 ok("unallowlisted executable is rejected by is_allowlisted", creds.is_allowlisted("curl") == false)
 ok("shell is rejected by is_allowlisted", creds.is_allowlisted("sh") == false)
@@ -95,6 +108,7 @@ local helper_script = tmp_dir .. "/gh"
 vim.fn.writefile({ "#!/bin/sh", "echo 'token_cmd_999'" }, helper_script)
 vim.fn.system({ "chmod", "+x", helper_script })
 
+config.setup({ auth = { allowed_command_providers = { helper_script } } })
 creds.set_profile("cmd-slug", { kind = "command", argv = { helper_script, "auth", "token" } })
 local cmd_token, cmd_err = creds.resolve_token("cmd-slug")
 ok("allowlisted command resolves token correctly", cmd_token == "token_cmd_999", cmd_err)
@@ -126,6 +140,24 @@ ok("cleanup function removed ephemeral curl config file", vim.fn.filereadable(cf
 local leaked = "Error 401: Authorization: Bearer secret_pat_12345 invalid"
 local redacted = creds.redact(leaked)
 ok("redact strips bearer token", redacted == "Error 401: Authorization: Bearer [REDACTED] invalid", redacted)
+
+-- 11. Spawned argv non-disclosure inspection (ADR §2.5.2 MUST)
+local spawned_calls = {}
+local real_system = vim.system
+vim.system = function(cmd, opts, on_exit)
+  table.insert(spawned_calls, { cmd = cmd, opts = opts })
+  return real_system(cmd, opts, on_exit)
+end
+
+creds.set_profile("canary-cmd", { kind = "command", argv = { helper_script, "get-pat" } })
+local can_token = creds.resolve_token("canary-cmd")
+ok("MF3: resolve_token executed spawned helper", #spawned_calls >= 1)
+local last_call = spawned_calls[#spawned_calls]
+ok("MF3: spawned command array matches configured argv", last_call.cmd[1] == helper_script)
+for _, arg in ipairs(last_call.cmd) do
+  ok("MF3: argument does not leak resolved secret token", arg:find("token_cmd_999", 1, true) == nil)
+end
+vim.system = real_system
 
 -- Cleanup scratch dir
 vim.fn.delete(tmp_dir, "rf")

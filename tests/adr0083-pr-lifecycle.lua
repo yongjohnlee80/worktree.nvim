@@ -83,7 +83,7 @@ ok("error names active PID and PR number",
 lock1:release()
 ok("release removes lock file", vim.fn.filereadable(lock1.path) == 0)
 
--- Dead-owner eviction: simulate lock left by dead process PID 99999999
+-- Dead-owner handling: simulate lock left by dead process PID 99999999
 local dead_lock_path = pr_mod._lock_path("github", "test-repo", 42)
 local dead_payload = vim.json.encode({
   owner_token = "dead_owner_123",
@@ -95,9 +95,37 @@ local dead_payload = vim.json.encode({
 vim.fn.writefile({ dead_payload }, dead_lock_path)
 vim.uv.fs_chmod(dead_lock_path, 384)
 
+-- MF1: Automatic reclaim is disabled to eliminate check-then-act race (concurrency-testing §3).
+-- Both contenders fail closed and neither deletes the dead lock behind each other's back.
+local a_ok, a_err = pcall(function() pr_mod.acquire_lock("github", "test-repo", 42) end)
+ok("MF1: acquire_lock fails closed on dead owner lock", a_ok == false)
+ok("MF1: error reports dead process and manual recovery",
+  a_err and a_err:find("dead/stale process PID 99999999", 1, true) ~= nil
+  and a_err:find(":WorktreeRecoverPRLock", 1, true) ~= nil,
+  a_err)
+ok("MF1: dead owner lock is NOT unlinked by acquire_lock", vim.fn.filereadable(dead_lock_path) == 1)
+
+local b_ok, b_err = pcall(function() pr_mod.acquire_lock("github", "test-repo", 42) end)
+ok("MF1: second contender also fails closed on dead owner lock", b_ok == false)
+ok("MF1: dead owner lock remains intact after competing contention", vim.fn.filereadable(dead_lock_path) == 1)
+
+-- recover_lock: recovers dead lock cleanly
+local rec_ok, rec_err = pr_mod.recover_lock("github", "test-repo", 42)
+ok("MF1: recover_lock successfully removes dead owner lock", rec_ok == true, rec_err)
+ok("MF1: lock file removed by recover_lock", vim.fn.filereadable(dead_lock_path) == 0)
+
+-- Now acquire succeeds cleanly
 local lock2 = pr_mod.acquire_lock("github", "test-repo", 42)
-ok("dead owner lock was safely evicted and acquired by contender", lock2 ~= nil and lock2.owner_token ~= "dead_owner_123")
-lock2:release()
+ok("acquire succeeds after recover_lock", lock2 ~= nil)
+
+-- recover_lock refuses to remove live process lock without force
+local rec_live_ok, rec_live_err = pr_mod.recover_lock("github", "test-repo", 42)
+ok("MF1: recover_lock refuses to remove active process lock", rec_live_ok == false)
+ok("MF1: active lock remains intact", vim.fn.filereadable(lock2.path) == 1)
+-- with force = true, operator can override
+local rec_force_ok = pr_mod.recover_lock("github", "test-repo", 42, { force = true })
+ok("MF1: recover_lock with force=true removes active lock", rec_force_ok == true)
+ok("MF1: lock file removed after forced recovery", vim.fn.filereadable(lock2.path) == 0)
 
 -- Compare-and-delete release safety
 local lock3 = pr_mod.acquire_lock("github", "test-repo", 42)
@@ -224,6 +252,66 @@ local test_rev_doc = {
 ok("dissociate_review detects matching PR", pr_mod.dissociate_review(test_rev_doc, 42) == true)
 ok("dissociate_review removes pr field", test_rev_doc.pr == nil)
 ok("dissociate_review returns false when pr is already nil", pr_mod.dissociate_review(test_rev_doc, 42) == false)
+
+-- 7. Spawned argv non-disclosure inspection for _http_request (ADR §2.5.2 MUST)
+pr_mod._mock_http = nil -- clear mock to exercise real curl transport
+local canary_token = "CANARY_PAT_SECRET_9876543210"
+local curl_spawned = nil
+local real_sys = vim.system
+local inspected_cfg_mode = nil
+local inspected_cfg_text = nil
+
+vim.system = function(cmd, opts, on_exit)
+  if cmd[1] == "curl" then
+    curl_spawned = { cmd = cmd, opts = opts }
+    -- Locate -K flag and verify ephemeral config permissions before synchronous deletion
+    for i, c in ipairs(cmd) do
+      if c == "-K" and cmd[i + 1] then
+        local st = vim.uv.fs_stat(cmd[i + 1])
+        if st then
+          inspected_cfg_mode = bit.band(st.mode, 511)
+          local ok_r, l = pcall(vim.fn.readfile, cmd[i + 1])
+          if ok_r and l then
+            inspected_cfg_text = table.concat(l, "\n")
+          end
+        end
+      end
+    end
+    -- Return synthetic 200 response with http_code appended
+    local obj = {
+      wait = function()
+        return { code = 0, stdout = '{"message":"ok"}\n200', stderr = "" }
+      end
+    }
+    return obj
+  end
+  return real_sys(cmd, opts, on_exit)
+end
+
+local code, body = pr_mod._http_request("POST", "https://api.github.com/repos/owner/test-repo/issues", canary_token, '{"title":"test"}')
+vim.system = real_sys
+
+ok("MF3: _http_request invoked curl via vim.system", curl_spawned ~= nil)
+ok("MF3: response parsed correctly", code == 200 and body:find('"ok"', 1, true) ~= nil)
+if curl_spawned then
+  local token_found_in_argv = false
+  for _, arg in ipairs(curl_spawned.cmd) do
+    if arg:find(canary_token, 1, true) ~= nil then
+      token_found_in_argv = true
+    end
+  end
+  ok("MF3: argv array does NOT disclose canary secret token", token_found_in_argv == false)
+  local has_k = false
+  for _, arg in ipairs(curl_spawned.cmd) do
+    if arg == "-K" then has_k = true end
+  end
+  ok("MF3: -K flag is used for credentials header", has_k == true)
+  ok("MF3: ephemeral config file has mode 0600 (384)", inspected_cfg_mode == 384, tostring(inspected_cfg_mode))
+  ok("MF3: ephemeral config file transmitted bearer token safely",
+    inspected_cfg_text and inspected_cfg_text:find("Authorization: Bearer " .. canary_token, 1, true) ~= nil)
+  ok("MF3: body streamed via stdin --data-binary @-",
+    curl_spawned.opts and curl_spawned.opts.stdin == '{"title":"test"}')
+end
 
 -- Cleanup
 vim.fn.delete(tmp_dir, "rf")

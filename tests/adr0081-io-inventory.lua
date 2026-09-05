@@ -96,12 +96,12 @@ local INVENTORY = {
   ["pr.lua"] = {
     scope = "permitted", phase = nil,
     why = "PR RECEIPT & LOCK STORE (ADR-0083 §2.6 Action 4): exclusive file locking with"
-      .. " live-owner immunity and atomic receipt persistence. Not a review artifact or draft.",
+      .. " live-owner immunity, fail-closed dead-owner recovery (ADR-0083 r1 MF1), and atomic receipt persistence.",
     calls = {
       fs_close = 1,
-      fs_open = 2,
+      fs_open = 1,
       fs_rename = 1,
-      fs_unlink = 3,
+      fs_unlink = 5,
       fs_write = 1,
       readfile = 1,
       ["vim.fn.globpath"] = 1,
@@ -272,11 +272,11 @@ for phase, n in pairs(by_phase) do print(("        %s owns %d"):format(phase, n)
 -- explanatory sentence said "five" for a while after the sixth was pinned
 -- (lector r3 SF1), so the number now appears in the failure detail too.
 ok("[3] the remaining work is enumerated, not estimated",
-  delegate_total == 0 and permitted_total == 24,
+  delegate_total == 0 and permitted_total == 25,
   ("delegate=%d permitted=%d — if a phase just landed, update this figure too")
     :format(delegate_total, permitted_total))
 -- AC1 IS MET, and by arithmetic: zero raw document-I/O calls remain in
--- worktree's production code. The twenty-four permitted ones are named and reasoned
+-- worktree's production code. The twenty-five permitted ones are named and reasoned
 -- above. If this number ever rises, the phase that raised it has to say why
 -- here, in the same commit.
 

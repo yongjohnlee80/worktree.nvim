@@ -121,12 +121,12 @@ function M.acquire_lock(forge, repo_slug, pr_number)
       ))
     end
 
-    -- Dead owner (ESRCH): break lock and retry acquire
-    pcall(vim.uv.fs_unlink, lock_path)
-    fd = vim.uv.fs_open(lock_path, "wx", 384)
-    if not fd then
-      error("worktree.pr: failed to acquire lock after breaking dead lock at " .. lock_path)
-    end
+    -- Dead owner (ESRCH): fail closed. Automatic reclaim by pathname unlink is a
+    -- check-then-act race (concurrency-testing §3, MF1). Manual operator recovery required.
+    error(string.format(
+      "worktree.pr: PR #%s review posting locked by dead/stale process PID %d (owner %s) on %s; automatic reclaim disabled. Manual recovery required (remove %s or run :WorktreeRecoverPRLock)",
+      tostring(pr_number), lock_data.pid, tostring(lock_data.owner_token), tostring(lock_data.host or my_host), lock_path
+    ))
   end
 
   local lock_payload = vim.json.encode({
@@ -170,6 +170,48 @@ function M.acquire_lock(forge, repo_slug, pr_number)
   end
 
   return handle
+end
+
+---recover_lock explicitly removes a stale lock file after verifying the owner is dead (or forced).
+---@param forge string
+---@param repo_slug string
+---@param pr_number integer|string
+---@param opts table? { force: boolean? }
+---@return boolean ok, string? err
+function M.recover_lock(forge, repo_slug, pr_number, opts)
+  opts = opts or {}
+  local lock_path = M._lock_path(forge, repo_slug, pr_number)
+  if vim.fn.filereadable(lock_path) ~= 1 then
+    return true, nil
+  end
+  local ok_read, lines = pcall(vim.fn.readfile, lock_path)
+  if not ok_read or not lines or #lines == 0 then
+    if opts.force then
+      pcall(vim.uv.fs_unlink, lock_path)
+      return true, nil
+    end
+    return false, "unreadable lock file; specify force=true to delete"
+  end
+  local dok, lock_data = pcall(vim.json.decode, table.concat(lines, "\n"))
+  if not dok or type(lock_data) ~= "table" or not lock_data.pid then
+    if opts.force then
+      pcall(vim.uv.fs_unlink, lock_path)
+      return true, nil
+    end
+    return false, "malformed lock file; specify force=true to delete"
+  end
+  if not opts.force then
+    local alive_ret = vim.uv.kill(lock_data.pid, 0)
+    if alive_ret == 0 or alive_ret == true then
+      return false, string.format("refusing to recover lock: process PID %d is still active on %s (use force to override)", lock_data.pid, tostring(lock_data.host or "localhost"))
+    end
+  end
+  local ok_un = pcall(vim.uv.fs_unlink, lock_path)
+  if ok_un then
+    return true, nil
+  else
+    return false, "failed to unlink lock file"
+  end
 end
 
 ---load_receipt loads the receipt document for a PR.

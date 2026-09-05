@@ -34,13 +34,39 @@ end
 ---@return boolean
 function M.is_allowlisted(exe)
   if type(exe) ~= "string" or exe == "" then return false end
-  local base = vim.fs.basename(exe)
+  local has_sep = exe:find("/", 1, true) ~= nil or exe:find("\\", 1, true) ~= nil
+  if has_sep then
+    -- A relative path with separator is strictly rejected to prevent execution of
+    -- repository-controlled files (e.g. ./pass or ../tmp/pass in a worktree)
+    if not (exe:sub(1, 1) == "/" or exe:match("^%a:[/\\]")) then
+      return false
+    end
+    -- For absolute paths, accept if explicitly configured in user_allowed,
+    -- or if it resolves to the exact system executable of an allowed default tool
+    local user_allowed = (config.options and config.options.auth and config.options.auth.allowed_command_providers) or {}
+    for _, allowed in ipairs(user_allowed) do
+      if allowed:find("/", 1, true) or allowed:find("\\", 1, true) then
+        if vim.fs.normalize(exe) == vim.fs.normalize(allowed) then
+          return true
+        end
+      end
+    end
+    for _, allowed in ipairs(M.DEFAULT_ALLOWLIST) do
+      local sys_path = vim.fn.exepath(allowed)
+      if sys_path ~= "" and vim.fs.normalize(exe) == vim.fs.normalize(sys_path) then
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Bare command name (no path separator, e.g. "pass", "op", "gh")
   for _, allowed in ipairs(M.DEFAULT_ALLOWLIST) do
-    if base == allowed or exe == allowed then return true end
+    if exe == allowed then return true end
   end
   local user_allowed = (config.options and config.options.auth and config.options.auth.allowed_command_providers) or {}
   for _, allowed in ipairs(user_allowed) do
-    if base == allowed or exe == allowed then return true end
+    if exe == allowed then return true end
   end
   return false
 end
