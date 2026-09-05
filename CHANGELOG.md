@@ -2,6 +2,56 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.10] — 2026-09-05 — CI on every PR, and a dependency guard that checks the symbol that broke
+
+Patch. No public Lua surface changed.
+
+**This repo now has an automated gate.** Until now every suite ran only
+where someone happened to run it — which is how two of them came to be
+aborting MID-RUN, reporting a clean-looking partial run rather than a
+failure. `tests/run-all.sh` already catches that shape by treating a
+missing summary line as a hard failure; CI supplies the environment and
+lets the runner be the judge.
+
+The workflow is deliberately shaped:
+
+- **No branch-restoring step.** That step is the one thing that behaves
+  differently per trigger entry — `actions/checkout` checks the branch
+  out on `push` and detaches on `pull_request`, so `git branch --force
+  main` exits 128 there — and an entry whose first firing is the merge
+  cannot be witnessed beforehand. Removing the difference beats testing
+  it.
+- **`fetch-depth: 0` is required here**, unlike the sibling plugins:
+  `adr0081-migration-gate` extracts the shipped v0.5.7 reader with
+  `git show v0.5.7:lua/...`, so its frozen fixtures are proven against
+  the real old code rather than an imitation of it. A shallow clone has
+  neither the tag nor its blobs.
+- **CI supplies a git identity**, because `repos.commit` shells out to
+  git and is right to take the ambient one rather than invent one.
+- **`install-deps.sh` asserts that auto-core can SERVE the request**,
+  not merely that a checkout exists — the same `{file, symbol}`
+  predicate the suite applies. A drift run rides auto-core's default
+  branch, so a can't-serve auto-core is reachable by design, and this
+  fails naming the missing symbol instead of aborting mid-suite.
+- **The pin tradeoff is split rather than traded.** The gating job pins
+  auto-core; a `drift` job resolves it at its default branch on schedule
+  and manual dispatch only — never on push, where it would redden a
+  merge for an upstream change unrelated to the PR.
+
+**`tests/smoke.lua` binds to an auto-core that can answer.** The suite
+picked a sibling by path existence alone, so a stale checkout won the
+candidate list and the suite died on `attempt to call field 'unpushed'`
+— on a machine where a perfectly good auto-core sat earlier in that very
+list. Candidates are now matched by FILE AND SYMBOL, and the guard
+carries BOTH dependencies the file's own comment names
+(`git.log.unpushed` and `docstore.write_json`). Checking one of two
+declared dependencies is how the first fix passed while observing the
+wrong thing: docstore landed BEFORE unpushed, so auto-core `37d023d`
+satisfies a docstore-only guard and still cannot serve.
+
+*(Changelog note: `v0.5.9` shipped without an entry. This one does not
+backfill it.)*
+
 ## [v0.5.8] — 2026-09-03 — ADR-0081: worktree delegates document I/O, keeps the git meaning
 
 Patch. Every public function keeps its signature and its return
