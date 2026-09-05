@@ -129,7 +129,7 @@ vim.api.nvim_create_user_command("WorktreeRecoverPRLock", function(opts)
   local function go(num)
     local ok, err = pr_mod.recover_lock(forge or "github", repo_slug, num, { force = force })
     if ok then
-      vim.notify(string.format("worktree: recovered lock for PR #%s", tostring(num)), vim.log.levels.INFO)
+      vim.notify(string.format("worktree: recovered lock for PR #%s (quiescence contract: ensure no poster is running for this PR)", tostring(num)), vim.log.levels.INFO)
     else
       vim.notify(string.format("worktree: failed to recover lock for PR #%s: %s", tostring(num), tostring(err)), vim.log.levels.ERROR)
     end
@@ -141,7 +141,7 @@ vim.api.nvim_create_user_command("WorktreeRecoverPRLock", function(opts)
       if input and input ~= "" then go(tonumber(input) or input) end
     end)
   end
-end, { bang = true, nargs = "?", desc = "Worktree: recover stale PR review lock (ADR-0083)" })
+end, { bang = true, nargs = "?", desc = "Worktree: recover stale PR lock (requires quiescence: no active posters for PR)" })
 
 -- Capture the startup cwd as the workspace root.
 --

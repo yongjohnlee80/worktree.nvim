@@ -124,8 +124,8 @@ function M.acquire_lock(forge, repo_slug, pr_number)
     -- Dead owner (ESRCH): fail closed. Automatic reclaim by pathname unlink is a
     -- check-then-act race (concurrency-testing §3, MF1). Manual operator recovery required.
     error(string.format(
-      "worktree.pr: PR #%s review posting locked by dead/stale process PID %d (owner %s) on %s; automatic reclaim disabled. Manual recovery required (remove %s or run :WorktreeRecoverPRLock)",
-      tostring(pr_number), lock_data.pid, tostring(lock_data.owner_token), tostring(lock_data.host or my_host), lock_path
+      "worktree.pr: PR #%s review posting locked by dead/stale process PID %d (owner %s) on %s; automatic reclaim disabled. Manual recovery required (ensure quiescence: no active posters running for PR #%s, then remove %s or run :WorktreeRecoverPRLock)",
+      tostring(pr_number), lock_data.pid, tostring(lock_data.owner_token), tostring(lock_data.host or my_host), tostring(pr_number), lock_path
     ))
   end
 
