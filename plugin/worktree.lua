@@ -127,11 +127,26 @@ vim.api.nvim_create_user_command("WorktreeRecoverPRLock", function(opts)
   local pr_num = tonumber(opts.args)
   local force = opts.bang
   local function go(num)
-    local ok, err = pr_mod.recover_lock(forge or "github", repo_slug, num, { force = force })
-    if ok then
-      vim.notify(string.format("worktree: recovered lock for PR #%s (quiescence contract: ensure no poster is running for this PR)", tostring(num)), vim.log.levels.INFO)
+    local function do_recover()
+      local ok, err = pr_mod.recover_lock(forge or "github", repo_slug, num, { force = force })
+      if ok then
+        vim.notify(string.format("worktree: recovered lock for PR #%s", tostring(num)), vim.log.levels.INFO)
+      else
+        vim.notify(string.format("worktree: failed to recover lock for PR #%s: %s", tostring(num), tostring(err)), vim.log.levels.ERROR)
+      end
+    end
+
+    if force then
+      do_recover()
     else
-      vim.notify(string.format("worktree: failed to recover lock for PR #%s: %s", tostring(num), tostring(err)), vim.log.levels.ERROR)
+      local prompt = string.format("Recover lock for PR #%s? (Quiescence requirement: ensure no active posting worker is running for this PR)", tostring(num))
+      vim.ui.select({ "yes", "no" }, { prompt = prompt }, function(choice)
+        if choice == "yes" then
+          do_recover()
+        else
+          vim.notify("worktree: recovery cancelled", vim.log.levels.INFO)
+        end
+      end)
     end
   end
   if pr_num then
