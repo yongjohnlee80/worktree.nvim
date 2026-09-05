@@ -9,6 +9,15 @@ on:
   schedule:
     - cron: "0 6 * * 1"   # Mondays, 06:00 UTC
   workflow_dispatch:
+    inputs:
+      force_drift_failure:
+        description: >-
+          Fail the drift job deliberately, to exercise the failure notifier.
+          The point of the notifier is that an unread signal is not a signal;
+          an untested notifier is the same bug one layer up, so there has to be
+          a way to make it fire on demand.
+        type: boolean
+        default: false
 
 # Least privilege: these jobs only read the tree.
 permissions:
@@ -122,6 +131,64 @@ jobs:
           git config --global user.name  "auto-agents ci"
           git config --global user.email "ci@example.invalid"
 
+      # The pin's age as ROUTINE INFORMATION, not something discovered while
+      # debugging. This job's pin comment read `# main @ v0.2.15` while sitting
+      # eighteen commits and three releases behind, and the way that surfaced
+      # was a cell failing on CI while passing everywhere else.
+      #
+      # Reported, never acted on: auto-bumping the pin would defeat the
+      # reproducibility it exists for — a gating job that changes under a PR
+      # reintroduces the mystery failure on unrelated work that pinning was
+      # adopted to prevent. The bump is a human's call, and a reviewed one.
+      - name: report how stale the auto-core pin is
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTO_CORE_REF: "bc4d998bc22f0644b80e3e89cfe3e1b92d71d32a"
+        run: |
+          # One API call rather than a second clone: compare gives the distance
+          # to the default branch directly.
+          # AHEAD_BY, not behind_by. For `compare/BASE...HEAD` GitHub reports
+          # ahead_by as "commits HEAD has that BASE does not" — which with
+          # BASE=pin, HEAD=main is the number wanted here — and behind_by as
+          # the reverse, which for an ancestor pin is ALWAYS 0.
+          #
+          # The first version of this step read behind_by and printed
+          # "commits ... that this pin does NOT have: 0" on a pin eight commits
+          # stale. It ran green and said the pin was current: an instrument
+          # reporting the reassuring answer for every input, which is worse than
+          # no instrument. Caught by reading the step's OUTPUT rather than its
+          # exit status.
+          # The pin appears TWICE in this file: the install step consumes it,
+          # this step reports on it. Assert they are the SAME. When this design
+          # was copied from auto-finder, this step arrived carrying auto-finder's
+          # SHA — so all four copies would have reported the age of a pin they do
+          # not use, in a step whose whole job is to notice staleness. Found by
+          # comparing the two values; nothing about the copy looked wrong.
+          seen="$(grep -oE 'AUTO_CORE_REF: "[0-9a-f]{40}"' .github/workflows/ci.yml \
+                   | grep -oE '[0-9a-f]{40}' | sort -u | wc -l)"
+          if [ "$seen" -ne 1 ]; then
+            echo "::error title=pin mismatch::this workflow names ${seen} different auto-core pins; the age below would describe the wrong one"
+            exit 1
+          fi
+          missing="$(gh api \
+            "repos/yongjohnlee80/auto-core.nvim/compare/${AUTO_CORE_REF}...main" \
+            --jq '.ahead_by' 2>/dev/null || true)"
+          echo "auto-core pin: ${AUTO_CORE_REF}"
+          case "$missing" in
+            ''|*[!0-9]*)
+              # Never silently 0: an unparseable answer is UNKNOWN, and it says
+              # so, because "0" here reads as "the pin is current".
+              echo "::warning title=auto-core pin age unknown::the compare API did not return a usable ahead_by; pin staleness was NOT determined"
+              ;;
+            *)
+              echo "commits on auto-core main that this pin does NOT have: ${missing}"
+              if [ "$missing" -gt 0 ]; then
+                msg="the gating job tests a pinned auto-core; the drift job is what notices when the pin goes stale, and bumping it is a deliberate reviewed change, never automatic"
+                echo "::notice title=auto-core pin is ${missing} commits behind main::${msg}"
+              fi
+              ;;
+          esac
+
       - name: tests/run-all.sh
         run: ./tests/run-all.sh
 
@@ -145,6 +212,12 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Raised for THIS JOB ONLY, and only by one step: a failing drift run has to
+    # be able to reach a person. The `lua` job keeps the workflow's read-only
+    # default.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -184,5 +257,84 @@ jobs:
           git config --global user.name  "auto-agents ci"
           git config --global user.email "ci@example.invalid"
 
+      # Exercisable on demand. The whole point of the step below is that an
+      # unread signal is not a signal — so an untested notifier is the same bug
+      # one layer up, and there has to be a way to make it fire without waiting
+      # for auto-core to break something.
+      - name: force a drift failure (notifier self-test)
+        if: inputs.force_drift_failure
+        run: |
+          echo "force_drift_failure was requested: failing deliberately so the"
+          echo "notifier below has something to report."
+          exit 1
+
       - name: tests/run-all.sh
         run: ./tests/run-all.sh
+
+      # Found by LABEL, not by title. Title matching breaks the moment somebody
+      # edits the title — the next failure opens a duplicate instead of
+      # commenting — and `--limit 50` silently stops finding it once the repo
+      # passes fifty issues in that state, which is a failure mode with no
+      # symptom. `gh label create --force` UPDATES an existing label rather
+      # than failing, so this needs no manual setup and stays idempotent.
+      # (gold-man, #32 r0 Q2 — the objection I had chosen the fragile option
+      # over does not exist.)
+      - name: open or update the drift issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          gh label create ci-drift --color B60205 \
+            --description "this suite fails against auto-core@main" --force
+          title="CI drift: this repo's suite fails against auto-core@main"
+          num="$(gh issue list --state all --label ci-drift --limit 1 \
+                  --json number --jq '.[0].number // empty')"
+          body="$(printf '%s\n' \
+            "The \`drift\` job resolves auto-core at its DEFAULT BRANCH instead of the pinned commit the gating job uses, and it failed." \
+            "" \
+            "Run: ${RUN_URL}" \
+            "Event: ${GITHUB_EVENT_NAME}  Commit: ${GITHUB_SHA}" \
+            "" \
+            "This does NOT mean this repo is broken for its users — the gating job pins auto-core and is green. It means auto-core has moved in a way this suite does not accept yet, and one of the two has to change before the pin is bumped." \
+            "" \
+            "Bumping the pin is a deliberate, reviewed decision and never automatic: a gating job that changes under a PR reintroduces the mystery failure on unrelated work that pinning exists to prevent." \
+            "" \
+            "This issue CLOSES ITSELF when a drift run passes, so its open/closed state is the answer to \"is auto-core's main compatible today\". If it reopens after somebody closed it, the divergence was still live — that is the point, not noise.")"
+          if [ -n "$num" ]; then
+            gh issue reopen "$num" >/dev/null 2>&1 || true
+            gh issue comment "$num" --body "$body"
+            echo "commented on drift issue #$num (reopened if it had been closed)"
+          else
+            gh issue create --title "$title" --label ci-drift --body "$body"
+          fi
+
+      # THE OTHER HALF, and without it the addressee is just a second thing to
+      # ignore. `if: failure()` alone leaves the issue open after the
+      # divergence clears — and today's episode is the demonstration: drift
+      # failed on the p40 regression, the fix landed, a re-dispatch went green,
+      # and an issue from that failure would still be open now. The first
+      # person to check it, find nothing wrong and close it by hand has learned
+      # the issue is noise, which is this task's own defect moved from a red run
+      # to an open issue.
+      #
+      # With this step the issue's OPEN/CLOSED STATE is the answer to "is
+      # auto-core's main compatible today", which is the question the job
+      # exists to answer. (gold-man, #32 r0 MF1.)
+      - name: close the drift issue when the divergence clears
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          num="$(gh issue list --state open --label ci-drift --limit 1 \
+                  --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [ -z "$num" ]; then
+            echo "no open drift issue — nothing to clear"
+            exit 0
+          fi
+          gh issue comment "$num" --body "Divergence cleared: the drift job passed against auto-core@main at ${RUN_URL}. Closing, so this issue's state keeps tracking the condition."
+          gh issue close "$num"
+          echo "closed drift issue #$num"
