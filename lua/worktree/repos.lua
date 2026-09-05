@@ -655,4 +655,42 @@ end
 
 function M._reset_for_tests() _base_cache = {} end
 
+---pr_for_worktree finds any PR associated with a worktree branch.
+---@param repo WorktreeRepo
+---@param wt WorktreeWorktree
+---@return table? pr
+function M.pr_for_worktree(repo, wt)
+  local ok_pr, pr_mod = pcall(require, "worktree.pr")
+  if not ok_pr then return nil end
+  return pr_mod.find_for_worktree(repo, wt)
+end
+
+---pr_diff returns commit and file diffs for a PR.
+---@param repo WorktreeRepo
+---@param base_ref string
+---@param pr_ref string
+---@return table[] commits
+function M.pr_diff(repo, base_ref, pr_ref)
+  local ok_pr, pr_mod = pcall(require, "worktree.pr")
+  if not ok_pr then return {} end
+  return pr_mod.pr_diff_commits(repo, base_ref, pr_ref)
+end
+
+---reviews_for_pr returns all review records associated with pr_number.
+---@param repo WorktreeRepo
+---@param pr_number integer|string
+---@return table[] reviews
+function M.reviews_for_pr(repo, pr_number)
+  if not repo or not pr_number then return {} end
+  local all = M.reviews_all(repo)
+  local out = {}
+  local target = tostring(pr_number)
+  for _, r in ipairs(all) do
+    if r.pr and tostring(r.pr) == target then
+      out[#out + 1] = r
+    end
+  end
+  return out
+end
+
 return M

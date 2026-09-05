@@ -5,6 +5,12 @@ M.defaults = {
   -- When nil, the plugin captures the global cwd at VimEnter.
   root = nil,
 
+  -- Authentication configuration for forge integration (ADR-0083 §2.5.1)
+  auth = {
+    allowed_command_providers = {},
+    config_path = nil,
+  },
+
   -- Workspace-rooted LSP servers that need restarting on cwd switch so
   -- they re-resolve root_dir against the new worktree. Empty by default --
   -- opt in with the servers you actually use, e.g.
