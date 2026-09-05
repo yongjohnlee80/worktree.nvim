@@ -29,7 +29,22 @@ for _, p in ipairs({
   plugins .. "/auto-core.nvim/main",
   plugins .. "/auto-core.nvim/" .. branch_dir,  -- same-branch sibling wins
 }) do
-  if vim.fn.isdirectory(p) == 1 then AUTO_CORE = p end
+  -- Later entries win (the same-branch sibling beats a generic checkout), but
+  -- ONLY among candidates that can actually satisfy the dependency. A stale
+  -- sibling used to win outright: worktree.store delegates to
+  -- auto-core.docstore (ADR-0081 P4a), so an auto-core predating it is not an
+  -- older version of the dependency, it is a checkout that cannot serve the
+  -- request at all -- and the suite failed with "auto-core.docstore is
+  -- required" naming no path, while a perfectly good copy sat earlier in this
+  -- very list.
+  if vim.fn.isdirectory(p) == 1 then
+    if vim.fn.isdirectory(p .. "/lua/auto-core/docstore") == 1
+      or vim.fn.filereadable(p .. "/lua/auto-core/docstore.lua") == 1 then
+      AUTO_CORE = p
+    elseif not AUTO_CORE then
+      AUTO_CORE = p  -- nothing qualifying seen yet; keep the loud failure informative
+    end
+  end
 end
 if AUTO_CORE then vim.opt.runtimepath:prepend(AUTO_CORE) end
 -- Passed to every child nvim, so the templates below need no edits.

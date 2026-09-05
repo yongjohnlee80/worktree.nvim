@@ -24,14 +24,66 @@ local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
 -- or worse, pass while exercising a different copy of the code.
 local siblings = vim.fn.fnamemodify(plugin_root, ":h:h")
 local branch_dir = vim.fn.fnamemodify(plugin_root, ":t")
+-- Pick ONE auto-core. Later candidates still win (a same-branch sibling beats
+-- a generic checkout), but only among those that can actually SERVE the
+-- request: worktree.store delegates to auto-core.docstore (ADR-0081 P4a), and
+-- repos.lua calls git.log.unpushed. An auto-core predating those is not an
+-- older dependency, it is one that cannot answer at all.
+--
+-- The hazard the comment above warns about is exactly what happened: a stale
+-- `auto-core.nvim/main` sibling won over a current lazy copy, and this suite
+-- aborted mid-run on `attempt to call field 'unpushed' (a nil value)` -- a
+-- silent partial run, on a machine where a perfectly good auto-core sat
+-- earlier in this very list.
+--
+-- The guard must check the LATER-landing symbol, not the earlier one. This file
+-- names TWO dependencies four lines up -- worktree.store -> auto-core.docstore,
+-- and repos.lua -> git.log.unpushed -- and the first version of this guard
+-- checked only docstore. Those landed at different times and docstore came
+-- FIRST (2ad0667 is an ancestor of 032c9fc), so there is a real window of
+-- checkouts that satisfy a docstore-only guard and still cannot serve: at
+-- auto-core 37d023d the docstore directory is present and git/log.lua has zero
+-- matches for `unpushed`. Such a candidate wins the loop below and the suite
+-- dies exactly as it did before -- on `attempt to call field 'unpushed'`, the
+-- failure quoted above. Checking one dependency out of two declared is how the
+-- guard passed while observing the wrong thing (gold-man, r0).
+--
+-- So: every entry must be satisfied, matched by FILE and SYMBOL rather than by
+-- path existence, since a path proves only that some copy is there.
+local AC_REQUIRES = {
+  { "lua/auto-core/git/log.lua",       "function M.unpushed"  },
+  { "lua/auto-core/docstore/init.lua", "function M.write_json" },
+}
+local function ac_serves(p)
+  for _, req in ipairs(AC_REQUIRES) do
+    local f = p .. "/" .. req[1]
+    if vim.fn.filereadable(f) ~= 1 then return false end
+    local found = false
+    for _, line in ipairs(vim.fn.readfile(f)) do
+      if line:find(req[2], 1, true) then found = true break end
+    end
+    if not found then return false end
+  end
+  return true
+end
+local AUTO_CORE
 for _, p in ipairs({
-  LAZY .. "/plenary.nvim",
   LAZY .. "/auto-core.nvim",
   siblings .. "/auto-core.nvim/main",
   siblings .. "/auto-core.nvim/" .. branch_dir,
-  plugin_root,
 }) do
   if vim.fn.isdirectory(p) == 1 then
+    -- qualifying candidates win outright; otherwise keep the first seen so a
+    -- genuine absence still fails loudly rather than silently skipping.
+    if ac_serves(p) or not AUTO_CORE then AUTO_CORE = p end
+  end
+end
+for _, p in ipairs({
+  LAZY .. "/plenary.nvim",
+  AUTO_CORE,
+  plugin_root,
+}) do
+  if p and vim.fn.isdirectory(p) == 1 then
     vim.opt.runtimepath:prepend(p)
   end
 end
