@@ -47,14 +47,25 @@ jobs:
       # Pinned by commit SHA, not by tag: a tag can be moved to different code
       # under the same name.
       #
-      # Deliberately NO branch-restoring step and no fetch-depth: 0. auto-core's
-      # workflow needs both because its suites read its own refs; these read
-      # none. Keeping `push` and `pull_request` behaviourally IDENTICAL is the
-      # point: the step auto-core needs there is the one that exits 128 here
-      # (actions/checkout checks the branch out on push rather than detaching),
-      # and an entry whose first firing is the merge cannot be witnessed
-      # beforehand — so the fix is to remove the per-entry difference.
+      # NO branch-restoring step — that is the one thing behaving differently
+      # per trigger entry (actions/checkout checks the branch out on push
+      # rather than detaching, so `git branch --force main` exits 128), and an
+      # entry whose first firing is the merge cannot be witnessed beforehand.
+      # Removing the per-entry difference is the fix. fetch-depth does not vary
+      # by event, so restoring it below does not reintroduce that.
+      #
+      # fetch-depth: 0 IS needed here, and my first pass got it wrong. I
+      # checked for three specific symbols — default_branch,
+      # local_branch_exists, list_branches — which is the set auto-core's step
+      # PROVIDES, not the set of repository operations these suites perform.
+      # adr0081-migration-gate extracts the SHIPPED v0.5.7 reader with
+      # `git show v0.5.7:lua/...`, so its frozen fixtures are proven against
+      # the real old code rather than a hand-written imitation. A shallow clone
+      # has neither the tag nor its blobs, and the gate said so:
+      # "tag v0.5.7 is not present in this checkout".
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
       - name: install neovim
         env:
@@ -100,6 +111,17 @@ jobs:
           test -d "$lazy/auto-core.nvim"
           test -d "$siblings/auto-core.nvim/main"
 
+      # A developer machine always has one; a runner has none. Most suites pass
+      # `-c user.email=... -c user.name=...` per invocation, but smoke 10g goes
+      # through the PRODUCT — repos.commit shells out to git and is right to
+      # take the ambient identity rather than invent one. So CI supplies what
+      # the environment owes it, instead of the product working around its
+      # absence. Without this: "Author identity unknown".
+      - name: give git an identity (repos.commit uses the ambient one)
+        run: |
+          git config --global user.name  "auto-agents ci"
+          git config --global user.email "ci@example.invalid"
+
       - name: tests/run-all.sh
         run: ./tests/run-all.sh
 
@@ -125,6 +147,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
       - name: install neovim
         env:
@@ -148,6 +172,17 @@ jobs:
         run: |
           siblings="$(dirname "$(dirname "$GITHUB_WORKSPACE")")"
           git -C "$siblings/auto-core.nvim/main" log --oneline -1
+
+      # A developer machine always has one; a runner has none. Most suites pass
+      # `-c user.email=... -c user.name=...` per invocation, but smoke 10g goes
+      # through the PRODUCT — repos.commit shells out to git and is right to
+      # take the ambient identity rather than invent one. So CI supplies what
+      # the environment owes it, instead of the product working around its
+      # absence. Without this: "Author identity unknown".
+      - name: give git an identity (repos.commit uses the ambient one)
+        run: |
+          git config --global user.name  "auto-agents ci"
+          git config --global user.email "ci@example.invalid"
 
       - name: tests/run-all.sh
         run: ./tests/run-all.sh
