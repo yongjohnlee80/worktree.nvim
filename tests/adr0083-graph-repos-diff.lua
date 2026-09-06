@@ -77,6 +77,35 @@ local ok2, err2 = graph._open_repos_diff(REPO, { hash = nil })
 ok("no commit under the cursor is refused", ok2 == false, tostring(ok2))
 ok("...with its own reason", (err2 or ""):find("commit", 1, true) ~= nil, tostring(err2))
 
+-- ── §1b gitgraph hands an ABBREVIATED hash ──────────────────────────
+-- The regression this suite failed to catch. gitgraph's commit objects carry a
+-- SHORT hash (measured live: "bd3a4c495", 9 chars), and
+-- auto-core.review.draft.scope requires 40 hex — deliberately, since two
+-- commits can share a prefix and a colliding scope merges two reviewers'
+-- drafts. scope() returns nil, draft() indexes the nil the store hands back,
+-- and `o` dies with:
+--   draft.lua:202: attempt to index local 'd' (a nil value)
+--
+-- The first version of this suite fabricated `{ hash = <full 40-hex> }` from
+-- `git rev-parse HEAD`, so it pinned MY ASSUMPTION of gitgraph's contract
+-- instead of gitgraph's. This drives the real shape.
+local SHORT = SHA:sub(1, 9)
+local captured_short
+local dv_pre = require("auto-core.ui.diffview")
+local real_open_pre = dv_pre.open
+dv_pre.open = function(opts) captured_short = opts; return { stub = true }, nil end
+local ok_short, err_short = graph._open_repos_diff(REPO, { hash = SHORT, msg = "the subject line" })
+dv_pre.open = real_open_pre
+ok("an abbreviated gitgraph hash opens rather than erroring", ok_short == true,
+  tostring(err_short))
+ok("...and the view is handed the FULL 40-hex sha",
+  captured_short and captured_short.sha == SHA,
+  captured_short and tostring(captured_short.sha))
+ok("...so the annotate surface is enabled, not disabled",
+  captured_short and type(captured_short.annotate) == "table"
+    and captured_short.annotate.disabled_reason == nil,
+  captured_short and captured_short.annotate and captured_short.annotate.disabled_reason)
+
 -- ── §2 what it hands the shared diff view ───────────────────────────
 local captured
 local dv = require("auto-core.ui.diffview")
