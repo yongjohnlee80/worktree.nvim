@@ -555,7 +555,30 @@ function M._open_repos_diff(repo, commit)
   end
 
   local wt_path = repo.sample_worktree
+
+  -- gitgraph hands out an ABBREVIATED hash — measured live: "bd3a4c495", nine
+  -- characters. `auto-core.review.draft.scope` requires 40 hex and returns nil
+  -- for anything shorter, deliberately: two commits can share a prefix, and a
+  -- colliding scope silently merges two reviewers' drafts. `draft()` then
+  -- indexed the nil the store handed back and `o` died with
+  -- `attempt to index local 'd' (a nil value)` (Johno, 2026-09-07).
+  --
+  -- Resolve rather than relax. The abbreviation is fine for `git show` and for
+  -- the diff read; it is the DRAFT KEY that must be unambiguous, and the repo
+  -- is the only thing that can expand it.
   local sha = commit.hash
+  if not sha:match("^" .. ("%x"):rep(40) .. "$") then
+    local out = vim.system({ "git", "--git-dir=" .. repo.common_dir,
+      "rev-parse", sha .. "^{commit}" }, { text = true }):wait()
+    local full = out.code == 0 and vim.trim(out.stdout or "") or ""
+    if not full:match("^" .. ("%x"):rep(40) .. "$") then
+      -- Refuse rather than carry on with the abbreviation: proceeding would
+      -- silently disable the annotate surface, which looks like the feature
+      -- quietly not working rather than like an error.
+      return false, ("cannot resolve %s to a full commit sha"):format(tostring(sha))
+    end
+    sha = full
+  end
   local repo_rec = {
     common_dir = repo.common_dir, label = repo.label,
     is_bare = repo.is_bare and true or false,
