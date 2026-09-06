@@ -63,75 +63,100 @@ local REPO = {
 }
 local COMMIT = { hash = SHA, msg = "the subject line" }
 
--- ── §1 auto-finder absent: a REASON, never silence ──────────────────
+-- ── §1 THE POINT OF THIS SUITE: no auto-finder anywhere ─────────────
+-- worktree used to reach UP into auto-finder for this view, inverting the
+-- family's order. It now assembles from worktree.repos + worktree.review +
+-- auto-core. Poisoning the auto-finder module proves the path never touches it:
+-- if anything still required it, this errors instead of opening.
 package.loaded["auto-finder.views.repos.tree"] = nil
-local real_searchers = package.preload["auto-finder.views.repos.tree"]
 package.preload["auto-finder.views.repos.tree"] = function()
-  error("auto-finder is not installed")
+  error("auto-finder must NOT be required by this path", 0)
 end
-local ok1, err1 = graph._open_repos_diff(REPO, COMMIT)
-ok("without auto-finder it refuses rather than crashing", ok1 == false, tostring(ok1))
-ok("...and names why", type(err1) == "string" and err1:find("auto%-finder") ~= nil, tostring(err1))
-package.preload["auto-finder.views.repos.tree"] = real_searchers
 
 local ok2, err2 = graph._open_repos_diff(REPO, { hash = nil })
 ok("no commit under the cursor is refused", ok2 == false, tostring(ok2))
 ok("...with its own reason", (err2 or ""):find("commit", 1, true) ~= nil, tostring(err2))
 
--- ── §2 the row handed to open_diff ──────────────────────────────────
+-- ── §2 what it hands the shared diff view ───────────────────────────
 local captured
-package.loaded["auto-finder.views.repos.tree"] = {
-  open_diff = function(row) captured = row; return true end,
-}
+local dv = require("auto-core.ui.diffview")
+local real_open = dv.open
+dv.open = function(opts) captured = opts; return { stub = true }, nil end
 local ok3 = graph._open_repos_diff(REPO, COMMIT)
+dv.open = real_open
 ok("open_repos_diff reports success", ok3 == true)
-ok("it called auto-finder's open_diff", captured ~= nil)
+ok("it called auto-core.ui.diffview.open", captured ~= nil)
+ok("it did NOT require auto-finder", package.loaded["auto-finder.views.repos.tree"] == nil,
+  "the whole point of step 3")
 
 if captured then
-  ok("row.kind is commit", captured.kind == "commit", captured.kind)
-  ok("node.sha is the full hash", captured.node and captured.node.sha == SHA,
-    captured.node and captured.node.sha)
-  ok("node.short is the 7-char form", captured.node and captured.node.short == SHA:sub(1, 7),
-    captured.node and captured.node.short)
-  -- The float titles itself with this; gitgraph calls it `msg`, the view
-  -- reads `commit.subject`. A mismatch renders an empty title, not an error.
-  ok("node.commit.subject carries gitgraph's msg",
-    captured.node and captured.node.commit and captured.node.commit.subject == "the subject line",
-    captured.node and captured.node.commit and captured.node.commit.subject)
-  -- Without a slug the review store and the authoring draft have no key, so
-  -- annotate and submit would be dead on arrival — the whole point of routing
-  -- here rather than to the flat float.
-  ok("repo.slug was resolved from the remote", type(captured.repo.slug) == "string"
-    and captured.repo.slug ~= "", tostring(captured.repo and captured.repo.slug))
-  ok("repo.slug names this repo", (captured.repo.slug or ""):find("proj", 1, true) ~= nil,
-    captured.repo.slug)
-  ok("repo.common_dir is carried", captured.repo.common_dir == REPO.common_dir,
-    captured.repo.common_dir)
-  -- open_diff hands `worktree` to the diff view so whole-file context can be
-  -- read; nil here would silently degrade `T`/`X` to the hunk render.
-  ok("worktree.path is the checkout", captured.worktree and captured.worktree.path == repo_dir,
-    captured.worktree and captured.worktree.path)
-  ok("repo.sample_worktree is carried", captured.repo.sample_worktree == repo_dir,
-    captured.repo.sample_worktree)
+  ok("files came from worktree.repos.diff", type(captured.files) == "table"
+    and #captured.files > 0, "#files=" .. tostring(captured.files and #captured.files))
+  -- Both are load-bearing: auto-core's _sides_full shells out to
+  -- `git -C <dir> show <rev>:<path>` and, given neither, silently returns the
+  -- HUNK render while the footer claims full context (auto-finder v0.4.22).
+  ok("sha is passed through", captured.sha == SHA, tostring(captured.sha))
+  ok("worktree is passed through", captured.worktree == repo_dir, tostring(captured.worktree))
+  -- gitgraph calls the subject `msg`; the title reads it. A mismatch renders an
+  -- empty title rather than erroring, so it is asserted rather than eyeballed.
+  ok("title carries the short sha", (captured.title or ""):find(SHA:sub(1, 7), 1, true) ~= nil,
+    captured.title)
+  ok("title carries gitgraph's msg",
+    (captured.title or ""):find("the subject line", 1, true) ~= nil, captured.title)
+  -- Without a slug the draft has no stable key, so the annotate surface must be
+  -- DISABLED with a reason rather than silently dropping the reviewer's work.
+  ok("annotate surface is enabled for a repo with a remote",
+    type(captured.annotate) == "table" and captured.annotate.disabled_reason == nil
+      and type(captured.annotate.on_add) == "function",
+    tostring(captured.annotate and captured.annotate.disabled_reason))
+  ok("annotations table is present", type(captured.annotations) == "table")
+
+  -- The draft must be the SHARED one, keyed <slug>@<40-hex> in auto-core, so an
+  -- annotation made from the graph is the same draft auto-finder's panel sees.
+  local drafts = require("auto-core.review.draft")
+  local ident = require("worktree.store").remote_identity(REPO.common_dir)
+  -- Do NOT discard first: `annotate.on_add` closes over the draft TABLE taken
+  -- when the view opened, and discarding the scope out from under it leaves the
+  -- closure appending to an orphan. That is a real property of the store, not a
+  -- test artifact — measure the DELTA instead of assuming an empty start.
+  local before_n = #((drafts.peek(ident.slug, SHA) or {}).items or {})
+  captured.annotate.on_add({ path = "f.lua", line = 1, anchored = true,
+                             severity = "nit", body = "from the graph" })
+  local shared = drafts.peek(ident.slug, SHA)
+  local after_n = #((shared or {}).items or {})
+  ok("the finding lands in auto-core's SHARED draft store", after_n == before_n + 1,
+    ("before=%d after=%d"):format(before_n, after_n))
+  ok("...and it is the finding we added", (function()
+    for _, c in ipairs((shared or {}).items or {}) do
+      if c.body == "from the graph" then return true end
+    end
+    return false
+  end)())
+  ok("...under the slug@sha key the panel uses",
+    drafts.scope(ident.slug, SHA) ~= nil, tostring(drafts.scope(ident.slug, SHA)))
+  ok("on_remove takes it back out", (function()
+    captured.annotate.on_remove({ path = "f.lua", line = 1, side = "RIGHT" })
+    local d2 = drafts.peek(ident.slug, SHA)
+    return d2 == nil or #(d2.items or {}) == 0
+  end)())
+  drafts.discard(ident.slug, SHA)
 end
 
--- a declining view is reported, not swallowed
-package.loaded["auto-finder.views.repos.tree"] = {
-  open_diff = function() return false, "no diff for this commit" end,
-}
+-- a refusing view is reported, not swallowed
+dv.open = function() return nil, "window too narrow" end
 local ok4, err4 = graph._open_repos_diff(REPO, COMMIT)
-ok("a declining diff view is reported", ok4 == false, tostring(ok4))
+dv.open = real_open
+ok("a refusing diff view is reported", ok4 == false, tostring(ok4))
 ok("...carrying the view's own reason",
-  (err4 or ""):find("no diff for this commit", 1, true) ~= nil, tostring(err4))
+  (err4 or ""):find("window too narrow", 1, true) ~= nil, tostring(err4))
 
--- a THROWING view must not take the keypress down with it
-package.loaded["auto-finder.views.repos.tree"] = {
-  open_diff = function() error("boom inside the view") end,
-}
+-- a repo whose diff is empty must say so rather than opening an empty view
+local real_diff = require("worktree.repos").diff
+require("worktree.repos").diff = function() return {} end
 local ok5, err5 = graph._open_repos_diff(REPO, COMMIT)
-ok("a throwing diff view is caught", ok5 == false, tostring(ok5))
-ok("...and its error is surfaced", (err5 or ""):find("boom", 1, true) ~= nil, tostring(err5))
-package.loaded["auto-finder.views.repos.tree"] = nil
+require("worktree.repos").diff = real_diff
+ok("an empty diff is refused", ok5 == false, tostring(ok5))
+ok("...naming the commit", (err5 or ""):find(SHA:sub(1, 7), 1, true) ~= nil, tostring(err5))
 
 -- ── §3 `o` is actually bound ────────────────────────────────────────
 local scratch = vim.api.nvim_create_buf(false, true)
@@ -139,7 +164,7 @@ graph._bind_pane_action_keys(scratch)
 local have = {}
 for _, m in ipairs(vim.api.nvim_buf_get_keymap(scratch, "n")) do have[m.lhs] = m.desc or "" end
 ok("`o` is bound on the graph pane", have["o"] ~= nil)
-ok("`o` says what it opens", (have["o"] or ""):find("repos diff", 1, true) ~= nil, have["o"])
+ok("`o` says what it opens", (have["o"] or ""):find("diff view", 1, true) ~= nil, have["o"])
 -- f/F keep their existing meaning in THIS surface (fetch), which differs from
 -- the diff view's f/F (file nav). Different buffers, so no collision — but a
 -- regression here would silently steal a fetch key.

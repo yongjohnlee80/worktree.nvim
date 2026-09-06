@@ -494,24 +494,35 @@ function M._show_commit_diff(repo, commit)
   end
 end
 
----_open_repos_diff routes the commit under the cursor into auto-finder's repos
----diff view: a file list, `a/<old>` and `b/<new>` panes, the annotate keys and
----the submit-review flow — instead of the single flat unified float `<CR>`
----opens (Johno, 2026-09-06: "there are cases (and somewhat frequently) for me
----to go back in the commit history to see the exact files changed under the
----commit").
+---_open_repos_diff opens the commit under the cursor in the shared diff view:
+---a file list, `a/<old>` and `b/<new>` panes, and the annotate surface —
+---instead of the single flat unified float `<CR>` opens (Johno, 2026-09-06:
+---"there are cases (and somewhat frequently) for me to go back in the commit
+---history to see the exact files changed under the commit").
 ---
----It CALLS `tree.open_diff` rather than rebuilding the view. That function
----already assembles the files, merges every review revision's comments, and
----builds the authoring draft; a second implementation here would be a second
----thing to keep correct, and the annotate surface is the point.
+---### It assembles this ITSELF, and that is the point
 ---
----DEPENDENCY DIRECTION. This is worktree reaching INTO auto-finder, the
----opposite of the usual arrangement (auto-finder depends on worktree, which is
----why `open_diff` can call `worktree.repos` freely). It is a soft `pcall` with
----a real fallback: without auto-finder the flat float is still a diff, so the
----key degrades rather than breaking. Keeping it soft is what makes the
----inversion acceptable — worktree.nvim must remain usable on its own.
+---The first version called `auto-finder.views.repos.tree.open_diff`, which
+---meant worktree reaching UP into auto-finder — the inverse of the family's
+---order (auto-core <- worktree <- auto-finder). Johno's ruling was to remove
+---the inversion rather than accommodate it, so the shared half moved DOWN into
+---auto-core (`auto-core.review.draft`, v0.2.22) and this assembles from parts
+---it already owns or already depends on:
+---
+---  files       worktree.repos.diff        (ours)
+---  annotations worktree.repos.reviews +
+---              worktree.review           (ours)
+---  the draft   auto-core.review.draft     (below us)
+---  the render  auto-core.ui.diffview      (below us)
+---
+---No `require("auto-finder")` anywhere. worktree.nvim depends on auto-core and
+---nothing else in the family, exactly as it did before the graph learned this
+---trick.
+---
+---The draft is keyed `<slug>@<40-hex>` in auto-core's shared store, so an
+---annotation made here is the SAME draft auto-finder's repos panel sees. Read
+---and annotate from the graph, submit from the panel; neither plugin needs the
+---other loaded to do its half.
 ---@param repo table   a fan_out repo record (common_dir, label, sample_worktree)
 ---@param commit table  a gitgraph commit (hash, msg)
 ---@return boolean ok, string? err
@@ -519,15 +530,23 @@ function M._open_repos_diff(repo, commit)
   if not (repo and commit and commit.hash) then
     return false, "no commit under the cursor"
   end
-  local ok_tree, tree = pcall(require, "auto-finder.views.repos.tree")
-  if not (ok_tree and type(tree) == "table" and type(tree.open_diff) == "function") then
-    return false, "auto-finder is not available"
+
+  local ok_dv, dv = pcall(require, "auto-core.ui.diffview")
+  if not (ok_dv and type(dv.open) == "function") then
+    return false, "auto-core.ui.diffview is unavailable"
+  end
+  local ok_draft, drafts = pcall(require, "auto-core.review.draft")
+  if not (ok_draft and type(drafts) == "table" and type(drafts.scope) == "function") then
+    return false, "auto-core.review.draft is unavailable (auto-core >= v0.2.22)"
+  end
+  local ok_repos, repos = pcall(require, "worktree.repos")
+  if not (ok_repos and type(repos.diff) == "function") then
+    return false, "worktree.repos is unavailable"
   end
 
-  -- `fan_out` records carry no slug, and `open_diff` needs one: the review
-  -- store and the authoring draft are both keyed on it. `remote_identity` is
-  -- the same call `worktree.repos.repos()` uses to stamp it, so the key this
-  -- produces is the one the panel would have produced.
+  -- `fan_out` records carry no slug, and the draft + review store are both
+  -- keyed on one. `remote_identity` is the same call `worktree.repos.repos()`
+  -- uses to stamp it, so this key is the one the panel would have produced.
   local ident = {}
   local ok_store, store = pcall(require, "worktree.store")
   if ok_store and type(store.remote_identity) == "function" then
@@ -536,35 +555,94 @@ function M._open_repos_diff(repo, commit)
   end
 
   local wt_path = repo.sample_worktree
-  local row = {
-    kind = "commit",
-    repo = {
-      common_dir = repo.common_dir,
-      label = repo.label,
-      is_bare = repo.is_bare and true or false,
-      sample_worktree = wt_path,
-      path = wt_path,
-      slug = ident.slug, url = ident.url, owner = ident.owner, name = ident.name,
-    },
-    worktree = wt_path and { path = wt_path } or nil,
-    node = {
-      kind = "commit",
-      sha = commit.hash,
-      short = commit.hash:sub(1, 7),
-      -- gitgraph names the subject `msg`; the diff view titles itself with it.
-      commit = { subject = commit.msg or commit.subject or "" },
-    },
+  local sha = commit.hash
+  local repo_rec = {
+    common_dir = repo.common_dir, label = repo.label,
+    is_bare = repo.is_bare and true or false,
+    sample_worktree = wt_path, path = wt_path,
+    slug = ident.slug, url = ident.url, owner = ident.owner, name = ident.name,
   }
 
-  local ok_open, res, oerr = pcall(tree.open_diff, row)
-  if not ok_open then return false, tostring(res) end
-  if res == false then return false, tostring(oerr or "the diff view declined to open") end
+  local ok_files, files = pcall(repos.diff, repo_rec, sha)
+  if not ok_files then return false, "cannot diff: " .. tostring(files) end
+  files = files or {}
+  if #files == 0 then return false, "no diff for " .. sha:sub(1, 7) end
+
+  -- Stored review comments, newest revision LAST so a later pass renders over
+  -- an earlier one rather than being hidden by it — the same ordering the
+  -- panel uses, because a reader switching surfaces must not see a different
+  -- answer.
+  local annotations = {}
+  local ok_rev, review = pcall(require, "worktree.review")
+  if ok_rev and ident.slug and type(repos.reviews) == "function" then
+    local ok_list, revs = pcall(repos.reviews, repo_rec, sha)
+    if ok_list and type(revs) == "table" then
+      for i = #revs, 1, -1 do
+        local meta = revs[i]
+        -- pcall'd per file: a review store is agent-written and hand-editable,
+        -- so ONE malformed file must cost the reader that file, not the diff.
+        local ok_doc, doc = pcall(review.load, ident.slug, meta.commit or meta.sha, meta.revision)
+        if ok_doc and doc then
+          local ok_by, by_path = pcall(review.by_path, doc)
+          if ok_by and type(by_path) == "table" then
+            for path, list in pairs(by_path) do
+              annotations[path] = annotations[path] or {}
+              for _, c in ipairs(list) do
+                c.author = c.author or doc.reviewer
+                table.insert(annotations[path], c)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- The annotate surface. Disabled rather than absent when there is no slug:
+  -- a draft with no stable key would be written somewhere a reader could never
+  -- find it again, and saying so beats silently dropping the reviewer's work.
+  local annotate
+  if ident.slug then
+    local draft = drafts.draft(ident.slug, sha, { cwd = wt_path })
+    annotate = {
+      on_add = function(a) drafts.add_finding(draft, a) end,
+      on_remove = function(a)
+        for i = #draft.items, 1, -1 do
+          local c = draft.items[i]
+          if c.anchored and c.path == a.path and c.line == a.line
+            and (c.side or "RIGHT") == (a.side or "RIGHT") then
+            table.remove(draft.items, i)
+            break
+          end
+        end
+      end,
+      pending = function() return draft.items or {} end,
+    }
+  else
+    annotate = { disabled_reason =
+      "this repository has no remote identity, so a draft would have no stable key" }
+  end
+
+  local title = (" %s  %s "):format(sha:sub(1, 7), commit.msg or commit.subject or "")
+  local handle, err = dv.open({
+    files = files,
+    annotations = annotations,
+    annotate = annotate,
+    -- Both are load-bearing for whole-file context: `_sides_full` shells out to
+    -- `git -C <dir> show <rev>:<path>` and, given neither, silently returns the
+    -- HUNK render while the footer says otherwise (auto-finder v0.4.22).
+    worktree = wt_path,
+    sha = sha,
+    title = title,
+  })
+  if not handle then return false, tostring(err) end
   return true, nil
 end
 
 ---_diff_at_cursor is the `o` handler: repos diff view, falling back to the
----flat float when auto-finder cannot serve it. The fallback SAYS why, once —
----a key that silently does nothing is the defect this whole task started from.
+---flat float when the shared diff view cannot serve it. The fallback SAYS why,
+---once — a key that silently does nothing is the defect this whole task started
+---from.
 local function diff_at_cursor()
   local repo = (state.repos or {})[state.selected or 1]
   local commit = current_commit()
@@ -1142,10 +1220,10 @@ local function bind_pane_action_keys(buf)
   map("f", fetch_selected,  "worktree.graph: fetch selected repo")
   map("F", fetch_all_repos, "worktree.graph: fetch all repos")
   map("p", pull_at_cursor,  "worktree.graph: pull selected repo's worktrees")
-  -- `o` opens the commit in auto-finder's repos diff view: file list, a/b
-  -- panes, annotate + submit. `<CR>` keeps the flat unified float — the two
-  -- answer different questions and both are worth a key.
-  map("o", diff_at_cursor, "worktree.graph: open this commit in the repos diff view")
+  -- `o` opens the commit in the shared diff view: file list, a/b panes,
+  -- annotate. `<CR>` keeps the flat unified float — the two answer different
+  -- questions and both are worth a key.
+  map("o", diff_at_cursor, "worktree.graph: open this commit in the diff view")
   -- q / <Esc> close the panel. auto-core.ui.float.multi already
   -- stamps these on every pane's bufnr at open time, but those
   -- stamps live on the SCRATCH buffer and don't carry over when a
