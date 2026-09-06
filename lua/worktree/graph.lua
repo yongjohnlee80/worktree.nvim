@@ -310,7 +310,14 @@ end
 
 -- ── right pane: cursor-driven stat preview ───────────────────
 
-local function current_commit_hash()
+---current_commit returns the gitgraph commit under the middle pane's cursor.
+---
+---Split out of `current_commit_hash` because the repos diff view titles itself
+---with the commit SUBJECT as well as the sha, and re-deriving that with a
+---second `git show` for a record gitgraph already holds would be a needless
+---subprocess per keypress.
+---@return table? commit
+local function current_commit()
   if not state.mfloat then return nil end
   local mid = state.mfloat:winid("middle")
   if not mid or not vim.api.nvim_win_is_valid(mid) then return nil end
@@ -321,7 +328,13 @@ local function current_commit_hash()
   local row = vim.api.nvim_win_get_cursor(mid)[1]
   local ok_c, commit = pcall(utils.get_commit_from_row, draw_mod.graph, row)
   if not ok_c or not commit then return nil end
-  return commit.hash
+  return commit
+end
+M._current_commit = current_commit -- test hook
+
+local function current_commit_hash()
+  local c = current_commit()
+  return c and c.hash or nil
 end
 
 -- ADR-0041 Batch A (redeems ADR-0038 D1): the preview previously
@@ -409,7 +422,16 @@ local function open_diff_float(repo, commit, lines)
   vim.bo[buf].buftype   = "nofile"
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype  = "git"
-  pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
+  -- A swallowed set_lines is an EMPTY float with no error: `nvim_buf_set_lines`
+  -- throws on a line containing a newline or a NUL, and the bare `pcall` here
+  -- discarded that, leaving the reader a blank window and nothing to act on.
+  local set_ok, set_err = pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
+  if not set_ok then
+    log("could not render the diff: " .. tostring(set_err), vim.log.levels.ERROR)
+    pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false,
+      { "", "  (auto-core/worktree: this diff could not be rendered)",
+        "  " .. tostring(set_err) })
+  end
   vim.bo[buf].modifiable = false
   local title = string.format(" Diff: %s — %s ",
     commit.hash:sub(1, 12), repo.label)
@@ -427,6 +449,16 @@ local function open_diff_float(repo, commit, lines)
   })
   -- ADR-0041 S2 (ADR-0028 hardening): explicit scope-local writes.
   vim.api.nvim_set_option_value("wrap", false, { win = win, scope = "local" })
+  -- Folding is set HERE rather than inherited. `syntax/git.vim` defines a fold
+  -- region per `diff --git` block, and a new window copies its fold options
+  -- from whichever window happened to be current — so an opener with
+  -- `foldmethod=syntax` and a low `foldlevel` would render every file after the
+  -- first as a one-line husk, and the same commit would look different
+  -- depending on where the reader was standing when they pressed <CR>. Open by
+  -- default: the reader asked for the diff.
+  vim.api.nvim_set_option_value("foldmethod", "syntax", { win = win, scope = "local" })
+  vim.api.nvim_set_option_value("foldlevel", 99, { win = win, scope = "local" })
+  vim.api.nvim_set_option_value("foldenable", true, { win = win, scope = "local" })
   vim.api.nvim_set_option_value("winhighlight",
     "Normal:NormalFloat,FloatBorder:FloatBorder",
     { win = win, scope = "local" })
@@ -461,6 +493,93 @@ function M._show_commit_diff(repo, commit)
     on_lines(core.git.graph.show_diff(repo.common_dir, commit.hash))
   end
 end
+
+---_open_repos_diff routes the commit under the cursor into auto-finder's repos
+---diff view: a file list, `a/<old>` and `b/<new>` panes, the annotate keys and
+---the submit-review flow — instead of the single flat unified float `<CR>`
+---opens (Johno, 2026-09-06: "there are cases (and somewhat frequently) for me
+---to go back in the commit history to see the exact files changed under the
+---commit").
+---
+---It CALLS `tree.open_diff` rather than rebuilding the view. That function
+---already assembles the files, merges every review revision's comments, and
+---builds the authoring draft; a second implementation here would be a second
+---thing to keep correct, and the annotate surface is the point.
+---
+---DEPENDENCY DIRECTION. This is worktree reaching INTO auto-finder, the
+---opposite of the usual arrangement (auto-finder depends on worktree, which is
+---why `open_diff` can call `worktree.repos` freely). It is a soft `pcall` with
+---a real fallback: without auto-finder the flat float is still a diff, so the
+---key degrades rather than breaking. Keeping it soft is what makes the
+---inversion acceptable — worktree.nvim must remain usable on its own.
+---@param repo table   a fan_out repo record (common_dir, label, sample_worktree)
+---@param commit table  a gitgraph commit (hash, msg)
+---@return boolean ok, string? err
+function M._open_repos_diff(repo, commit)
+  if not (repo and commit and commit.hash) then
+    return false, "no commit under the cursor"
+  end
+  local ok_tree, tree = pcall(require, "auto-finder.views.repos.tree")
+  if not (ok_tree and type(tree) == "table" and type(tree.open_diff) == "function") then
+    return false, "auto-finder is not available"
+  end
+
+  -- `fan_out` records carry no slug, and `open_diff` needs one: the review
+  -- store and the authoring draft are both keyed on it. `remote_identity` is
+  -- the same call `worktree.repos.repos()` uses to stamp it, so the key this
+  -- produces is the one the panel would have produced.
+  local ident = {}
+  local ok_store, store = pcall(require, "worktree.store")
+  if ok_store and type(store.remote_identity) == "function" then
+    local ok_id, got = pcall(store.remote_identity, repo.common_dir)
+    if ok_id and type(got) == "table" then ident = got end
+  end
+
+  local wt_path = repo.sample_worktree
+  local row = {
+    kind = "commit",
+    repo = {
+      common_dir = repo.common_dir,
+      label = repo.label,
+      is_bare = repo.is_bare and true or false,
+      sample_worktree = wt_path,
+      path = wt_path,
+      slug = ident.slug, url = ident.url, owner = ident.owner, name = ident.name,
+    },
+    worktree = wt_path and { path = wt_path } or nil,
+    node = {
+      kind = "commit",
+      sha = commit.hash,
+      short = commit.hash:sub(1, 7),
+      -- gitgraph names the subject `msg`; the diff view titles itself with it.
+      commit = { subject = commit.msg or commit.subject or "" },
+    },
+  }
+
+  local ok_open, res, oerr = pcall(tree.open_diff, row)
+  if not ok_open then return false, tostring(res) end
+  if res == false then return false, tostring(oerr or "the diff view declined to open") end
+  return true, nil
+end
+
+---_diff_at_cursor is the `o` handler: repos diff view, falling back to the
+---flat float when auto-finder cannot serve it. The fallback SAYS why, once —
+---a key that silently does nothing is the defect this whole task started from.
+local function diff_at_cursor()
+  local repo = (state.repos or {})[state.selected or 1]
+  local commit = current_commit()
+  if not (repo and commit) then
+    log("put the cursor on a commit in the graph pane", vim.log.levels.WARN)
+    return
+  end
+  local ok, err = M._open_repos_diff(repo, commit)
+  if not ok then
+    log("repos diff view unavailable (" .. tostring(err) .. ") — showing the plain diff",
+      vim.log.levels.WARN)
+    M._show_commit_diff(repo, commit)
+  end
+end
+M._diff_at_cursor = diff_at_cursor -- test hook
 
 function M._show_range_diff(repo, from, to)
   local core = _core()
@@ -1023,6 +1142,10 @@ local function bind_pane_action_keys(buf)
   map("f", fetch_selected,  "worktree.graph: fetch selected repo")
   map("F", fetch_all_repos, "worktree.graph: fetch all repos")
   map("p", pull_at_cursor,  "worktree.graph: pull selected repo's worktrees")
+  -- `o` opens the commit in auto-finder's repos diff view: file list, a/b
+  -- panes, annotate + submit. `<CR>` keeps the flat unified float — the two
+  -- answer different questions and both are worth a key.
+  map("o", diff_at_cursor, "worktree.graph: open this commit in the repos diff view")
   -- q / <Esc> close the panel. auto-core.ui.float.multi already
   -- stamps these on every pane's bufnr at open time, but those
   -- stamps live on the SCRATCH buffer and don't carry over when a
@@ -1033,6 +1156,7 @@ local function bind_pane_action_keys(buf)
   map("q",     function() M.close() end, "worktree.graph: close")
   map("<Esc>", function() M.close() end, "worktree.graph: close (Esc)")
 end
+M._bind_pane_action_keys = bind_pane_action_keys -- test hook
 
 -- ── public surface ───────────────────────────────────────────
 
@@ -1111,7 +1235,7 @@ function M.open()
       },
       footer = {
         height  = 1,
-        content = " <Tab> cycle • <CR> diff • 1-9 repo • f fetch • F fetch all • p pull • C checkout • W new • D destroy wt/remote • r rescan • R remotes • q close",
+        content = " <Tab> cycle • <CR> diff • o repos diff • 1-9 repo • f fetch • F fetch all • p pull • C checkout • W new • D destroy wt/remote • r rescan • R remotes • q close",
       },
     },
     initial_focus = "left",
