@@ -2,6 +2,40 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.12] — 2026-09-07 — `o` died on every commit; gitgraph abbreviates its hashes
+
+Patch. Fixes a regression shipped in `v0.5.11`.
+
+Pressing `o` on the graph commit tree errored and opened nothing:
+
+```
+draft.lua:202: attempt to index local 'd' (a nil value)
+graph.lua:606: in function '_open_repos_diff'
+```
+
+**gitgraph's commit objects carry a NINE-character hash** — `bd3a4c495`, read
+live from a running session rather than reasoned about.
+`auto-core.review.draft.scope` requires 40 hex and refuses anything shorter by
+returning nil, deliberately: two commits can share a prefix, and a colliding
+scope silently merges two reviewers' drafts. `draft()` then indexed the nil the
+store handed back, so `o` was broken on **every** commit, not some.
+
+**Resolved rather than relaxed.** The abbreviation is fine for `git show` and
+for the diff read; it is only the DRAFT KEY that must be unambiguous, and the
+repository is the only thing that can expand it. `git rev-parse <short>^{commit}`
+does, and a resolution that fails **refuses** rather than carrying on —
+proceeding with the abbreviation would silently disable the annotate surface,
+which reads as the feature quietly not working rather than as an error.
+
+Why 28 green cells said nothing, which is the part worth keeping: the fixture
+built `{ hash = <full 40-hex> }` from `git rev-parse HEAD`. It pinned an
+ASSUMPTION about gitgraph's contract rather than gitgraph's own, so the suite
+never exercised the only shape the caller ever sees. It now drives the
+abbreviated form and asserts the full sha reaches the view.
+
+Pairs with auto-core **v0.2.23**, which makes the same class fail legibly
+instead of as an index error.
+
 ## [v0.5.11] — 2026-09-07 — `o` opens a commit in the diff view, without reaching up a layer
 
 Patch. Additive keymap plus two float fixes. **Requires auto-core >= v0.2.22.**
