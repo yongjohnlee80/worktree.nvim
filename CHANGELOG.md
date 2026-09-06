@@ -2,6 +2,62 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.11] — 2026-09-07 — `o` opens a commit in the diff view, without reaching up a layer
+
+Patch. Additive keymap plus two float fixes. **Requires auto-core >= v0.2.22.**
+
+**`o` on the graph commit tree** opens the commit under the cursor in the shared
+diff view — a file list, `a/<old>` and `b/<new>` panes, and the annotate
+surface — instead of the single flat unified float `<CR>` gives. Asked for
+because going back through commit history to see exactly which files a commit
+touched is frequent work, and the graph (the good history browser) and the diff
+view (the good per-commit reader) had nothing connecting them. `<CR>` keeps the
+flat float; the two answer different questions.
+
+**It assembles that itself.** The first implementation called
+`auto-finder.views.repos.tree.open_diff`, which meant worktree reaching UP into
+auto-finder — the inverse of the family's order
+(auto-core ← worktree ← auto-finder). A soft `pcall` made that survivable, not
+correct. The shared half moved DOWN into auto-core instead
+(`auto-core.review.draft`, v0.2.22), and this now builds from parts worktree
+already owns or already depends on:
+
+| piece | from |
+|---|---|
+| files | `worktree.repos.diff` (ours) |
+| annotations | `worktree.repos.reviews` + `worktree.review` (ours) |
+| the draft | `auto-core.review.draft` (below us) |
+| the render | `auto-core.ui.diffview` (below us) |
+
+No `require("auto-finder")` on any path, and the suite proves it rather than
+asserting it: `package.preload` for that module is poisoned to throw, so
+anything still reaching for it errors instead of opening.
+
+**The draft is shared.** Keyed `<slug>@<40-hex>` in auto-core's store, so an
+annotation made from the graph is the SAME draft auto-finder's repos panel
+sees. Annotate from the graph, submit from the panel; neither plugin needs the
+other loaded to do its half. Annotate is disabled — with a reason — when the
+repository has no remote identity, since a draft with no stable key would be
+written where no reader could find it again.
+
+Two fixes to the flat `<CR>` float while here:
+
+- **Folding is set explicitly rather than inherited.** `syntax/git.vim` defines
+  a fold region per `diff --git` block, and a new window copies fold options
+  from whichever window was current — so the same commit could render expanded
+  or as a column of one-line husks depending on where the reader was standing.
+  The inherited values were measured, not guessed: `foldmethod=manual`,
+  `foldlevel=0`. With `foldmethod=syntax` now set, `zM` / `za` also give
+  per-file collapsing for free.
+- **A swallowed `nvim_buf_set_lines` was an empty float with no error.** It
+  throws on a line containing a newline or a NUL and the bare `pcall` discarded
+  that. The failure is now logged and rendered in the float itself.
+
+`f` / `F` keep their meaning here (fetch selected / fetch all). They mean file
+navigation in the diff view, which is a different buffer, so there is no
+collision — and the suite pins both so a regression cannot silently steal a
+fetch key.
+
 ## [v0.5.10] — 2026-09-05 — CI on every PR, and a dependency guard that checks the symbol that broke
 
 Patch. No public Lua surface changed.
