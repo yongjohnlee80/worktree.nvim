@@ -685,7 +685,23 @@ function M.pr_diff_commits(repo, base_branch, pr_branch)
   if not dir then return {} end
 
   local range = string.format("%s..%s", base_branch, pr_branch)
-  local log_out = vim.system({ "git", "-C", dir, "log", "--oneline", "--reverse", range }, { text = true }):wait()
+  -- `--format=%H %s`, NOT `--oneline`.
+  --
+  -- `--oneline` implies `--abbrev-commit`, so `sha` came back abbreviated —
+  -- while the very next line here computes `short = sha:sub(1, 7)`, which only
+  -- makes sense if `sha` is full. Consumers took the field at its name:
+  -- auto-core's `review.draft.scope` requires 40 hex and refuses anything
+  -- shorter (two commits can share a prefix, and a colliding scope would
+  -- silently merge two reviewers' drafts), so opening a range diff over a real
+  -- repository died in `draft()` on the first commit.
+  --
+  -- This is the SAME defect v0.5.12 fixed in `graph.lua`, where gitgraph
+  -- handed out a nine-character hash; that fix resolved the abbreviation at
+  -- the consumer because gitgraph's output was not ours to change. Here the
+  -- abbreviation is ours, and produced one line above where it is consumed, so
+  -- it is fixed at the source instead — `short` is now a real abbreviation of
+  -- a real sha rather than a truncation of a truncation (Johno, 2026-09-08).
+  local log_out = vim.system({ "git", "-C", dir, "log", "--format=%H %s", "--reverse", range }, { text = true }):wait()
   if log_out.code ~= 0 or not log_out.stdout or log_out.stdout == "" then return {} end
 
   local commits = {}
