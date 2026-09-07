@@ -99,7 +99,14 @@ jobs:
       # paid by the `drift` job below, not by weakening this one.
       - name: install plugin dependencies
         env:
-          AUTO_CORE_REF: "bc4d998bc22f0644b80e3e89cfe3e1b92d71d32a"  # main @ v0.2.15
+          # BUMPED 2026-09-08 from bc4d998 (v0.2.15). The pin was stale enough to
+          # be red: `adr0083-graph-repos-diff` landed in v0.5.12 (#19) and needs
+          # `auto-core.review.draft`, which arrived in auto-core v0.2.22 — so
+          # every run since #19 failed 7 cells with "auto-core.review.draft is
+          # unavailable (auto-core >= v0.2.22)", on `main` as well as on PRs.
+          # A gate that is red for a reason unrelated to the change under test
+          # is not a gate; nobody can tell a new failure from the standing one.
+          AUTO_CORE_REF: "16ae176726ba8a5303640fde617aeca7db31822e"  # main @ v0.2.23
           PLENARY_REF:   "74b06c6c75e4eeb3108ec01852001636d85a932b"
         run: ./.github/install-deps.sh
 
@@ -143,7 +150,8 @@ jobs:
       - name: report how stale the auto-core pin is
         env:
           GH_TOKEN: ${{ github.token }}
-          AUTO_CORE_REF: "bc4d998bc22f0644b80e3e89cfe3e1b92d71d32a"
+          # Kept in step with the install pin above — the guard below asserts it.
+          AUTO_CORE_REF: "16ae176726ba8a5303640fde617aeca7db31822e"
         run: |
           # One API call rather than a second clone: compare gives the distance
           # to the default branch directly.
