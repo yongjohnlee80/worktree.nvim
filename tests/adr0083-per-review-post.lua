@@ -33,8 +33,12 @@ local repo = { slug = "owner__myrepo", remote = "git@github.com:owner/myrepo.git
 creds.set_profile(repo.slug, { kind = "in_memory", token = "t" })
 
 -- A fake forge that STORES posted review comments and returns them on GET, so we
--- can count exactly what landed remotely (Lector's independent probe).
-local remote = {} -- finding_id -> body
+-- can count exactly what landed remotely (Lector's independent probe). It also
+-- counts POST /reviews calls and every comment SENT (not deduped by id) — the
+-- remote map is keyed by finding_id and so cannot, by itself, detect a repost of
+-- the same id (lector PR #25 r1 cell note); the counters can.
+local remote = {} -- finding_id -> body (the landed set)
+local post_calls, comments_sent = 0, 0
 pr._mock_http = function(method, url, _token, body)
   if method == "GET" and url:find("/comments", 1, true) then
     local arr = {}
@@ -44,8 +48,10 @@ pr._mock_http = function(method, url, _token, body)
     return 200, vim.json.encode(arr)
   end
   if method == "POST" and url:find("/reviews", 1, true) then
+    post_calls = post_calls + 1
     local data = vim.json.decode(body)
     for _, c in ipairs(data.comments or {}) do
+      comments_sent = comments_sent + 1
       local fid = (c.body or ""):match("<!%-%- worktree:finding_id=([^%s]+) %-%->")
       if fid then remote[fid] = c.body end
     end
@@ -78,12 +84,20 @@ ok("*** BOTH reviews' findings reached the forge (r2 not dropped) ***", n == 2,
 ok("*** r1 is [posted] ***", pr.review_posted(repo, { pr = 7, name = r1.doc_name }) == true)
 ok("*** r2 is [posted] ***", pr.review_posted(repo, { pr = 7, name = r2.doc_name }) == true)
 
--- Idempotency preserved: re-submitting r1 posts nothing new.
-local before = n
-pr.post_feedback(repo, 7, { r1 })
-local after = 0
-for _ in pairs(remote) do after = after + 1 end
-ok("re-submitting r1 is idempotent (no duplicate)", after == before, "before=" .. before .. " after=" .. after)
+-- Two reviews, two distinct commit batches -> two POST calls, one comment each.
+ok("each review was posted as its own review (2 POST calls, 2 comments)",
+  post_calls == 2 and comments_sent == 2,
+  "post_calls=" .. post_calls .. " comments_sent=" .. comments_sent)
+
+-- Idempotency: re-submitting r1 sends NOTHING on the wire (its findings are
+-- already posted). Counting POST calls, not remote entries, is what actually
+-- observes a repost — the remote map keyed by finding_id would hide one.
+local post_calls_before, comments_before = post_calls, comments_sent
+local res3 = pr.post_feedback(repo, 7, { r1 })
+ok("re-submitting r1 succeeds (idempotent no-op)", res3 and res3.ok == true)
+ok("*** re-submit made NO new POST call and sent NO comment ***",
+  post_calls == post_calls_before and comments_sent == comments_before,
+  string.format("posts %d->%d, comments %d->%d", post_calls_before, post_calls, comments_before, comments_sent))
 
 pr._mock_http = nil
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
