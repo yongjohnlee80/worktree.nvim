@@ -29,6 +29,74 @@ vim.api.nvim_create_user_command("WorktreeGraphRefresh", function()
 end, { desc = "Worktree: refresh graph view (drops caches)" })
 
 -- ADR-0083 §2.6: PR actions
+-- :WorktreeAuth — register / inspect / clear credential profiles (item A1).
+--
+-- There was previously NO way to register a forge token short of calling
+-- require("worktree.credentials").set_profile by hand, so GetPR was unusable
+-- out of the box. Usage:
+--   :WorktreeAuth list
+--   :WorktreeAuth set <key> env <VAR>
+--   :WorktreeAuth set <key> command <exe> [args...]   (exe must be allowlisted)
+--   :WorktreeAuth clear <key>
+-- <key> is a repo slug (e.g. monstercat__lm) or a forge host (e.g. github.com);
+-- resolve_token tries slug then host then env.
+vim.api.nvim_create_user_command("WorktreeAuth", function(opts)
+  local creds = require("worktree.credentials")
+  local a = opts.fargs
+  local sub = a[1]
+  if sub == "list" then
+    local profs = creds.list_profiles()
+    if vim.tbl_isempty(profs) then
+      vim.notify("WorktreeAuth: no credential profiles configured", vim.log.levels.INFO)
+      return
+    end
+    local lines = { "WorktreeAuth profiles:" }
+    for key, p in pairs(profs) do
+      local shape = p.kind == "env" and ("env " .. tostring(p.var))
+        or p.kind == "command" and ("command " .. table.concat(p.argv or {}, " "))
+        or p.kind
+      lines[#lines + 1] = string.format("  %-28s %s  (%s)", key, shape, p.source or "?")
+    end
+    vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+  elseif sub == "clear" then
+    local key = a[2]
+    if not key then vim.notify("WorktreeAuth clear <key>", vim.log.levels.ERROR); return end
+    creds.clear_profile(key)
+    vim.notify("WorktreeAuth: cleared profile for " .. key, vim.log.levels.INFO)
+  elseif sub == "set" then
+    local key, kind = a[2], a[3]
+    if not key or not kind then
+      vim.notify("WorktreeAuth set <key> env <VAR> | command <exe> [args...]", vim.log.levels.ERROR); return
+    end
+    local ok, err = pcall(function()
+      if kind == "env" then
+        creds.set_profile(key, { kind = "env", var = a[4] })
+      elseif kind == "command" then
+        local argv = {}
+        for i = 4, #a do argv[#argv + 1] = a[i] end
+        creds.set_profile(key, { kind = "command", argv = argv })
+      else
+        error("kind must be 'env' or 'command', got '" .. tostring(kind) .. "'")
+      end
+    end)
+    if ok then
+      vim.notify(string.format("WorktreeAuth: set %s profile for %s", kind, key), vim.log.levels.INFO)
+    else
+      vim.notify("WorktreeAuth: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  else
+    vim.notify("WorktreeAuth <list|set|clear> — see :h WorktreeAuth", vim.log.levels.ERROR)
+  end
+end, {
+  nargs = "*",
+  desc = "Worktree: manage forge credential profiles (list/set/clear)",
+  complete = function(_, line)
+    local n = select(2, line:gsub("%s+", " "))
+    if n <= 1 then return { "list", "set", "clear" } end
+    return {}
+  end,
+})
+
 vim.api.nvim_create_user_command("WorktreeGetPR", function(opts)
   local arg = opts.fargs[1]
   local pr_num = tonumber(arg)
@@ -36,10 +104,23 @@ vim.api.nvim_create_user_command("WorktreeGetPR", function(opts)
     if not num then return end
     local repos_mod = require("worktree.repos")
     local root_repos = repos_mod.repos()
-    local repo = root_repos[1]
-    if not repo then
+    if not root_repos[1] then
       vim.notify("WorktreeGetPR: no repository found in workspace", vim.log.levels.ERROR)
       return
+    end
+    -- B8: act on the repo the cursor/cwd is IN, not blindly repos()[1]. Resolve
+    -- cwd's git common-dir and match it; fall back to the first repo only when
+    -- cwd is not inside any of them (e.g. run from the workspace container).
+    local repo = root_repos[1]
+    local cd = vim.fn.systemlist({ "git", "-C", vim.fn.getcwd(),
+      "rev-parse", "--path-format=absolute", "--git-common-dir" })
+    if vim.v.shell_error == 0 and cd[1] and cd[1] ~= "" then
+      local want = vim.fs.normalize((cd[1]):gsub("/+$", ""))
+      for _, r in ipairs(root_repos) do
+        if r.common_dir and vim.fs.normalize((r.common_dir):gsub("/+$", "")) == want then
+          repo = r; break
+        end
+      end
     end
     local pr_mod = require("worktree.pr")
     local res = pr_mod.fetch_and_create_worktree(repo, num)
