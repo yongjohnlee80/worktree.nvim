@@ -397,11 +397,17 @@ end
 
 do
   -- MF4 branch A — BARE repo: `git worktree add` fails because wt_path is a file.
+  -- Everything lives under ONE uniquely-owned parent (lector PR #23 r1 MF2):
+  -- the code derives wt_path = dirname(common_dir)/pr-42, so putting the bare
+  -- repo inside `root` makes that sibling `root/pr-42` — owned by this cell, not
+  -- the shared /tmp. Cleanup removes only `root`, never a path we don't own.
   local origin = make_origin_with_pr()
-  local bare = vim.fn.tempname() .. "-bareclone.git"
+  local root = vim.fn.tempname() .. "-mf4a"
+  vim.fn.mkdir(root, "p")
+  local bare = root .. "/repo.git"
   vim.fn.system({ "git", "clone", "-q", "--bare", origin, bare })
-  -- wt_path = <parent-of-bare>/pr-42 — pre-create it as a FILE so `worktree add`
-  -- refuses ("already exists"), AFTER the fetch has already succeeded.
+  -- Pre-create wt_path (== root/pr-42) as a FILE so `worktree add` refuses
+  -- ("already exists"), AFTER the fetch has already succeeded.
   local wt_path = vim.fs.dirname(bare) .. "/pr-42"
   vim.fn.writefile({ "block" }, wt_path)
   local slug = "mf4a__repo"
@@ -423,7 +429,7 @@ do
     res and type(res.error) == "string" and res.error:find("check it out", 1, true) ~= nil,
     res and tostring(res.error) or "nil")
   pr_mod._mock_http = nil; creds.clear_profile(slug)
-  vim.fn.delete(origin, "rf"); vim.fn.delete(bare, "rf"); vim.fn.delete(wt_path, "rf")
+  vim.fn.delete(origin, "rf"); vim.fn.delete(root, "rf") -- only owned paths
 end
 
 do
@@ -470,7 +476,7 @@ do
     return d, cd
   end
   local d1, cd1 = mkrepo("gp1")
-  local d2, cd2 = mkrepo("gp2")     -- a second, in-inventory repo
+  local d2, cd2 = mkrepo("gp2")     -- a second, standalone in-inventory repo
   local dX, _   = mkrepo("gpX")     -- a repo NOT in the inventory
   local outside  = vim.fn.tempname() .. "-notrepo"
   vim.fn.mkdir(outside, "p")
@@ -479,7 +485,7 @@ do
   local r, e = repos.getpr_target_repo(d1, inv)
   ok("5f: cwd inside an inventory repo resolves to THAT repo", r and r.slug == "gp1", e)
   local r2 = repos.getpr_target_repo(d2, inv)
-  ok("5f: a linked/second inventory repo also resolves to itself", r2 and r2.slug == "gp2")
+  ok("5f: a second standalone inventory repo also resolves to itself", r2 and r2.slug == "gp2")
   local rc, ec = repos.getpr_target_repo(outside, inv)
   ok("5f: cwd NOT inside any repo falls back to inventory[1]", rc and rc.slug == "gp1", ec)
   local rx, ex = repos.getpr_target_repo(dX, inv)
@@ -489,7 +495,26 @@ do
   local rn, en = repos.getpr_target_repo(outside, {})
   ok("5f: empty inventory yields nil + err", rn == nil and type(en) == "string")
 
-  vim.fn.delete(d1, "rf"); vim.fn.delete(d2, "rf"); vim.fn.delete(dX, "rf"); vim.fn.delete(outside, "rf")
+  -- LINKED worktree (lector PR #23 r1 evidence gap): a real `git worktree add`,
+  -- not a standalone `git init`. Its git-common-dir is the PARENT repo's .git
+  -- (cd1), so a cwd inside the linked worktree must resolve to gp1 — this is the
+  -- bare-repo-family case the resolver exists for, and only a genuine linked
+  -- worktree exercises the common-dir-points-elsewhere path.
+  vim.fn.system({ "git", "-C", d1, "-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "-q", "--allow-empty", "-m", "seed" })
+  local wtlink = vim.fn.tempname() .. "-gp1-linked"
+  vim.fn.system({ "git", "-C", d1, "worktree", "add", "-q", "-b", "linkbr", wtlink })
+  local link_cd = vim.trim(vim.fn.system({ "git", "-C", wtlink,
+    "rev-parse", "--path-format=absolute", "--git-common-dir" }))
+  ok("5f: (precondition) linked worktree's common-dir IS the parent repo's .git",
+    vim.fs.normalize((link_cd:gsub("/+$", ""))) == vim.fs.normalize((cd1:gsub("/+$", ""))),
+    link_cd .. " vs " .. cd1)
+  local rl, el = repos.getpr_target_repo(wtlink, inv)
+  ok("5f: *** cwd inside a LINKED worktree resolves to its parent inventory repo (gp1) ***",
+    rl and rl.slug == "gp1", (rl and rl.slug or "nil") .. " / " .. tostring(el))
+
+  vim.fn.delete(d1, "rf"); vim.fn.delete(d2, "rf"); vim.fn.delete(dX, "rf")
+  vim.fn.delete(outside, "rf"); vim.fn.delete(wtlink, "rf")
 end
 
 -- 6. dissociate_review validation
