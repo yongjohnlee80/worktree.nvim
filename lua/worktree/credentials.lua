@@ -175,18 +175,55 @@ function M.clear_profile(key)
   end
 end
 
----resolve_token retrieves the secret token for a key.
----@param key string
+---list_profiles returns every configured profile (disk + in-memory), keyed by
+---its key, with the token VALUE never included — only the kind and the
+---non-secret shape (env var name, command argv). For `:WorktreeAuth list`.
+---@return table<string, table>
+function M.list_profiles()
+  local out = {}
+  local data = M._read_disk_config()
+  for k, v in pairs(data) do
+    if type(v) == "table" then out[k] = { kind = v.kind, var = v.var, argv = v.argv, source = "disk" } end
+  end
+  for k, v in pairs(M._in_memory) do
+    -- in_memory carries the raw token; never surface it.
+    out[k] = { kind = v.kind, source = "memory" }
+  end
+  return out
+end
+
+---resolve_token retrieves the secret token for a key, with a fallback chain.
+---
+---The chain is repo SLUG → forge HOST → env (item A2). Callers pass both,
+---because a token is registered EITHER per-repo (`monstercat__lm`) OR
+---per-host (`github.com`) and there was no way to reach a host profile: the
+---call sites read `resolve_token(repo.slug or remote_info.host)`, so a slug
+---always won and `host` was dead code.
+---
+---The env fallback is keyed on the HOST, not the key (item A3). The old check
+---was `key:find("github")` — a slug like `monstercat__lm` never contains
+---"github", so `GITHUB_TOKEN` was unreachable for every real repo. A github
+---HOST is what actually decides whether `GITHUB_TOKEN` applies.
+---@param key string           repo slug (or any primary key)
+---@param host string?         forge host, for the profile + env fallback
 ---@return string? token, string? err
-function M.resolve_token(key)
+function M.resolve_token(key, host)
   local prof = M.get_profile(key)
+  -- SLUG → HOST profile fallback: a per-host profile keyed `github.com` is now
+  -- reachable when no per-repo profile exists.
+  if not prof and type(host) == "string" and host ~= "" and host ~= key then
+    prof = M.get_profile(host)
+  end
   if not prof then
-    -- Fallback checks: GITHUB_TOKEN or FORGE_TOKEN if key appears to be a github/forge remote
+    -- Env fallback, keyed on the HOST (or the literal "default").
     local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
-    if env_pat and env_pat ~= "" and (key:find("github") or key == "default") then
+    local host_is_github = type(host) == "string" and host:find("github") ~= nil
+    if env_pat and env_pat ~= "" and (host_is_github or key == "default" or host == "default") then
       return env_pat, nil
     end
-    return nil, string.format("no credential profile configured for '%s'", tostring(key))
+    return nil, string.format(
+      "no credential profile configured for '%s'%s — register one with :WorktreeAuth set",
+      tostring(key), host and (" or host '" .. host .. "'") or "")
   end
 
   if prof.kind == "in_memory" then

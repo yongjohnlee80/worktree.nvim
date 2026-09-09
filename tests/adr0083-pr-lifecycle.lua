@@ -247,6 +247,29 @@ ok("get_pr base_ref is main", pr_data.base_ref == "main")
 -- base_rev mechanism has no source. Deleting the mapping fails this cell.
 ok("get_pr surfaces the forge base sha", pr_data.base_sha == "ba5e5ha0000000000000000000000000000000f", tostring(pr_data.base_sha))
 
+-- 5b. fetch_and_create_worktree reports FAILURE instead of a false {ok=true} (B5).
+-- The forge query is mocked to succeed; the git fetch of the PR ref then fails
+-- (this scratch repo has no `origin` remote), and the function must say so —
+-- the original returned { ok = true } unconditionally, so the UI toasted
+-- "fetched PR #42" even when every git call failed.
+do
+  local scratch = vim.fn.tempname() .. "-fcw"
+  vim.fn.mkdir(scratch, "p")
+  vim.fn.system({ "git", "-C", scratch, "init", "-q" })
+  vim.fn.writefile({ "x" }, scratch .. "/a.txt")
+  vim.fn.system({ "git", "-C", scratch, "-c", "user.email=t@t", "-c", "user.name=t", "add", "." })
+  vim.fn.system({ "git", "-C", scratch, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base" })
+  local res = pr_mod.fetch_and_create_worktree(
+    { slug = "test-repo", remote = "git@github.com:owner/test-repo.git",
+      common_dir = scratch .. "/.git", path = scratch }, 42)
+  ok("B5: *** a failed PR fetch returns ok=false, not a false success ***",
+    res ~= nil and res.ok == false, vim.inspect(res))
+  ok("B5: the failure names the PR and comes from git, not the forge query",
+    res and type(res.error) == "string" and res.error:find("42", 1, true) ~= nil,
+    res and tostring(res.error) or "nil")
+  vim.fn.delete(scratch, "rf")
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",

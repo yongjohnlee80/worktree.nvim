@@ -333,7 +333,7 @@ end
 function M.get_pr(repo, pr_number)
   local remote_url = _get_repo_remote_url(repo)
   local remote_info = M.parse_remote(remote_url)
-  local token, terr = credentials.resolve_token(repo.slug or remote_info.host)
+  local token, terr = credentials.resolve_token(repo.slug, remote_info.host)
   if not token then return nil, terr end
 
   local url = string.format("%s/repos/%s/%s/pulls/%s", remote_info.api_base, remote_info.owner, remote_info.repo, tostring(pr_number))
@@ -373,7 +373,7 @@ end
 function M.get_comments(repo, pr_number)
   local remote_url = _get_repo_remote_url(repo)
   local remote_info = M.parse_remote(remote_url)
-  local token, terr = credentials.resolve_token(repo.slug or remote_info.host)
+  local token, terr = credentials.resolve_token(repo.slug, remote_info.host)
   if not token then return {}, terr end
 
   local url = string.format("%s/repos/%s/%s/pulls/%s/comments", remote_info.api_base, remote_info.owner, remote_info.repo, tostring(pr_number))
@@ -397,7 +397,7 @@ function M.create_pr(repo, opts)
   opts = opts or {}
   local remote_url = _get_repo_remote_url(repo)
   local remote_info = M.parse_remote(remote_url)
-  local token, terr = credentials.resolve_token(repo.slug or remote_info.host)
+  local token, terr = credentials.resolve_token(repo.slug, remote_info.host)
   if not token then return nil, terr end
 
   local payload = vim.json.encode({
@@ -615,6 +615,11 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
   local branch = string.format("pr-%s", tostring(pr_number))
 
   -- 1. git fetch origin pull/{pr_number}/head:pr-{pr_number}
+  --
+  -- B5: check the RESULT. The original returned `{ ok = true }` unconditionally
+  -- — it never re-checked `f_res.code` after the fallback refspec, and never
+  -- checked `worktree add` / `checkout` at all — so the UI toasted "fetched PR
+  -- #N" even when every git call failed.
   local fetch_ref = string.format("pull/%s/head:%s", tostring(pr_number), branch)
   local f_res = vim.system({ "git", "-C", dir, "fetch", "origin", fetch_ref }, { text = true }):wait()
   if f_res.code ~= 0 then
@@ -622,17 +627,40 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
     local alt_ref = string.format("refs/pull/%s/head:%s", tostring(pr_number), branch)
     f_res = vim.system({ "git", "-C", dir, "fetch", "origin", alt_ref }, { text = true }):wait()
   end
+  if f_res.code ~= 0 then
+    return { ok = false, error = string.format(
+      "git fetch of PR #%s failed: %s", tostring(pr_number),
+      vim.trim(f_res.stderr or f_res.stdout or "")) }
+  end
 
-  -- 2. Add worktree
+  -- Refresh the base's remote-tracking ref while we are already on the network,
+  -- so a later diff has a fresh `origin/<base>` (best-effort; the authoritative
+  -- base_sha in the KB doc below is the real fix — B6/lector PR #22). A failure
+  -- here is non-fatal: the fetch that matters (the PR head) already succeeded.
+  if pr.base_ref and pr.base_ref ~= "" then
+    pcall(function()
+      vim.system({ "git", "-C", dir, "fetch", "origin",
+        string.format("%s:refs/remotes/origin/%s", pr.base_ref, pr.base_ref) },
+        { text = true }):wait()
+    end)
+  end
+
+  -- 2. Add worktree — and CHECK it.
   local is_bare = repo.bare == true or (repo.common_dir and repo.common_dir:find("%.git$") and not repo.path)
   local wt_path
+  local add_res
   if is_bare or repo.sample_worktree then
     local parent = vim.fs.dirname(dir)
     wt_path = parent .. "/" .. branch
-    vim.system({ "git", "-C", dir, "worktree", "add", wt_path, branch }, { text = true }):wait()
+    add_res = vim.system({ "git", "-C", dir, "worktree", "add", wt_path, branch }, { text = true }):wait()
   else
     wt_path = dir
-    vim.system({ "git", "-C", dir, "checkout", branch }, { text = true }):wait()
+    add_res = vim.system({ "git", "-C", dir, "checkout", branch }, { text = true }):wait()
+  end
+  if add_res.code ~= 0 then
+    return { ok = false, error = string.format(
+      "fetched PR #%s but could not check it out into a worktree: %s",
+      tostring(pr_number), vim.trim(add_res.stderr or add_res.stdout or "")) }
   end
 
   -- 3. Create KB document shared/prs/<repo_slug>/pr-<number>.md
@@ -647,6 +675,7 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
     string.format("state: %s", pr.draft and "draft" or pr.state),
     string.format("branch: %s", branch),
     string.format("base: %s", pr.base_ref or "main"),
+    string.format("base_sha: %s", pr.base_sha or ""),
     string.format("author: %s", pr.author or ""),
     string.format("created: %s", pr.created_at or os.date("%Y-%m-%d")),
     string.format("updated: %s", pr.updated_at or os.date("%Y-%m-%d")),

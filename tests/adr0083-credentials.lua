@@ -114,6 +114,59 @@ local cmd_token, cmd_err = creds.resolve_token("cmd-slug")
 ok("allowlisted command resolves token correctly", cmd_token == "token_cmd_999", cmd_err)
 ok("trailing newline was stripped from command output", cmd_token == "token_cmd_999")
 
+-- 7b. resolve_token fallback chain: slug -> host -> env (items A2, A3)
+--
+-- The call sites read resolve_token(repo.slug or remote_info.host), so a slug
+-- always won and a per-HOST profile was unreachable; and the env fallback keyed
+-- on key:find("github"), which a slug like monstercat__lm never matches. Both
+-- are fixed by resolve_token(key, host).
+do
+  -- A2: a per-HOST profile is reached when there is no per-repo profile.
+  creds.set_profile("github.com", { kind = "in_memory", token = "host_token_abc" })
+  ok("A2: unknown slug falls back to the host profile",
+    creds.resolve_token("monstercat__lm", "github.com") == "host_token_abc",
+    tostring(creds.resolve_token("monstercat__lm", "github.com")))
+  -- A per-repo profile still WINS over the host.
+  creds.set_profile("monstercat__lm", { kind = "in_memory", token = "repo_token_xyz" })
+  ok("A2: a per-repo profile wins over the host",
+    creds.resolve_token("monstercat__lm", "github.com") == "repo_token_xyz")
+  creds.clear_profile("monstercat__lm")
+  creds.clear_profile("github.com")
+
+  -- A3: env fallback keyed on the HOST, not a substring of the slug.
+  local saved = vim.env.GITHUB_TOKEN
+  vim.env.GITHUB_TOKEN = "env_gh_token_123"
+  ok("A3: a github HOST reaches GITHUB_TOKEN for a non-github slug",
+    creds.resolve_token("monstercat__lm", "github.com") == "env_gh_token_123",
+    tostring(creds.resolve_token("monstercat__lm", "github.com")))
+  ok("A3: *** a non-github host does NOT silently use GITHUB_TOKEN ***",
+    select(1, creds.resolve_token("acme__thing", "gitlab.example.com")) == nil)
+  ok("A3: the old slug-substring behaviour is gone (slug alone, no host, no match)",
+    select(1, creds.resolve_token("monstercat__lm")) == nil)
+  vim.env.GITHUB_TOKEN = saved
+end
+
+-- 7c. list_profiles reports shape without leaking the token (A1 support)
+do
+  creds.set_profile("list-env", { kind = "env", var = "SOME_VAR" })
+  creds.set_profile("list-mem", { kind = "in_memory", token = "super_secret_tok" })
+  local profs = creds.list_profiles()
+  ok("A1: list includes the env profile with its var", profs["list-env"]
+    and profs["list-env"].kind == "env" and profs["list-env"].var == "SOME_VAR")
+  ok("A1: list includes the in-memory profile", profs["list-mem"]
+    and profs["list-mem"].kind == "in_memory")
+  ok("A1: *** list NEVER surfaces the in-memory token value ***", (function()
+    for _, p in pairs(profs) do
+      for _, v in pairs(p) do
+        if type(v) == "string" and v:find("super_secret_tok", 1, true) then return false end
+      end
+    end
+    return true
+  end)())
+  creds.clear_profile("list-env")
+  creds.clear_profile("list-mem")
+end
+
 -- 8. Clearing profiles
 creds.clear_profile("in-mem-slug")
 ok("cleared in-memory profile is gone", creds.get_profile("in-mem-slug") == nil)

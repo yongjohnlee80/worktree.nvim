@@ -182,6 +182,39 @@ use {
 | `:WorktreeInit`           | Init a new project in the same layout                     |
 | `:WorktreeGraph`          | Toggle the multi-repo graph dashboard                     |
 | `:WorktreeGraphRefresh`   | Refresh the graph view (drops `auto-core.git.graph` caches)|
+| `:WorktreeGetPR <n>`      | Fetch PR #n's branch into a worktree (acts on the repo at cwd)|
+| `:WorktreeAuth <sub>`     | Manage forge credential profiles (`list` / `set` / `clear`)|
+
+## Forge authentication (for PR features)
+
+`:WorktreeGetPR` and the review-posting flow talk to a forge (GitHub, Forgejo,
+GitLab) and need a token. **Nothing works until a credential profile is
+registered** — there is no ambient default. Register one with `:WorktreeAuth`:
+
+```vim
+" A token from an allowlisted secret helper (recommended). The executable must
+" be on the allowlist: pass, op, gh, secret-tool, keyctl, security.
+:WorktreeAuth set github.com command pass show git/pat
+
+" Or from an environment variable:
+:WorktreeAuth set github.com env GITHUB_TOKEN
+
+" Inspect / remove (the token VALUE is never printed):
+:WorktreeAuth list
+:WorktreeAuth clear github.com
+```
+
+The `<key>` is matched **slug → host → env**, in that order:
+
+- a **repo slug** (e.g. `monstercat__lm`) for a per-repository token;
+- a **forge host** (e.g. `github.com`) for a token shared by every repo on
+  that host — the common case;
+- failing both, `$GITHUB_TOKEN` is used **only when the repo's host is
+  GitHub** (a non-GitHub host never silently borrows it).
+
+Profiles persist in `~/.config/nvim/.auto-agents-config/worktree-auth.json`
+(mode 0600, token-free — it stores the *reference*, never the secret). The
+allowlist is extendable via `setup({ auth = { allowed_command_providers = {…} } })`.
 
 ## Multi-repo graph view (`worktree.graph`)
 
