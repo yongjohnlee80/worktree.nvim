@@ -270,6 +270,76 @@ do
   vim.fn.delete(scratch, "rf")
 end
 
+-- 5c. BRIDGE: the forge base sha reaches the consumer end-to-end (lector #22 r1).
+--   get_pr(base.sha) -> fetch_and_create_worktree persists base_sha in the doc
+--   -> find_for_worktree parses it back -> repos.pr_diff forwards it as base_rev
+--   -> pr_diff_commits ranges authoritatively (stale=false).
+-- Without any link in this chain the authoritative base never reaches the diff,
+-- which is exactly the gap the review named.
+do
+  local kb = vim.fn.tempname() .. "-bridgekb"
+  local slug = "bridge__repo"
+  -- Real repo: base advances C1->C2->C3, feature=C3+F1, local base stale at C1,
+  -- origin/base stale at C2 — so ONLY the forge sha (C3) yields the correct range.
+  local rp = vim.fn.tempname() .. "-bridge"
+  local function g(...) return vim.fn.system({ "git", "-C", rp, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=base", ... }) end
+  vim.fn.mkdir(rp, "p"); vim.fn.system({ "git", "-C", rp, "init", "-q", "-b", "base" })
+  vim.fn.writefile({ "c1" }, rp .. "/a"); g("add", "."); g("commit", "-qm", "C1")
+  local c1 = vim.trim(g("rev-parse", "HEAD"))
+  vim.fn.writefile({ "c2" }, rp .. "/b"); g("add", "."); g("commit", "-qm", "C2")
+  local c2 = vim.trim(g("rev-parse", "HEAD"))
+  vim.fn.writefile({ "c3" }, rp .. "/c"); g("add", "."); g("commit", "-qm", "C3")
+  local c3 = vim.trim(g("rev-parse", "HEAD"))
+  g("checkout", "-q", "-b", "pr-77"); vim.fn.writefile({ "f1" }, rp .. "/f1"); g("add", "."); g("commit", "-qm", "F1")
+  g("checkout", "-q", "base"); g("update-ref", "refs/remotes/origin/base", c2); g("reset", "--hard", c1)
+  local repo = { slug = slug, common_dir = rp .. "/.git", path = rp }
+
+  -- get_pr mocked to return base.sha = C3 (the true forge base).
+  pr_mod._mock_http = function(method, url)
+    if method == "GET" and url:find("/pulls/77$") then
+      return 200, vim.json.encode({ number = 77, title = "bridge", body = "b",
+        state = "open", draft = false, base = { ref = "base", sha = c3 },
+        head = { ref = "pr-77", sha = c3 } })
+    end
+    return 404, "nf"
+  end
+  creds.set_profile(slug, { kind = "in_memory", token = "t" })
+
+  -- 1) get_pr surfaces base_sha = C3.
+  local pr = pr_mod.get_pr(repo, 77)
+  ok("5c: get_pr surfaces the forge base sha (C3)", pr and pr.base_sha == c3, pr and tostring(pr.base_sha))
+
+  -- 2) The KB PR doc persists base_sha, and find_for_worktree parses it back.
+  local doc_dir = string.format("%s/shared/prs/%s", kb, slug)
+  vim.fn.mkdir(doc_dir, "p")
+  vim.fn.writefile({ "---", "number: 77", "branch: pr-77",
+    "base: base", "base_sha: " .. c3, "---", "x" },
+    string.format("%s/pr-77.md", doc_dir))
+  local saved = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local found = pr_mod.find_for_worktree(repo, { branch = "pr-77" })
+  vim.env.AUTO_AGENTS_KB_ROOT = saved
+  ok("5c: find_for_worktree parses base_sha back", found and found.base_sha == c3,
+    found and tostring(found.base_sha) or "nil")
+
+  -- 3) repos.pr_diff forwards base_rev -> authoritative range (only F1, not C2/C3),
+  --    and reports stale=false.
+  local repos = require("worktree.repos")
+  local commits, stale = repos.pr_diff(repo, "base", "pr-77", { base_rev = found.base_sha })
+  local subj = {}
+  for _, c in ipairs(commits) do subj[c.subject] = true end
+  ok("5c: *** repos.pr_diff forwards base_rev -> only F1 (C2/C3 excluded) ***",
+    subj["F1"] and not subj["C2"] and not subj["C3"], vim.inspect(vim.tbl_keys(subj)))
+  ok("5c: *** and reports stale=false (authoritative) ***", stale == false)
+  -- And WITHOUT base_rev, repos.pr_diff surfaces stale=true (the honest fallback).
+  local _, stale2 = repos.pr_diff(repo, "base", "pr-77")
+  ok("5c: repos.pr_diff without base_rev reports stale=true", stale2 == true)
+
+  pr_mod._mock_http = nil
+  creds.clear_profile(slug)
+  vim.fn.delete(rp, "rf"); vim.fn.delete(kb, "rf")
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",
