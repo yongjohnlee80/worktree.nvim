@@ -223,6 +223,47 @@ for _, arg in ipairs(last_call.cmd) do
 end
 vim.system = real_system
 
+-- MF-rng (lector PR #23 r1): concurrent credential-config creation must not
+-- collide. open_exclusive_config drew its temp suffix from Lua's DEFAULT
+-- math.random stream, which is identical in every freshly-launched Lua state —
+-- so N independently-spawned nvims produced the SAME ten O_EXCL candidates and
+-- exhausted them (lector measured 4/4 concurrent failures). The fix seeds from
+-- an OS entropy source. Evidence, timing-independent: launch 8 headless nvims,
+-- each with its OWN run_dir so candidate #1 always succeeds, and collect the
+-- chosen filename. Under the deterministic bug every process reports the SAME
+-- suffix; with OS entropy all eight are distinct.
+do
+  local probe = tmp_dir .. "/rng-probe.lua"
+  vim.fn.writefile({
+    "vim.opt.runtimepath:prepend(" .. string.format("%q", plugin_root) .. ")",
+    "local creds = require('worktree.credentials')",
+    "creds._custom_run_dir = arg[1]",
+    "local path = creds.open_exclusive_config('tok-probe')",
+    "io.write(vim.fn.fnamemodify(path, ':t'))",
+    "os.exit(0)",
+  }, probe)
+  local N = 8
+  local procs = {}
+  for i = 1, N do
+    local rd = tmp_dir .. "/rng-run-" .. i
+    vim.fn.mkdir(rd, "p")
+    procs[i] = vim.system(
+      { "nvim", "--headless", "-u", "NONE", "-l", probe, rd }, { text = true })
+  end
+  local suffixes, seen, n_distinct, all_spawned = {}, {}, 0, true
+  for i = 1, N do
+    local r = procs[i]:wait()
+    local out = vim.trim(r.stdout or "")
+    if r.code ~= 0 or out == "" then all_spawned = false end
+    suffixes[i] = out
+    if out ~= "" and not seen[out] then seen[out] = true; n_distinct = n_distinct + 1 end
+  end
+  ok("MF-rng: all 8 probe processes created a config (no O_EXCL exhaustion)",
+    all_spawned, vim.inspect(suffixes))
+  ok("MF-rng: *** 8 concurrent processes chose 8 DISTINCT temp names (not one shared RNG stream) ***",
+    n_distinct == N, string.format("%d distinct of %d: %s", n_distinct, N, vim.inspect(suffixes)))
+end
+
 -- Cleanup scratch dir
 vim.fn.delete(tmp_dir, "rf")
 

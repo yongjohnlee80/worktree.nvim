@@ -20,6 +20,7 @@ M.DEFAULT_ALLOWLIST = {
 -- In-memory profile storage (for kind == "in_memory")
 M._in_memory = {}
 M._custom_config_path = nil
+M._custom_run_dir = nil -- test hook: override the ephemeral-config directory
 
 ---_config_path returns the path to worktree-auth.json
 function M._config_path()
@@ -265,6 +266,31 @@ function M.resolve_token(key, host)
   return nil, string.format("unsupported profile kind '%s'", tostring(prof.kind))
 end
 
+---_temp_suffix returns a hex suffix for an ephemeral credential-config name.
+---
+---It MUST NOT reuse Lua's default `math.random` stream: that stream is
+---identical in every freshly-launched Lua state, so independently-spawned
+---nvims produced the SAME ten O_EXCL candidates and exhausted them, making
+---concurrent PR operations fail (lector PR #23 r1 — measured 4/4). Draw from
+---an OS entropy source (`vim.uv.random`, libuv's CSPRNG); if that is somehow
+---unavailable, fall back to a per-process/per-attempt mix of pid + monotonic
+---clock so distinct processes still diverge.
+---@param attempt integer  the candidate index, mixed into the fallback
+---@return string suffix
+function M._temp_suffix(attempt)
+  local ok_r, bytes = pcall(function() return vim.uv.random(12) end)
+  if ok_r and type(bytes) == "string" and #bytes >= 8 then
+    return (bytes:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
+  end
+  -- Fallback: pid + high-res monotonic clock + attempt, seeded per call so two
+  -- processes with the same default seed still diverge (pid differs).
+  local pid = vim.uv.os_getpid()
+  local hr = vim.uv.hrtime()
+  math.randomseed(bit.bxor(pid * 2654435761, hr % 0x7fffffff, attempt))
+  return string.format("%08x%08x%04x",
+    bit.bxor(pid, hr % 0xffffffff), math.random(0, 0x7fffffff), attempt % 0xffff)
+end
+
 ---open_exclusive_config creates a mode 0600 ephemeral curl config for bearer auth (ADR-0083 §2.5.2).
 ---@param token string
 ---@return string config_path, function cleanup_fn
@@ -272,13 +298,13 @@ function M.open_exclusive_config(token)
   if type(token) ~= "string" or token == "" then
     error("worktree.credentials: token must be a non-empty string")
   end
-  local run_dir = vim.fn.stdpath("run")
+  local run_dir = M._custom_run_dir or vim.fn.stdpath("run")
   if not run_dir or run_dir == "" or vim.fn.isdirectory(run_dir) ~= 1 then
     run_dir = "/tmp"
   end
 
-  for _ = 1, 10 do
-    local rand_suffix = string.format("%08x%08x", math.random(0, 0x7fffffff), math.random(0, 0x7fffffff))
+  for attempt = 1, 10 do
+    local rand_suffix = M._temp_suffix(attempt)
     local path = string.format("%s/worktree-auth-%s.curlrc", run_dir, rand_suffix)
     -- "wx" maps strictly to O_WRONLY | O_CREAT | O_EXCL
     local fd, err = vim.uv.fs_open(path, "wx", 384) -- mode 0600
