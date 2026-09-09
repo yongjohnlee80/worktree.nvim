@@ -841,7 +841,7 @@ function M.find_for_worktree(repo, wt)
     local files = vim.fn.globpath(prs_dir, "pr-*.md", false, true)
     for _, f in ipairs(files) do
       local lines = vim.fn.readfile(f, "", 30)
-      local num, title, state, branch, draft, base
+      local num, title, state, branch, draft, base, base_sha
       local in_fm = false
       for _, l in ipairs(lines) do
         if l == "---" then
@@ -857,6 +857,10 @@ function M.find_for_worktree(repo, wt)
           -- "main" and diffed against the wrong branch. Accept both `base:` and
           -- the `base_ref:` the writer emits.
           elseif k == "base" or k == "base_ref" then base = v:gsub('^"(.*)"$', "%1")
+          -- base_sha: the FORGE's authoritative base commit, written by
+          -- fetch_and_create_worktree. It is what lets open_pr_diff pass an
+          -- authoritative base_rev to repos.pr_diff (B6 wiring, lector #22 r1).
+          elseif k == "base_sha" then base_sha = v:gsub('^"(.*)"$', "%1")
           end
         end
       end
@@ -868,6 +872,7 @@ function M.find_for_worktree(repo, wt)
           draft = draft == true or state == "draft",
           branch = branch or wt.branch,
           base = base,
+          base_sha = (base_sha and base_sha ~= "") and base_sha or nil,
           kb_doc = f,
         }
       end

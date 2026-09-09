@@ -670,10 +670,21 @@ end
 ---@param base_ref string
 ---@param pr_ref string
 ---@return table[] commits
-function M.pr_diff(repo, base_ref, pr_ref)
+---pr_diff lists the commits a PR adds, best-effort or authoritative.
+---@param repo table
+---@param base_ref string
+---@param pr_ref string
+---@param opts table?  { base_rev: string? }  the forge's authoritative base sha
+---@return table[] commits
+---@return boolean stale  true when the range is a local best-effort (no base_rev)
+function M.pr_diff(repo, base_ref, pr_ref, opts)
   local ok_pr, pr_mod = pcall(require, "worktree.pr")
-  if not ok_pr then return {} end
-  return pr_mod.pr_diff_commits(repo, base_ref, pr_ref)
+  if not ok_pr then return {}, false end
+  -- Forward opts AND the stale flag: this is the bridge auto-finder's
+  -- open_pr_diff calls, so the authoritative base_rev has to survive the hop
+  -- and the caller has to be able to surface the best-effort case (lector
+  -- PR #22 r1 — the authoritative sha must reach the consumer path).
+  return pr_mod.pr_diff_commits(repo, base_ref, pr_ref, opts)
 end
 
 ---reviews_for_pr returns all review records associated with pr_number.
