@@ -665,15 +665,21 @@ function M.pr_for_worktree(repo, wt)
   return pr_mod.find_for_worktree(repo, wt)
 end
 
----pr_diff returns commit and file diffs for a PR.
----@param repo WorktreeRepo
+---pr_diff lists the commits a PR adds, best-effort or authoritative.
+---@param repo table
 ---@param base_ref string
 ---@param pr_ref string
+---@param opts table?  { base_rev: string? }  the forge's authoritative base sha
 ---@return table[] commits
-function M.pr_diff(repo, base_ref, pr_ref)
+---@return boolean stale  true when the range is a local best-effort (no base_rev)
+function M.pr_diff(repo, base_ref, pr_ref, opts)
   local ok_pr, pr_mod = pcall(require, "worktree.pr")
-  if not ok_pr then return {} end
-  return pr_mod.pr_diff_commits(repo, base_ref, pr_ref)
+  if not ok_pr then return {}, false end
+  -- Forward opts AND the stale flag: this is the bridge auto-finder's
+  -- open_pr_diff calls, so the authoritative base_rev has to survive the hop
+  -- and the caller has to be able to surface the best-effort case (lector
+  -- PR #22 r1 — the authoritative sha must reach the consumer path).
+  return pr_mod.pr_diff_commits(repo, base_ref, pr_ref, opts)
 end
 
 ---reviews_for_pr returns all review records associated with pr_number.
@@ -691,6 +697,39 @@ function M.reviews_for_pr(repo, pr_number)
     end
   end
   return out
+end
+
+---getpr_target_repo resolves which repo a GetPR should act on for a given cwd,
+---testably (the `:WorktreeGetPR` command is the only caller).
+---
+---Three outcomes (lector PR #23 — a mismatch must not silently target repo 1):
+---  * cwd is inside a repo that IS in the inventory  -> that repo, nil
+---  * cwd is NOT inside any git repo (workspace container) -> inventory[1], nil
+---  * cwd IS inside a git repo NOT in the inventory  -> nil, err (a lexical
+---    path/symlink alias can defeat the common-dir compare; refuse rather than
+---    fetch the PR into the wrong repo)
+---@param cwd string
+---@param inventory table[]?  defaults to M.repos()
+---@return table? repo, string? err
+function M.getpr_target_repo(cwd, inventory)
+  inventory = inventory or M.repos()
+  if not inventory[1] then return nil, "no repository found in workspace" end
+  local out = vim.fn.systemlist({ "git", "-C", cwd,
+    "rev-parse", "--path-format=absolute", "--git-common-dir" })
+  if vim.v.shell_error ~= 0 or not out[1] or out[1] == "" then
+    -- Not inside a repo: the container case. Act on the first.
+    return inventory[1], nil
+  end
+  -- NB: gsub returns (string, count); the extra parens drop the count so it
+  -- does not leak into vim.fs.normalize's second (opts) argument.
+  local want = vim.fs.normalize(((out[1]):gsub("/+$", "")))
+  for _, r in ipairs(inventory) do
+    if r.common_dir and vim.fs.normalize(((r.common_dir):gsub("/+$", ""))) == want then
+      return r, nil
+    end
+  end
+  return nil, "cwd is in a git repo that is not in the workspace inventory ("
+    .. want .. ") — cd into the target repo, or run from the workspace root"
 end
 
 return M

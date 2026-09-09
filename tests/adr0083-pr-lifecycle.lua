@@ -247,6 +247,276 @@ ok("get_pr base_ref is main", pr_data.base_ref == "main")
 -- base_rev mechanism has no source. Deleting the mapping fails this cell.
 ok("get_pr surfaces the forge base sha", pr_data.base_sha == "ba5e5ha0000000000000000000000000000000f", tostring(pr_data.base_sha))
 
+-- 5b. fetch_and_create_worktree reports FAILURE instead of a false {ok=true} (B5).
+-- The forge query is mocked to succeed; the git fetch of the PR ref then fails
+-- (this scratch repo has no `origin` remote), and the function must say so —
+-- the original returned { ok = true } unconditionally, so the UI toasted
+-- "fetched PR #42" even when every git call failed.
+do
+  local scratch = vim.fn.tempname() .. "-fcw"
+  vim.fn.mkdir(scratch, "p")
+  vim.fn.system({ "git", "-C", scratch, "init", "-q" })
+  vim.fn.writefile({ "x" }, scratch .. "/a.txt")
+  vim.fn.system({ "git", "-C", scratch, "-c", "user.email=t@t", "-c", "user.name=t", "add", "." })
+  vim.fn.system({ "git", "-C", scratch, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base" })
+  local res = pr_mod.fetch_and_create_worktree(
+    { slug = "test-repo", remote = "git@github.com:owner/test-repo.git",
+      common_dir = scratch .. "/.git", path = scratch }, 42)
+  ok("B5: *** a failed PR fetch returns ok=false, not a false success ***",
+    res ~= nil and res.ok == false, vim.inspect(res))
+  ok("B5: the failure names the PR and comes from git, not the forge query",
+    res and type(res.error) == "string" and res.error:find("42", 1, true) ~= nil,
+    res and tostring(res.error) or "nil")
+  vim.fn.delete(scratch, "rf")
+end
+
+-- 5c. BRIDGE: the forge base sha reaches the consumer end-to-end (lector #22 r1).
+--   get_pr(base.sha) -> fetch_and_create_worktree persists base_sha in the doc
+--   -> find_for_worktree parses it back -> repos.pr_diff forwards it as base_rev
+--   -> pr_diff_commits ranges authoritatively (stale=false).
+-- Without any link in this chain the authoritative base never reaches the diff,
+-- which is exactly the gap the review named.
+do
+  local kb = vim.fn.tempname() .. "-bridgekb"
+  local slug = "bridge__repo"
+  -- Real repo: base advances C1->C2->C3, feature=C3+F1, local base stale at C1,
+  -- origin/base stale at C2 — so ONLY the forge sha (C3) yields the correct range.
+  local rp = vim.fn.tempname() .. "-bridge"
+  local function g(...) return vim.fn.system({ "git", "-C", rp, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=base", ... }) end
+  vim.fn.mkdir(rp, "p"); vim.fn.system({ "git", "-C", rp, "init", "-q", "-b", "base" })
+  vim.fn.writefile({ "c1" }, rp .. "/a"); g("add", "."); g("commit", "-qm", "C1")
+  local c1 = vim.trim(g("rev-parse", "HEAD"))
+  vim.fn.writefile({ "c2" }, rp .. "/b"); g("add", "."); g("commit", "-qm", "C2")
+  local c2 = vim.trim(g("rev-parse", "HEAD"))
+  vim.fn.writefile({ "c3" }, rp .. "/c"); g("add", "."); g("commit", "-qm", "C3")
+  local c3 = vim.trim(g("rev-parse", "HEAD"))
+  g("checkout", "-q", "-b", "pr-77"); vim.fn.writefile({ "f1" }, rp .. "/f1"); g("add", "."); g("commit", "-qm", "F1")
+  g("checkout", "-q", "base"); g("update-ref", "refs/remotes/origin/base", c2); g("reset", "--hard", c1)
+  local repo = { slug = slug, common_dir = rp .. "/.git", path = rp }
+
+  -- get_pr mocked to return base.sha = C3 (the true forge base).
+  pr_mod._mock_http = function(method, url)
+    if method == "GET" and url:find("/pulls/77$") then
+      return 200, vim.json.encode({ number = 77, title = "bridge", body = "b",
+        state = "open", draft = false, base = { ref = "base", sha = c3 },
+        head = { ref = "pr-77", sha = c3 } })
+    end
+    return 404, "nf"
+  end
+  creds.set_profile(slug, { kind = "in_memory", token = "t" })
+
+  -- 1) get_pr surfaces base_sha = C3.
+  local pr = pr_mod.get_pr(repo, 77)
+  ok("5c: get_pr surfaces the forge base sha (C3)", pr and pr.base_sha == c3, pr and tostring(pr.base_sha))
+
+  -- 2) The KB PR doc persists base_sha, and find_for_worktree parses it back.
+  local doc_dir = string.format("%s/shared/prs/%s", kb, slug)
+  vim.fn.mkdir(doc_dir, "p")
+  vim.fn.writefile({ "---", "number: 77", "branch: pr-77",
+    "base: base", "base_sha: " .. c3, "---", "x" },
+    string.format("%s/pr-77.md", doc_dir))
+  local saved = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local found = pr_mod.find_for_worktree(repo, { branch = "pr-77" })
+  vim.env.AUTO_AGENTS_KB_ROOT = saved
+  ok("5c: find_for_worktree parses base_sha back", found and found.base_sha == c3,
+    found and tostring(found.base_sha) or "nil")
+
+  -- 3) repos.pr_diff forwards base_rev -> authoritative range (only F1, not C2/C3),
+  --    and reports stale=false.
+  local repos = require("worktree.repos")
+  local commits, stale = repos.pr_diff(repo, "base", "pr-77", { base_rev = found.base_sha })
+  local subj = {}
+  for _, c in ipairs(commits) do subj[c.subject] = true end
+  ok("5c: *** repos.pr_diff forwards base_rev -> only F1 (C2/C3 excluded) ***",
+    subj["F1"] and not subj["C2"] and not subj["C3"], vim.inspect(vim.tbl_keys(subj)))
+  ok("5c: *** and reports stale=false (authoritative) ***", stale == false)
+  -- And WITHOUT base_rev, repos.pr_diff surfaces stale=true (the honest fallback).
+  local _, stale2 = repos.pr_diff(repo, "base", "pr-77")
+  ok("5c: repos.pr_diff without base_rev reports stale=true", stale2 == true)
+
+  pr_mod._mock_http = nil
+  creds.clear_profile(slug)
+  vim.fn.delete(rp, "rf"); vim.fn.delete(kb, "rf")
+end
+
+-- 5d. post_feedback honours the slug -> HOST -> env chain (lector PR #23 MF2).
+-- A profile registered ONLY under the host `github.com` (no per-slug profile,
+-- no env token) must let review posting resolve a token — because post_feedback
+-- passes remote_info.host to resolve_token like get/create/comments do. If it
+-- resolved with the slug alone, the host profile is invisible and posting fails
+-- with "failed to resolve auth token" while every other verb works. The mock
+-- captures the token that reaches the HTTP layer, so we also prove it is the
+-- HOST profile's token, not something else.
+do
+  local slug = "hostonly__repo"
+  local repo = { slug = slug, remote = "git@github.com:owner/hostonly-repo.git" }
+  -- Only a host-scoped profile exists; ensure no slug profile lingers.
+  creds.clear_profile(slug)
+  creds.set_profile("github.com", { kind = "in_memory", token = "HOSTTOK-9x" })
+  local seen_post_token = nil
+  pr_mod._mock_http = function(method, url, token, _body)
+    if method == "GET" and url:find("/comments$") then return 200, "[]" end
+    if method == "POST" and url:find("/reviews$") then
+      seen_post_token = token
+      return 201, vim.json.encode({ id = 1 })
+    end
+    return 404, "nf"
+  end
+  local res = pr_mod.post_feedback(repo, 7, {
+    { commit = "deadbeef", doc_name = "rev", comments = {
+      { path = "a.lua", line = 1, body = "nit" } } },
+  })
+  ok("5d: *** post_feedback resolves via the host profile (ok=true) ***",
+    res ~= nil and res.ok == true, res and tostring(res.error) or "nil")
+  ok("5d: the HOST profile's token is what reached the POST /reviews call",
+    seen_post_token == "HOSTTOK-9x", tostring(seen_post_token))
+  pr_mod._mock_http = nil
+  creds.clear_profile("github.com")
+end
+
+-- 5e. fetch_and_create_worktree checks BOTH checkout branches (lector PR #23 MF4).
+-- The original returned { ok = true } no matter what git did; the fix checks the
+-- exit code of `worktree add` (bare path) AND `checkout` (non-bare path). One
+-- cell per branch, each engineered so the fetch SUCCEEDS (a real local origin
+-- carrying refs/pull/42/head) and only the checkout step fails — so deleting
+-- EITHER of the two checks (not just the fetch check) turns the cell green.
+local function make_origin_with_pr()
+  -- origin: main has base.txt; refs/pull/42/head additionally adds collide.txt.
+  local origin = vim.fn.tempname() .. "-origin"
+  local function g(...) return vim.fn.system({ "git", "-C", origin,
+    "-c", "user.email=t@t", "-c", "user.name=t", "-c", "init.defaultBranch=main", ... }) end
+  vim.fn.mkdir(origin, "p"); vim.fn.system({ "git", "-C", origin, "init", "-q", "-b", "main" })
+  vim.fn.writefile({ "base" }, origin .. "/base.txt"); g("add", "."); g("commit", "-qm", "base")
+  g("checkout", "-q", "-b", "prhead")
+  vim.fn.writefile({ "from-pr" }, origin .. "/collide.txt"); g("add", "."); g("commit", "-qm", "pr")
+  g("update-ref", "refs/pull/42/head", "prhead")
+  g("checkout", "-q", "main"); g("branch", "-qD", "prhead")
+  return origin
+end
+
+do
+  -- MF4 branch A — BARE repo: `git worktree add` fails because wt_path is a file.
+  -- Everything lives under ONE uniquely-owned parent (lector PR #23 r1 MF2):
+  -- the code derives wt_path = dirname(common_dir)/pr-42, so putting the bare
+  -- repo inside `root` makes that sibling `root/pr-42` — owned by this cell, not
+  -- the shared /tmp. Cleanup removes only `root`, never a path we don't own.
+  local origin = make_origin_with_pr()
+  local root = vim.fn.tempname() .. "-mf4a"
+  vim.fn.mkdir(root, "p")
+  local bare = root .. "/repo.git"
+  vim.fn.system({ "git", "clone", "-q", "--bare", origin, bare })
+  -- Pre-create wt_path (== root/pr-42) as a FILE so `worktree add` refuses
+  -- ("already exists"), AFTER the fetch has already succeeded.
+  local wt_path = vim.fs.dirname(bare) .. "/pr-42"
+  vim.fn.writefile({ "block" }, wt_path)
+  local slug = "mf4a__repo"
+  creds.set_profile(slug, { kind = "in_memory", token = "t" })
+  pr_mod._mock_http = function(method, url)
+    if method == "GET" and url:find("/pulls/42$") then
+      return 200, vim.json.encode({ number = 42, title = "x", body = "b",
+        state = "open", draft = false, base = { ref = "main", sha = "" },
+        head = { ref = "pr-42", sha = "" } })
+    end
+    return 404, "nf"
+  end
+  local res = pr_mod.fetch_and_create_worktree(
+    { slug = slug, remote = "git@github.com:owner/mf4a.git", bare = true,
+      common_dir = bare }, 42)
+  ok("5e-A: *** fetch OK but `worktree add` fails -> ok=false (bare check) ***",
+    res ~= nil and res.ok == false, vim.inspect(res))
+  ok("5e-A: the error names the checkout-into-worktree step",
+    res and type(res.error) == "string" and res.error:find("check it out", 1, true) ~= nil,
+    res and tostring(res.error) or "nil")
+  pr_mod._mock_http = nil; creds.clear_profile(slug)
+  vim.fn.delete(origin, "rf"); vim.fn.delete(root, "rf") -- only owned paths
+end
+
+do
+  -- MF4 branch B — NON-BARE repo: `git checkout pr-42` fails because an untracked
+  -- collide.txt would be overwritten. The fetch of the PR head still succeeds.
+  local origin = make_origin_with_pr()
+  local work = vim.fn.tempname() .. "-work"
+  vim.fn.system({ "git", "clone", "-q", origin, work })
+  vim.fn.writefile({ "local-untracked" }, work .. "/collide.txt") -- collides with pr-42
+  local slug = "mf4b__repo"
+  creds.set_profile(slug, { kind = "in_memory", token = "t" })
+  pr_mod._mock_http = function(method, url)
+    if method == "GET" and url:find("/pulls/42$") then
+      return 200, vim.json.encode({ number = 42, title = "x", body = "b",
+        state = "open", draft = false, base = { ref = "main", sha = "" },
+        head = { ref = "pr-42", sha = "" } })
+    end
+    return 404, "nf"
+  end
+  -- No common_dir / not bare: dir = repo.path = the worktree, so checkout runs
+  -- in a work tree and fails on the untracked collision.
+  local res = pr_mod.fetch_and_create_worktree(
+    { slug = slug, remote = "git@github.com:owner/mf4b.git", path = work }, 42)
+  ok("5e-B: *** fetch OK but `checkout` fails -> ok=false (non-bare check) ***",
+    res ~= nil and res.ok == false, vim.inspect(res))
+  ok("5e-B: the error names the checkout-into-worktree step",
+    res and type(res.error) == "string" and res.error:find("check it out", 1, true) ~= nil,
+    res and tostring(res.error) or "nil")
+  pr_mod._mock_http = nil; creds.clear_profile(slug)
+  vim.fn.delete(origin, "rf"); vim.fn.delete(work, "rf")
+end
+
+-- 5f. repos.getpr_target_repo — the :WorktreeGetPR cwd resolver (lector PR #23 MF3).
+-- Three outcomes, unit-tested rather than living inline in the command: cwd in a
+-- matching repo -> that repo; cwd not in any repo -> inventory[1]; cwd in a repo
+-- NOT in the inventory -> REFUSE (nil + err), never silently target repo 1.
+do
+  local repos = require("worktree.repos")
+  local function mkrepo(name)
+    local d = vim.fn.tempname() .. "-" .. name
+    vim.fn.mkdir(d, "p"); vim.fn.system({ "git", "-C", d, "init", "-q" })
+    local cd = vim.trim(vim.fn.system({ "git", "-C", d,
+      "rev-parse", "--path-format=absolute", "--git-common-dir" }))
+    return d, cd
+  end
+  local d1, cd1 = mkrepo("gp1")
+  local d2, cd2 = mkrepo("gp2")     -- a second, standalone in-inventory repo
+  local dX, _   = mkrepo("gpX")     -- a repo NOT in the inventory
+  local outside  = vim.fn.tempname() .. "-notrepo"
+  vim.fn.mkdir(outside, "p")
+  local inv = { { slug = "gp1", common_dir = cd1 }, { slug = "gp2", common_dir = cd2 } }
+
+  local r, e = repos.getpr_target_repo(d1, inv)
+  ok("5f: cwd inside an inventory repo resolves to THAT repo", r and r.slug == "gp1", e)
+  local r2 = repos.getpr_target_repo(d2, inv)
+  ok("5f: a second standalone inventory repo also resolves to itself", r2 and r2.slug == "gp2")
+  local rc, ec = repos.getpr_target_repo(outside, inv)
+  ok("5f: cwd NOT inside any repo falls back to inventory[1]", rc and rc.slug == "gp1", ec)
+  local rx, ex = repos.getpr_target_repo(dX, inv)
+  ok("5f: *** cwd inside a repo NOT in inventory REFUSES (nil + err) ***",
+    rx == nil and type(ex) == "string" and ex:find("not in the workspace", 1, true) ~= nil,
+    tostring(rx) .. " / " .. tostring(ex))
+  local rn, en = repos.getpr_target_repo(outside, {})
+  ok("5f: empty inventory yields nil + err", rn == nil and type(en) == "string")
+
+  -- LINKED worktree (lector PR #23 r1 evidence gap): a real `git worktree add`,
+  -- not a standalone `git init`. Its git-common-dir is the PARENT repo's .git
+  -- (cd1), so a cwd inside the linked worktree must resolve to gp1 — this is the
+  -- bare-repo-family case the resolver exists for, and only a genuine linked
+  -- worktree exercises the common-dir-points-elsewhere path.
+  vim.fn.system({ "git", "-C", d1, "-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "-q", "--allow-empty", "-m", "seed" })
+  local wtlink = vim.fn.tempname() .. "-gp1-linked"
+  vim.fn.system({ "git", "-C", d1, "worktree", "add", "-q", "-b", "linkbr", wtlink })
+  local link_cd = vim.trim(vim.fn.system({ "git", "-C", wtlink,
+    "rev-parse", "--path-format=absolute", "--git-common-dir" }))
+  ok("5f: (precondition) linked worktree's common-dir IS the parent repo's .git",
+    vim.fs.normalize((link_cd:gsub("/+$", ""))) == vim.fs.normalize((cd1:gsub("/+$", ""))),
+    link_cd .. " vs " .. cd1)
+  local rl, el = repos.getpr_target_repo(wtlink, inv)
+  ok("5f: *** cwd inside a LINKED worktree resolves to its parent inventory repo (gp1) ***",
+    rl and rl.slug == "gp1", (rl and rl.slug or "nil") .. " / " .. tostring(el))
+
+  vim.fn.delete(d1, "rf"); vim.fn.delete(d2, "rf"); vim.fn.delete(dX, "rf")
+  vim.fn.delete(outside, "rf"); vim.fn.delete(wtlink, "rf")
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",

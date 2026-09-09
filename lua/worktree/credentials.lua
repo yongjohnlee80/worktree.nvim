@@ -20,6 +20,7 @@ M.DEFAULT_ALLOWLIST = {
 -- In-memory profile storage (for kind == "in_memory")
 M._in_memory = {}
 M._custom_config_path = nil
+M._custom_run_dir = nil -- test hook: override the ephemeral-config directory
 
 ---_config_path returns the path to worktree-auth.json
 function M._config_path()
@@ -175,18 +176,64 @@ function M.clear_profile(key)
   end
 end
 
----resolve_token retrieves the secret token for a key.
----@param key string
+---list_profiles returns every configured profile (disk + in-memory), keyed by
+---its key, with the token VALUE never included — only the kind and the
+---non-secret shape (env var name, command argv). For `:WorktreeAuth list`.
+---@return table<string, table>
+function M.list_profiles()
+  local out = {}
+  local data = M._read_disk_config()
+  for k, v in pairs(data) do
+    if type(v) == "table" then out[k] = { kind = v.kind, var = v.var, argv = v.argv, source = "disk" } end
+  end
+  for k, v in pairs(M._in_memory) do
+    -- in_memory carries the raw token; never surface it.
+    out[k] = { kind = v.kind, source = "memory" }
+  end
+  return out
+end
+
+---resolve_token retrieves the secret token for a key, with a fallback chain.
+---
+---The chain is repo SLUG → forge HOST → env (item A2). Callers pass both,
+---because a token is registered EITHER per-repo (`monstercat__lm`) OR
+---per-host (`github.com`) and there was no way to reach a host profile: the
+---call sites read `resolve_token(repo.slug or remote_info.host)`, so a slug
+---always won and `host` was dead code.
+---
+---The env fallback is keyed on the HOST, not the key (item A3). The old check
+---was `key:find("github")` — a slug like `monstercat__lm` never contains
+---"github", so `GITHUB_TOKEN` was unreachable for every real repo. A github
+---HOST is what actually decides whether `GITHUB_TOKEN` applies.
+---@param key string           repo slug (or any primary key)
+---@param host string?         forge host, for the profile + env fallback
 ---@return string? token, string? err
-function M.resolve_token(key)
+function M.resolve_token(key, host)
   local prof = M.get_profile(key)
+  -- SLUG → HOST profile fallback: a per-host profile keyed `github.com` is now
+  -- reachable when no per-repo profile exists.
+  if not prof and type(host) == "string" and host ~= "" and host ~= key then
+    prof = M.get_profile(host)
+  end
   if not prof then
-    -- Fallback checks: GITHUB_TOKEN or FORGE_TOKEN if key appears to be a github/forge remote
+    -- Env fallback via GITHUB_TOKEN — but ONLY for a host that is genuinely
+    -- github.com (lector PR #23 must-fix). `host:find("github")` matched
+    -- `notgithub.example` and `github.attacker.example`, handing a malicious
+    -- remote the ambient GitHub token; and `key == "default"` handed it out
+    -- even with a concrete non-GitHub host. The rule is now EXACT: `github.com`
+    -- itself, or a `*.github.com` subdomain (api.github.com, an enterprise
+    -- subdomain). "default" is honoured only when NO concrete host was given.
     local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
-    if env_pat and env_pat ~= "" and (key:find("github") or key == "default") then
+    local function is_github_host(h)
+      return type(h) == "string" and (h == "github.com" or h:match("%.github%.com$") ~= nil)
+    end
+    local no_host = host == nil or host == "" or host == "default"
+    if env_pat and env_pat ~= "" and (is_github_host(host) or (no_host and key == "default")) then
       return env_pat, nil
     end
-    return nil, string.format("no credential profile configured for '%s'", tostring(key))
+    return nil, string.format(
+      "no credential profile configured for '%s'%s — register one with :WorktreeAuth set",
+      tostring(key), host and (" or host '" .. host .. "'") or "")
   end
 
   if prof.kind == "in_memory" then
@@ -219,6 +266,35 @@ function M.resolve_token(key)
   return nil, string.format("unsupported profile kind '%s'", tostring(prof.kind))
 end
 
+---_temp_suffix returns a hex suffix for an ephemeral credential-config name.
+---
+---It MUST NOT reuse Lua's default `math.random` stream: that stream is
+---identical in every freshly-launched Lua state, so independently-spawned
+---nvims produced the SAME ten O_EXCL candidates and exhausted them, making
+---concurrent PR operations fail (lector PR #23 r1 — measured 4/4). Draw from
+---an OS entropy source (`vim.uv.random`, libuv's CSPRNG); if that is somehow
+---unavailable, fall back to a per-process/per-attempt mix of pid + monotonic
+---clock so distinct processes still diverge.
+---@param attempt integer  the candidate index, mixed into the fallback
+---@return string suffix
+function M._temp_suffix(attempt)
+  local ok_r, bytes = pcall(function() return vim.uv.random(12) end)
+  if ok_r and type(bytes) == "string" and #bytes >= 8 then
+    return (bytes:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
+  end
+  -- Fallback (vim.uv.random unavailable): derive purely from pid + high-res
+  -- monotonic clock + attempt. pid separates processes; hrtime (nanoseconds,
+  -- advancing on every call) and attempt separate candidates within a process.
+  -- Deliberately does NOT touch math.random — reseeding the global PRNG here
+  -- would perturb any other code relying on that stream (lector PR #23 r2
+  -- nonblocking note).
+  local pid = vim.uv.os_getpid()
+  local hr = vim.uv.hrtime()
+  local hi = math.floor(hr / 0x100000000) % 0x100000000
+  local lo = hr % 0x100000000
+  return string.format("%08x%08x%04x", bit.bxor(pid, hi), lo, attempt % 0x10000)
+end
+
 ---open_exclusive_config creates a mode 0600 ephemeral curl config for bearer auth (ADR-0083 §2.5.2).
 ---@param token string
 ---@return string config_path, function cleanup_fn
@@ -226,13 +302,13 @@ function M.open_exclusive_config(token)
   if type(token) ~= "string" or token == "" then
     error("worktree.credentials: token must be a non-empty string")
   end
-  local run_dir = vim.fn.stdpath("run")
+  local run_dir = M._custom_run_dir or vim.fn.stdpath("run")
   if not run_dir or run_dir == "" or vim.fn.isdirectory(run_dir) ~= 1 then
     run_dir = "/tmp"
   end
 
-  for _ = 1, 10 do
-    local rand_suffix = string.format("%08x%08x", math.random(0, 0x7fffffff), math.random(0, 0x7fffffff))
+  for attempt = 1, 10 do
+    local rand_suffix = M._temp_suffix(attempt)
     local path = string.format("%s/worktree-auth-%s.curlrc", run_dir, rand_suffix)
     -- "wx" maps strictly to O_WRONLY | O_CREAT | O_EXCL
     local fd, err = vim.uv.fs_open(path, "wx", 384) -- mode 0600

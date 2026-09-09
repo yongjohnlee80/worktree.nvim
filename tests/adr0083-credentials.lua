@@ -114,6 +114,70 @@ local cmd_token, cmd_err = creds.resolve_token("cmd-slug")
 ok("allowlisted command resolves token correctly", cmd_token == "token_cmd_999", cmd_err)
 ok("trailing newline was stripped from command output", cmd_token == "token_cmd_999")
 
+-- 7b. resolve_token fallback chain: slug -> host -> env (items A2, A3)
+--
+-- The call sites read resolve_token(repo.slug or remote_info.host), so a slug
+-- always won and a per-HOST profile was unreachable; and the env fallback keyed
+-- on key:find("github"), which a slug like monstercat__lm never matches. Both
+-- are fixed by resolve_token(key, host).
+do
+  -- A2: a per-HOST profile is reached when there is no per-repo profile.
+  creds.set_profile("github.com", { kind = "in_memory", token = "host_token_abc" })
+  ok("A2: unknown slug falls back to the host profile",
+    creds.resolve_token("monstercat__lm", "github.com") == "host_token_abc",
+    tostring(creds.resolve_token("monstercat__lm", "github.com")))
+  -- A per-repo profile still WINS over the host.
+  creds.set_profile("monstercat__lm", { kind = "in_memory", token = "repo_token_xyz" })
+  ok("A2: a per-repo profile wins over the host",
+    creds.resolve_token("monstercat__lm", "github.com") == "repo_token_xyz")
+  creds.clear_profile("monstercat__lm")
+  creds.clear_profile("github.com")
+
+  -- A3: env fallback keyed on the HOST, not a substring of the slug.
+  local saved = vim.env.GITHUB_TOKEN
+  vim.env.GITHUB_TOKEN = "env_gh_token_123"
+  ok("A3: a github HOST reaches GITHUB_TOKEN for a non-github slug",
+    creds.resolve_token("monstercat__lm", "github.com") == "env_gh_token_123",
+    tostring(creds.resolve_token("monstercat__lm", "github.com")))
+  ok("A3: *** a non-github host does NOT silently use GITHUB_TOKEN ***",
+    select(1, creds.resolve_token("acme__thing", "gitlab.example.com")) == nil)
+  ok("A3: the old slug-substring behaviour is gone (slug alone, no host, no match)",
+    select(1, creds.resolve_token("monstercat__lm")) == nil)
+  -- SECURITY (lector PR #23): the github-host rule is EXACT, not a substring.
+  -- A malicious remote whose host merely CONTAINS "github" must not borrow the
+  -- ambient GitHub token.
+  ok("A3: *** 'notgithub.example' does NOT borrow GITHUB_TOKEN ***",
+    select(1, creds.resolve_token("x__y", "notgithub.example")) == nil)
+  ok("A3: *** 'github.attacker.example' does NOT borrow GITHUB_TOKEN ***",
+    select(1, creds.resolve_token("x__y", "github.attacker.example")) == nil)
+  ok("A3: a real github SUBDOMAIN (api.github.com) still resolves",
+    creds.resolve_token("x__y", "api.github.com") == "env_gh_token_123")
+  ok("A3: *** key='default' with a concrete NON-github host does NOT borrow it ***",
+    select(1, creds.resolve_token("default", "gitlab.example.com")) == nil)
+  vim.env.GITHUB_TOKEN = saved
+end
+
+-- 7c. list_profiles reports shape without leaking the token (A1 support)
+do
+  creds.set_profile("list-env", { kind = "env", var = "SOME_VAR" })
+  creds.set_profile("list-mem", { kind = "in_memory", token = "super_secret_tok" })
+  local profs = creds.list_profiles()
+  ok("A1: list includes the env profile with its var", profs["list-env"]
+    and profs["list-env"].kind == "env" and profs["list-env"].var == "SOME_VAR")
+  ok("A1: list includes the in-memory profile", profs["list-mem"]
+    and profs["list-mem"].kind == "in_memory")
+  ok("A1: *** list NEVER surfaces the in-memory token value ***", (function()
+    for _, p in pairs(profs) do
+      for _, v in pairs(p) do
+        if type(v) == "string" and v:find("super_secret_tok", 1, true) then return false end
+      end
+    end
+    return true
+  end)())
+  creds.clear_profile("list-env")
+  creds.clear_profile("list-mem")
+end
+
 -- 8. Clearing profiles
 creds.clear_profile("in-mem-slug")
 ok("cleared in-memory profile is gone", creds.get_profile("in-mem-slug") == nil)
@@ -158,6 +222,72 @@ for _, arg in ipairs(last_call.cmd) do
   ok("MF3: argument does not leak resolved secret token", arg:find("token_cmd_999", 1, true) == nil)
 end
 vim.system = real_system
+
+-- MF-rng (lector PR #23 r1): concurrent credential-config creation must not
+-- collide. open_exclusive_config drew its temp suffix from Lua's DEFAULT
+-- math.random stream, which is identical in every freshly-launched Lua state —
+-- so N independently-spawned nvims produced the SAME ten O_EXCL candidates and
+-- exhausted them (lector measured 4/4 concurrent failures). The fix seeds from
+-- an OS entropy source. Evidence, timing-independent: launch 8 headless nvims,
+-- each with its OWN run_dir so candidate #1 always succeeds, and collect the
+-- chosen filename. Under the deterministic bug every process reports the SAME
+-- suffix; with OS entropy all eight are distinct.
+do
+  local probe = tmp_dir .. "/rng-probe.lua"
+  vim.fn.writefile({
+    "vim.opt.runtimepath:prepend(" .. string.format("%q", plugin_root) .. ")",
+    "local creds = require('worktree.credentials')",
+    "creds._custom_run_dir = arg[1]",
+    "local path = creds.open_exclusive_config('tok-probe')",
+    "io.write(vim.fn.fnamemodify(path, ':t'))",
+    "os.exit(0)",
+  }, probe)
+  local N = 8
+  local procs = {}
+  for i = 1, N do
+    local rd = tmp_dir .. "/rng-run-" .. i
+    vim.fn.mkdir(rd, "p")
+    procs[i] = vim.system(
+      { "nvim", "--headless", "-u", "NONE", "-l", probe, rd }, { text = true })
+  end
+  local suffixes, seen, n_distinct, all_spawned = {}, {}, 0, true
+  for i = 1, N do
+    local r = procs[i]:wait()
+    local out = vim.trim(r.stdout or "")
+    if r.code ~= 0 or out == "" then all_spawned = false end
+    suffixes[i] = out
+    if out ~= "" and not seen[out] then seen[out] = true; n_distinct = n_distinct + 1 end
+  end
+  ok("MF-rng: all 8 probe processes created a config (no O_EXCL exhaustion)",
+    all_spawned, vim.inspect(suffixes))
+  ok("MF-rng: *** 8 concurrent processes chose 8 DISTINCT temp names (not one shared RNG stream) ***",
+    n_distinct == N, string.format("%d distinct of %d: %s", n_distinct, N, vim.inspect(suffixes)))
+end
+
+-- MF-rng fallback (lector PR #23 r2 nonblocking note): when vim.uv.random is
+-- unavailable, _temp_suffix must still produce distinct candidates AND must not
+-- reseed Lua's GLOBAL math.random stream (a global side effect that would
+-- perturb any other code relying on it).
+do
+  local real_random = vim.uv.random
+  math.randomseed(12345)
+  local before = { math.random(), math.random(), math.random() }
+  math.randomseed(12345) -- rewind the stream to a known point
+  vim.uv.random = function() error("forced unavailable") end
+  local seen, n, err_free = {}, 0, true
+  for attempt = 1, 10 do
+    local ok_s, suf = pcall(creds._temp_suffix, attempt)
+    if not ok_s or type(suf) ~= "string" or suf == "" then err_free = false end
+    if suf and not seen[suf] then seen[suf] = true; n = n + 1 end
+  end
+  vim.uv.random = real_random
+  ok("MF-rng fallback: produces a suffix without error on every attempt", err_free)
+  ok("MF-rng fallback: 10 attempts yield 10 distinct suffixes", n == 10, tostring(n))
+  local after = { math.random(), math.random(), math.random() }
+  ok("MF-rng fallback: *** does NOT reseed the global math.random stream ***",
+    after[1] == before[1] and after[2] == before[2] and after[3] == before[3],
+    vim.inspect({ before = before, after = after }))
+end
 
 -- Cleanup scratch dir
 vim.fn.delete(tmp_dir, "rf")
