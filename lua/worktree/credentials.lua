@@ -282,13 +282,17 @@ function M._temp_suffix(attempt)
   if ok_r and type(bytes) == "string" and #bytes >= 8 then
     return (bytes:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
   end
-  -- Fallback: pid + high-res monotonic clock + attempt, seeded per call so two
-  -- processes with the same default seed still diverge (pid differs).
+  -- Fallback (vim.uv.random unavailable): derive purely from pid + high-res
+  -- monotonic clock + attempt. pid separates processes; hrtime (nanoseconds,
+  -- advancing on every call) and attempt separate candidates within a process.
+  -- Deliberately does NOT touch math.random — reseeding the global PRNG here
+  -- would perturb any other code relying on that stream (lector PR #23 r2
+  -- nonblocking note).
   local pid = vim.uv.os_getpid()
   local hr = vim.uv.hrtime()
-  math.randomseed(bit.bxor(pid * 2654435761, hr % 0x7fffffff, attempt))
-  return string.format("%08x%08x%04x",
-    bit.bxor(pid, hr % 0xffffffff), math.random(0, 0x7fffffff), attempt % 0xffff)
+  local hi = math.floor(hr / 0x100000000) % 0x100000000
+  local lo = hr % 0x100000000
+  return string.format("%08x%08x%04x", bit.bxor(pid, hi), lo, attempt % 0x10000)
 end
 
 ---open_exclusive_config creates a mode 0600 ephemeral curl config for bearer auth (ADR-0083 §2.5.2).

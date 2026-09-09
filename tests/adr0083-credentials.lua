@@ -264,6 +264,31 @@ do
     n_distinct == N, string.format("%d distinct of %d: %s", n_distinct, N, vim.inspect(suffixes)))
 end
 
+-- MF-rng fallback (lector PR #23 r2 nonblocking note): when vim.uv.random is
+-- unavailable, _temp_suffix must still produce distinct candidates AND must not
+-- reseed Lua's GLOBAL math.random stream (a global side effect that would
+-- perturb any other code relying on it).
+do
+  local real_random = vim.uv.random
+  math.randomseed(12345)
+  local before = { math.random(), math.random(), math.random() }
+  math.randomseed(12345) -- rewind the stream to a known point
+  vim.uv.random = function() error("forced unavailable") end
+  local seen, n, err_free = {}, 0, true
+  for attempt = 1, 10 do
+    local ok_s, suf = pcall(creds._temp_suffix, attempt)
+    if not ok_s or type(suf) ~= "string" or suf == "" then err_free = false end
+    if suf and not seen[suf] then seen[suf] = true; n = n + 1 end
+  end
+  vim.uv.random = real_random
+  ok("MF-rng fallback: produces a suffix without error on every attempt", err_free)
+  ok("MF-rng fallback: 10 attempts yield 10 distinct suffixes", n == 10, tostring(n))
+  local after = { math.random(), math.random(), math.random() }
+  ok("MF-rng fallback: *** does NOT reseed the global math.random stream ***",
+    after[1] == before[1] and after[2] == before[2] and after[3] == before[3],
+    vim.inspect({ before = before, after = after }))
+end
+
 -- Cleanup scratch dir
 vim.fn.delete(tmp_dir, "rf")
 
