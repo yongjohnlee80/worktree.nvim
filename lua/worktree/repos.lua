@@ -665,6 +665,18 @@ function M.pr_for_worktree(repo, wt)
   return pr_mod.find_for_worktree(repo, wt)
 end
 
+---review_posted answers whether a review's findings are all on the forge, from
+---the posting receipt (ADR-0083 Amendment r9.3). The repos panel reads it to
+---badge a review `[posted]`; the review JSON is never consulted or written.
+---@param repo WorktreeRepo
+---@param review table  a describe record (needs `.pr` and `.name`/`.path`)
+---@return boolean posted
+function M.review_posted(repo, review)
+  local ok_pr, pr_mod = pcall(require, "worktree.pr")
+  if not ok_pr or type(pr_mod.review_posted) ~= "function" then return false end
+  return pr_mod.review_posted(repo, review) == true
+end
+
 ---pr_diff lists the commits a PR adds, best-effort or authoritative.
 ---@param repo table
 ---@param base_ref string
