@@ -475,7 +475,31 @@ function M.post_feedback(repo, pr_number, reviews, opts)
       end
     end
 
-    -- Process each commit batch
+    -- Recompute a batch's aggregate state from its comments: committed only when
+    -- EVERY finding it owns is posted. A committed batch that gains a new
+    -- review's findings reopens to in_flight.
+    local function reconcile_batch_state(rb)
+      local all_posted = true
+      for _, rc in pairs(rb.comments) do
+        if rc.state ~= "posted" then all_posted = false; break end
+      end
+      if all_posted then
+        rb.state = "committed"
+        rb.committed_at = rb.committed_at or os.date("!%Y-%m-%dT%H:%M:%SZ")
+      elseif rb.state == "committed" then
+        rb.state = "in_flight"
+      end
+    end
+
+    -- Process each commit batch. Batches are keyed by commit SHA, but a per-review
+    -- submit (ADR-0083 r9) posts ONE review at a time and two distinct reviews can
+    -- share a commit. So the batch is the UNION of every review's findings for
+    -- that sha: this call's finding_ids are MERGED in, and "done" is judged
+    -- against THIS call's finding_ids — never an aggregate "committed" a prior
+    -- review set. (lector PR #45 MF1: keying by sha and skipping a committed batch
+    -- silently dropped the second review while still returning ok=true. A
+    -- finding_id is unique per (sha, review_doc, comment), so a new review's
+    -- findings never collide with an already-posted one.)
     for sha, batch in pairs(commit_batches) do
       lock:refresh()
       local receipt_batch = receipt.batches[sha]
@@ -487,97 +511,93 @@ function M.post_feedback(repo, pr_number, reviews, opts)
           started_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
           comments = {},
         }
-        for _, c in ipairs(batch.comments) do
+        receipt.batches[sha] = receipt_batch
+      end
+      -- Merge THIS call's findings (new ones as in_flight).
+      for _, c in ipairs(batch.comments) do
+        if not receipt_batch.comments[c.finding_id] then
           receipt_batch.comments[c.finding_id] = {
-            path = c.path,
-            line = c.line,
-            side = c.side,
-            state = "in_flight",
+            path = c.path, line = c.line, side = c.side, state = "in_flight",
           }
         end
-        receipt.batches[sha] = receipt_batch
-        M.save_receipt(forge, slug, pr_number, receipt)
+      end
+      M.save_receipt(forge, slug, pr_number, receipt)
+
+      -- Is every finding in THIS call already posted? (Not: is the batch, in
+      -- aggregate, committed.)
+      local this_all_posted = true
+      for _, c in ipairs(batch.comments) do
+        if receipt_batch.comments[c.finding_id].state ~= "posted" then
+          this_all_posted = false
+          break
+        end
       end
 
-      -- If already committed, skip
-      if receipt_batch.state ~= "committed" then
-        -- Step 4 pre-flight reconciliation if in_flight from previous crash
+      if not this_all_posted then
+        -- Step 4 pre-flight reconciliation against the remote.
         local remote_comments = M.get_comments(repo, pr_number)
         local remote_markers = {}
         for _, rc in ipairs(remote_comments or {}) do
-          local rc_body = rc.body or ""
-          local marker = rc_body:match("<!%-%- worktree:finding_id=([^%s]+) %-%->")
-          if marker then
-            remote_markers[marker] = rc.id
-          end
+          local marker = (rc.body or ""):match("<!%-%- worktree:finding_id=([^%s]+) %-%->")
+          if marker then remote_markers[marker] = rc.id end
         end
 
-        local all_landed = true
+        -- Only THIS call's not-yet-landed findings go on the wire.
         local pending_comments = {}
         for _, c in ipairs(batch.comments) do
-          if remote_markers[c.finding_id] then
-            receipt_batch.comments[c.finding_id].remote_id = remote_markers[c.finding_id]
-            receipt_batch.comments[c.finding_id].state = "posted"
+          local rc = receipt_batch.comments[c.finding_id]
+          if rc.state == "posted" then
+            -- landed on a prior call; nothing to send
+          elseif remote_markers[c.finding_id] then
+            rc.remote_id = remote_markers[c.finding_id]
+            rc.state = "posted"
           else
-            all_landed = false
-            -- Suffix invisible HTML identity marker
             local remote_body = string.format("%s\n\n<!-- worktree:finding_id=%s -->", c.body, c.finding_id)
             table.insert(pending_comments, {
-              path = c.path,
-              line = c.line,
-              side = c.side,
-              body = remote_body,
+              path = c.path, line = c.line, side = c.side,
+              body = remote_body, finding_id = c.finding_id,
             })
           end
         end
 
-        if all_landed then
-          receipt_batch.state = "committed"
-          receipt_batch.committed_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-          M.save_receipt(forge, slug, pr_number, receipt)
-        elseif #pending_comments > 0 then
-          -- Step 2: Transmission via Header Config Transport
+        if #pending_comments > 0 then
+          -- Step 2: Transmission via Header Config Transport.
           local review_payload = vim.json.encode({
             commit_id = sha,
             body = string.format("Review findings for %s", sha:sub(1, 7)),
             event = "COMMENT",
-            comments = pending_comments,
+            comments = vim.tbl_map(function(pc)
+              return { path = pc.path, line = pc.line, side = pc.side, body = pc.body }
+            end, pending_comments),
           })
 
           local post_url = string.format("%s/repos/%s/%s/pulls/%s/reviews", remote_info.api_base, remote_info.owner, remote_info.repo, tostring(pr_number))
           local pcode, pbody = M._http_request("POST", post_url, token, review_payload)
           if pcode == 200 or pcode == 201 then
-            -- Step 3: Post-Response Confirmation
-            local dok, pdata = pcall(vim.json.decode, pbody)
-            -- Mark all batch comments as posted
-            for _, c in ipairs(batch.comments) do
-              receipt_batch.comments[c.finding_id].state = "posted"
+            -- Step 3: Post-Response Confirmation — mark the SENT findings posted.
+            for _, pc in ipairs(pending_comments) do
+              receipt_batch.comments[pc.finding_id].state = "posted"
             end
-            receipt_batch.state = "committed"
-            receipt_batch.committed_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-            M.save_receipt(forge, slug, pr_number, receipt)
           else
-            -- Reconcile to see if it landed despite error
+            -- Reconcile to see what landed despite the error.
             local rem_after = M.get_comments(repo, pr_number)
-            local landed_count = 0
             for _, rc in ipairs(rem_after or {}) do
               local marker = (rc.body or ""):match("<!%-%- worktree:finding_id=([^%s]+) %-%->")
               if marker and receipt_batch.comments[marker] then
                 receipt_batch.comments[marker].remote_id = rc.id
                 receipt_batch.comments[marker].state = "posted"
-                landed_count = landed_count + 1
               end
             end
-            if landed_count == #batch.comments then
-              receipt_batch.state = "committed"
-            else
-              receipt_batch.state = "indeterminate"
-            end
+            reconcile_batch_state(receipt_batch)
+            if receipt_batch.state ~= "committed" then receipt_batch.state = "indeterminate" end
             M.save_receipt(forge, slug, pr_number, receipt)
             error(string.format("post review failed with HTTP %d: %s", pcode, credentials.redact(pbody)))
           end
         end
       end
+
+      reconcile_batch_state(receipt_batch)
+      M.save_receipt(forge, slug, pr_number, receipt)
     end
 
     return receipt
