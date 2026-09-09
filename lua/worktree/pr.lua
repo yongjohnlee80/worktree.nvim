@@ -604,6 +604,46 @@ function M.dissociate_review(review_data, pr_number)
   return false
 end
 
+---review_posted answers whether a review's findings are all on the forge, read
+---from the two-phase posting RECEIPT (ADR-0083 §2.6 Action 4, r9.3). The
+---review's own JSON is an ADR-0067 immutable artifact and is NEITHER consulted
+---nor written — the receipt is the mutable side-store that records posted state.
+---
+---A review is matched to its receipt entries by the `doc_name` segment of the
+---finding_id (`<commit_sha>:<doc_name>:<comment_id>` — see post_feedback), which
+---is the review's file name, exactly what the panel passes as `doc_name` when it
+---posts. `doc_name` and `commit_sha` never contain a colon, so `:<doc_name>:` is
+---an unambiguous marker of this review's findings inside a finding_id.
+---
+---Returns true only when the review HAS receipt entries AND every one is posted:
+---a review nobody has submitted, or one only partially landed, is not "posted".
+---@param repo table
+---@param review table  a describe record (needs `.pr` and `.name`/`.path`)
+---@return boolean posted
+function M.review_posted(repo, review)
+  if not (repo and review and review.pr) then return false end
+  local remote_info = M.parse_remote(_get_repo_remote_url(repo))
+  local slug = repo.slug or remote_info.repo
+  local receipt = M.load_receipt(remote_info.forge, slug, review.pr)
+  if type(receipt) ~= "table" or type(receipt.batches) ~= "table" then return false end
+  local doc_name = review.name
+    or (type(review.path) == "string" and review.path:match("[^/]+$")) or nil
+  if not doc_name or doc_name == "" then return false end
+  local needle = ":" .. doc_name .. ":"
+  local found, all_posted = false, true
+  for _, batch in pairs(receipt.batches) do
+    if type(batch) == "table" and type(batch.comments) == "table" then
+      for fid, c in pairs(batch.comments) do
+        if type(fid) == "string" and fid:find(needle, 1, true) then
+          found = true
+          if not (type(c) == "table" and c.state == "posted") then all_posted = false end
+        end
+      end
+    end
+  end
+  return found and all_posted
+end
+
 ---fetch_and_create_worktree fetches PR branch, creates worktree, and writes KB PR document (Action 1).
 ---@param repo table
 ---@param pr_number integer|string
