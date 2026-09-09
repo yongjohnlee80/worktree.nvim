@@ -675,6 +675,41 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
   }
 end
 
+---Resolve `base_branch` to the FRESHEST ref, and range from the merge-base.
+---
+---The old two-dot `local_base..pr_branch` inflated the range whenever the
+---LOCAL base lagged the remote — which in this shared bare-repo layout is the
+---normal state (peers push; nobody pulled). A PR branch built on the newer
+---base then listed the base's own catch-up commits as if the PR added them
+---(Johno, 2026-09-06 item B6). Two corrections, both needed:
+---
+---  * prefer `origin/<base>` when it exists — the remote-tracking ref is the
+---    freshest base available WITHOUT a network fetch, and it is what the PR
+---    was actually opened against;
+---  * range from `merge-base(base_ref, pr_branch)`, not the base tip — so a
+---    base that has diverged with commits the PR does not contain still yields
+---    only what the PR adds since divergence.
+---@param dir string  a directory git can resolve refs in
+---@param base_branch string
+---@param pr_branch string
+---@return string range  a `<rev>..<pr_branch>` range
+local function _pr_range(dir, base_branch, pr_branch)
+  local function rev(ref)
+    local o = vim.system({ "git", "-C", dir, "rev-parse", "--verify", "--quiet", ref },
+      { text = true }):wait()
+    return o.code == 0 and vim.trim(o.stdout or "") ~= "" and vim.trim(o.stdout) or nil
+  end
+  -- Freshest base ref: origin/<base> if present, else the local branch.
+  local base_ref = rev("origin/" .. base_branch) and ("origin/" .. base_branch) or base_branch
+  local mb = vim.system({ "git", "-C", dir, "merge-base", base_ref, pr_branch },
+    { text = true }):wait()
+  if mb.code == 0 and vim.trim(mb.stdout or "") ~= "" then
+    return string.format("%s..%s", vim.trim(mb.stdout), pr_branch)
+  end
+  -- No common ancestor (unrelated histories): fall back to the base ref tip.
+  return string.format("%s..%s", base_ref, pr_branch)
+end
+
 ---pr_diff_commits collects commits and changed files for a multi-commit diffview (Action 2).
 ---@param repo table
 ---@param base_branch string
@@ -684,7 +719,7 @@ function M.pr_diff_commits(repo, base_branch, pr_branch)
   local dir = repo.common_dir or repo.sample_worktree or repo.path
   if not dir then return {} end
 
-  local range = string.format("%s..%s", base_branch, pr_branch)
+  local range = _pr_range(dir, base_branch, pr_branch)
   -- `--format=%H %s`, NOT `--oneline`.
   --
   -- `--oneline` implies `--abbrev-commit`, so `sha` came back abbreviated —
@@ -754,7 +789,7 @@ function M.find_for_worktree(repo, wt)
     local files = vim.fn.globpath(prs_dir, "pr-*.md", false, true)
     for _, f in ipairs(files) do
       local lines = vim.fn.readfile(f, "", 30)
-      local num, title, state, branch, draft
+      local num, title, state, branch, draft, base
       local in_fm = false
       for _, l in ipairs(lines) do
         if l == "---" then
@@ -766,6 +801,10 @@ function M.find_for_worktree(repo, wt)
           elseif k == "state" then state = v
           elseif k == "branch" then branch = v
           elseif k == "draft" then draft = (v == "true")
+          -- B7: `base:` was never parsed, so `open_pr_diff` always fell back to
+          -- "main" and diffed against the wrong branch. Accept both `base:` and
+          -- the `base_ref:` the writer emits.
+          elseif k == "base" or k == "base_ref" then base = v:gsub('^"(.*)"$', "%1")
           end
         end
       end
@@ -776,6 +815,7 @@ function M.find_for_worktree(repo, wt)
           state = state or "open",
           draft = draft == true or state == "draft",
           branch = branch or wt.branch,
+          base = base,
           kb_doc = f,
         }
       end

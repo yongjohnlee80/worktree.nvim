@@ -148,6 +148,88 @@ ok("[6] *** the sha is still 40 hex and the subject is intact ***",
     and hexy[1].subject == "deadbeef cafe fix the thing",
   hexy[1] and ("%s | %s"):format(hexy[1].sha, hexy[1].subject) or "nil")
 
+print("\n[7] a STALE local base does not inflate the range (B6)")
+-- The bug: `pr_diff_commits` used a two-dot `local_base..pr_branch`. When the
+-- LOCAL base branch lags the remote (peers push; nobody pulled), and the PR
+-- branch was built on the NEWER base, the range lists the base's own catch-up
+-- commits as if the PR added them. The fix resolves the base to the freshest
+-- ref available (origin/<base> when present) and ranges from the merge-base.
+do
+  -- Build a "remote": trunk C1 -> C2 -> C3. A feature branched at C1 then
+  -- rebased onto C3, adding F1, F2. Clone it, then REWIND the clone's local
+  -- trunk to C1 so it is stale, while origin/trunk stays at C3.
+  local up = sb .. "/upstream"; vim.fn.mkdir(up, "p")
+  G(up, "init", "-q", "-b", "trunk")
+  vim.fn.writefile({ "c1" }, up .. "/a.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C1")
+  local c1 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
+  vim.fn.writefile({ "c2" }, up .. "/b.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C2")
+  vim.fn.writefile({ "c3" }, up .. "/c.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C3")
+  -- feature = C3 + F1 + F2 (as if rebased onto the current trunk).
+  G(up, "checkout", "-q", "-b", "feature")
+  vim.fn.writefile({ "f1" }, up .. "/f1.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "F1")
+  vim.fn.writefile({ "f2" }, up .. "/f2.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "F2")
+  G(up, "checkout", "-q", "trunk")
+
+  local clone = sb .. "/clone"
+  G(sb, "clone", "-q", up, clone)
+  G(clone, "fetch", "-q", "origin", "feature:feature")
+  -- Rewind LOCAL trunk to C1 (stale), leaving origin/trunk at C3. `reset --hard`,
+  -- NOT `branch -f`: trunk is the checked-out branch and `branch -f` refuses it,
+  -- which silently left an earlier draft's trunk at C3 and the whole cell green
+  -- against the bug (fixture-preconditions-must-survive-the-action).
+  G(clone, "reset", "--hard", c1)
+
+  local rc = { common_dir = clone .. "/.git", path = clone, sample_worktree = clone }
+  -- PRECONDITION: the bug only exists when local base is behind the remote.
+  -- Assert the stale state actually landed, or this cell proves nothing.
+  local local_trunk = vim.trim(G(clone, "rev-parse", "trunk").stdout or "")
+  local origin_trunk = vim.trim(G(clone, "rev-parse", "origin/trunk").stdout or "")
+  ok("[7] fixture precondition: local trunk is C1 while origin/trunk is ahead",
+    local_trunk == c1 and origin_trunk ~= c1,
+    ("local=%s origin=%s c1=%s"):format(local_trunk:sub(1,7), origin_trunk:sub(1,7), c1:sub(1,7)))
+
+  local commits = pr_mod.pr_diff_commits(rc, "trunk", "feature")
+  local subjects = {}
+  for _, c in ipairs(commits) do subjects[c.subject] = true end
+  ok("[7] *** only the PR's own commits are listed (F1, F2) ***",
+    subjects["F1"] and subjects["F2"] and vim.tbl_count(subjects) == 2,
+    "got: " .. vim.inspect(vim.tbl_keys(subjects)))
+  ok("[7] *** the stale base's catch-up commits (C2, C3) are NOT listed ***",
+    not subjects["C2"] and not subjects["C3"],
+    "got: " .. vim.inspect(vim.tbl_keys(subjects)))
+end
+
+print("\n[8] find_for_worktree parses base: from the KB PR doc (B7)")
+do
+  -- open_pr_diff read the PR's base branch from find_for_worktree, which parsed
+  -- number/title/state/branch/draft but NOT base — so it silently fell back to
+  -- "main" and diffed against the wrong branch on any PR based elsewhere.
+  local kb = sb .. "/kb"
+  local slug = "acme__thing"
+  vim.fn.mkdir(string.format("%s/shared/prs/%s", kb, slug), "p")
+  vim.fn.writefile({
+    "---",
+    "number: 77",
+    'title: "a PR based on develop"',
+    "state: open",
+    "branch: feature/x",
+    "base: develop",
+    "draft: false",
+    "---",
+    "body",
+  }, string.format("%s/shared/prs/%s/pr-77.md", kb, slug))
+
+  local saved = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local pr = pr_mod.find_for_worktree({ slug = slug }, { branch = "feature/x" })
+  vim.env.AUTO_AGENTS_KB_ROOT = saved
+
+  ok("[8] the PR doc is found by branch", pr ~= nil and pr.number == 77,
+    vim.inspect(pr))
+  ok("[8] *** base: is parsed, not defaulted to main ***",
+    pr ~= nil and pr.base == "develop", pr and tostring(pr.base) or "nil")
+end
+
 vim.fn.delete(sb, "rf")
 io.stdout:write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail > 0 and 1 or 0)
