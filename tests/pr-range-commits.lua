@@ -148,6 +148,96 @@ ok("[6] *** the sha is still 40 hex and the subject is intact ***",
     and hexy[1].subject == "deadbeef cafe fix the thing",
   hexy[1] and ("%s | %s"):format(hexy[1].sha, hexy[1].subject) or "nil")
 
+print("\n[7] the range against a stale base (B6, lector three-level fixture)")
+-- Three ref levels that disagree, exactly the counterexample from PR #22:
+--   local base   = C1  (stale local branch)
+--   origin/base  = C2  (stale remote-tracking ref nobody re-fetched)
+--   forge base   = C3  (ground truth: what the PR was actually opened against)
+--   PR branch    = C3 + F1
+-- Only the forge base sha yields the correct range (F1). Any LOCAL heuristic
+-- keyed on origin/base still misreports C3, which is why the authoritative
+-- base_rev exists and why its absence is surfaced as `stale`.
+do
+  local up = sb .. "/up3"; vim.fn.mkdir(up, "p")
+  G(up, "init", "-q", "-b", "base")
+  vim.fn.writefile({ "c1" }, up .. "/a.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C1")
+  local c1 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
+  vim.fn.writefile({ "c2" }, up .. "/b.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C2")
+  local c2 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
+  vim.fn.writefile({ "c3" }, up .. "/c.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C3")
+  local c3 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
+  G(up, "checkout", "-q", "-b", "feature")
+  vim.fn.writefile({ "f1" }, up .. "/f1.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "F1")
+  G(up, "checkout", "-q", "base")
+
+  local clone = sb .. "/clone3"
+  G(sb, "clone", "-q", up, clone)
+  G(clone, "fetch", "-q", "origin", "feature:feature")
+  -- Pin origin/base to C2 (stale tracking ref) and local base to C1.
+  G(clone, "update-ref", "refs/remotes/origin/base", c2)
+  G(clone, "reset", "--hard", c1)
+
+  local rc = { common_dir = clone .. "/.git", path = clone, sample_worktree = clone }
+  -- PRECONDITION: the three levels really disagree.
+  ok("[7] fixture: local=C1, origin/base=C2, forge=C3 all differ",
+    vim.trim(G(clone, "rev-parse", "base").stdout or "") == c1
+      and vim.trim(G(clone, "rev-parse", "origin/base").stdout or "") == c2
+      and c1 ~= c2 and c2 ~= c3,
+    ("c1=%s c2=%s c3=%s"):format(c1:sub(1,7), c2:sub(1,7), c3:sub(1,7)))
+
+  -- Authoritative: the forge base sha C3 is present locally (ancestor of the
+  -- fetched head), so merge-base(C3, feature) = C3 and the range is exactly F1.
+  local commits, stale = pr_mod.pr_diff_commits(rc, "base", "feature", { base_rev = c3 })
+  local subj = {}
+  for _, c in ipairs(commits) do subj[c.subject] = true end
+  ok("[7] *** with the forge base sha, only F1 is listed (C2/C3 excluded) ***",
+    subj["F1"] and not subj["C2"] and not subj["C3"] and vim.tbl_count(subj) == 1,
+    "got: " .. vim.inspect(vim.tbl_keys(subj)))
+  ok("[7] *** and it is NOT flagged stale (authoritative) ***", stale == false)
+
+  -- Best-effort (no base_rev): the local heuristic can only reach origin/base=C2,
+  -- so C3 leaks — AND the function says so via `stale = true`, so the caller can
+  -- surface "base may be stale" rather than trust the count.
+  local commits2, stale2 = pr_mod.pr_diff_commits(rc, "base", "feature")
+  local subj2 = {}
+  for _, c in ipairs(commits2) do subj2[c.subject] = true end
+  ok("[7] *** without it, the best-effort range is FLAGGED stale ***",
+    stale2 == true, "stale=" .. tostring(stale2))
+  ok("[7] the best-effort range is a superset that still contains F1",
+    subj2["F1"] == true, "got: " .. vim.inspect(vim.tbl_keys(subj2)))
+end
+
+print("\n[8] find_for_worktree parses base: from the KB PR doc (B7)")
+do
+  -- open_pr_diff read the PR's base branch from find_for_worktree, which parsed
+  -- number/title/state/branch/draft but NOT base — so it silently fell back to
+  -- "main" and diffed against the wrong branch on any PR based elsewhere.
+  local kb = sb .. "/kb"
+  local slug = "acme__thing"
+  vim.fn.mkdir(string.format("%s/shared/prs/%s", kb, slug), "p")
+  vim.fn.writefile({
+    "---",
+    "number: 77",
+    'title: "a PR based on develop"',
+    "state: open",
+    "branch: feature/x",
+    "base: develop",
+    "draft: false",
+    "---",
+    "body",
+  }, string.format("%s/shared/prs/%s/pr-77.md", kb, slug))
+
+  local saved = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local pr = pr_mod.find_for_worktree({ slug = slug }, { branch = "feature/x" })
+  vim.env.AUTO_AGENTS_KB_ROOT = saved
+
+  ok("[8] the PR doc is found by branch", pr ~= nil and pr.number == 77,
+    vim.inspect(pr))
+  ok("[8] *** base: is parsed, not defaulted to main ***",
+    pr ~= nil and pr.base == "develop", pr and tostring(pr.base) or "nil")
+end
+
 vim.fn.delete(sb, "rf")
 io.stdout:write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail > 0 and 1 or 0)
