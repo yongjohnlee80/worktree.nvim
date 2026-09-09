@@ -186,7 +186,7 @@ pr_mod._mock_http = function(method, url, token, body)
       body = "PR description here",
       state = "open",
       draft = false,
-      base = { ref = "main" },
+      base = { ref = "main", sha = "ba5e5ha0000000000000000000000000000000f" },
       head = { ref = "feat/x", sha = "abc1234" },
     })
   end
@@ -243,6 +243,9 @@ ok("get_pr succeeds", pr_data ~= nil, pr_err)
 ok("get_pr title parsed", pr_data.title == "Implement Feature X")
 ok("get_pr state is open", pr_data.state == "open")
 ok("get_pr base_ref is main", pr_data.base_ref == "main")
+-- The authoritative base sha (B6): get_pr must MAP data.base.sha, or the whole
+-- base_rev mechanism has no source. Deleting the mapping fails this cell.
+ok("get_pr surfaces the forge base sha", pr_data.base_sha == "ba5e5ha0000000000000000000000000000000f", tostring(pr_data.base_sha))
 
 -- 6. dissociate_review validation
 local test_rev_doc = {

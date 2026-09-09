@@ -679,10 +679,18 @@ end
 ---Resolve the base for a PR range, and range from the merge-base.
 ---
 ---Ground truth is the FORGE's base sha (`base_rev`), passed by a caller that
----queried the PR. It is authoritative and — this is the part that makes it
----usable locally — always PRESENT locally once the PR head is fetched, because
----for a PR based on that commit the base sha is an ancestor of the head. So
+---queried the PR. It is authoritative, and it is USABLE locally in the common
+---case: for a PR whose base has not advanced since the branch diverged, the
+---base sha is an ancestor of the fetched head, so it is already present and
 ---`merge-base(base_rev, pr_branch)` needs no network.
+---
+---It is NOT universally local (lector PR #22 r1): if the base branch advanced
+---AFTER the divergence, its tip sha is not in the PR head's history and may be
+---absent until fetched. `_pr_range` handles that by checking `rev(base_rev)`
+---first and, when the object is absent, degrading to the flagged best-effort
+---(`stale = true`) rather than ranging against a sha git cannot resolve. The
+---GetPR fetch refreshes `origin/<base>` for exactly this reason, so the tip is
+---present after a fetch.
 ---
 ---Without it, the best LOCAL answer is a BEST EFFORT and is surfaced as such
 ---(second return `stale`). The old two-dot `local_base..pr_branch` inflated the
