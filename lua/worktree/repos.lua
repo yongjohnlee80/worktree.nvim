@@ -665,11 +665,6 @@ function M.pr_for_worktree(repo, wt)
   return pr_mod.find_for_worktree(repo, wt)
 end
 
----pr_diff returns commit and file diffs for a PR.
----@param repo WorktreeRepo
----@param base_ref string
----@param pr_ref string
----@return table[] commits
 ---pr_diff lists the commits a PR adds, best-effort or authoritative.
 ---@param repo table
 ---@param base_ref string
@@ -702,6 +697,39 @@ function M.reviews_for_pr(repo, pr_number)
     end
   end
   return out
+end
+
+---getpr_target_repo resolves which repo a GetPR should act on for a given cwd,
+---testably (the `:WorktreeGetPR` command is the only caller).
+---
+---Three outcomes (lector PR #23 — a mismatch must not silently target repo 1):
+---  * cwd is inside a repo that IS in the inventory  -> that repo, nil
+---  * cwd is NOT inside any git repo (workspace container) -> inventory[1], nil
+---  * cwd IS inside a git repo NOT in the inventory  -> nil, err (a lexical
+---    path/symlink alias can defeat the common-dir compare; refuse rather than
+---    fetch the PR into the wrong repo)
+---@param cwd string
+---@param inventory table[]?  defaults to M.repos()
+---@return table? repo, string? err
+function M.getpr_target_repo(cwd, inventory)
+  inventory = inventory or M.repos()
+  if not inventory[1] then return nil, "no repository found in workspace" end
+  local out = vim.fn.systemlist({ "git", "-C", cwd,
+    "rev-parse", "--path-format=absolute", "--git-common-dir" })
+  if vim.v.shell_error ~= 0 or not out[1] or out[1] == "" then
+    -- Not inside a repo: the container case. Act on the first.
+    return inventory[1], nil
+  end
+  -- NB: gsub returns (string, count); the extra parens drop the count so it
+  -- does not leak into vim.fs.normalize's second (opts) argument.
+  local want = vim.fs.normalize(((out[1]):gsub("/+$", "")))
+  for _, r in ipairs(inventory) do
+    if r.common_dir and vim.fs.normalize(((r.common_dir):gsub("/+$", ""))) == want then
+      return r, nil
+    end
+  end
+  return nil, "cwd is in a git repo that is not in the workspace inventory ("
+    .. want .. ") — cd into the target repo, or run from the workspace root"
 end
 
 return M

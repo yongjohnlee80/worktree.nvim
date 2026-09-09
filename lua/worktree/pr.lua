@@ -447,7 +447,10 @@ function M.post_feedback(repo, pr_number, reviews, opts)
 
   local ok, err = pcall(function()
     local receipt = M.load_receipt(forge, slug, pr_number)
-    local token, terr = credentials.resolve_token(slug)
+    -- Thread the HOST too (lector PR #23): review posting must honour the same
+    -- slug -> host -> env chain as get/create/comments, or a shared github.com
+    -- host profile works everywhere EXCEPT posting.
+    local token, terr = credentials.resolve_token(slug, remote_info.host)
     if not token then error("worktree.pr: failed to resolve auth token: " .. tostring(terr)) end
 
     -- Group findings by commit_sha

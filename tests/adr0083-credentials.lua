@@ -143,6 +143,17 @@ do
     select(1, creds.resolve_token("acme__thing", "gitlab.example.com")) == nil)
   ok("A3: the old slug-substring behaviour is gone (slug alone, no host, no match)",
     select(1, creds.resolve_token("monstercat__lm")) == nil)
+  -- SECURITY (lector PR #23): the github-host rule is EXACT, not a substring.
+  -- A malicious remote whose host merely CONTAINS "github" must not borrow the
+  -- ambient GitHub token.
+  ok("A3: *** 'notgithub.example' does NOT borrow GITHUB_TOKEN ***",
+    select(1, creds.resolve_token("x__y", "notgithub.example")) == nil)
+  ok("A3: *** 'github.attacker.example' does NOT borrow GITHUB_TOKEN ***",
+    select(1, creds.resolve_token("x__y", "github.attacker.example")) == nil)
+  ok("A3: a real github SUBDOMAIN (api.github.com) still resolves",
+    creds.resolve_token("x__y", "api.github.com") == "env_gh_token_123")
+  ok("A3: *** key='default' with a concrete NON-github host does NOT borrow it ***",
+    select(1, creds.resolve_token("default", "gitlab.example.com")) == nil)
   vim.env.GITHUB_TOKEN = saved
 end
 

@@ -85,7 +85,7 @@ vim.api.nvim_create_user_command("WorktreeAuth", function(opts)
       vim.notify("WorktreeAuth: " .. tostring(err), vim.log.levels.ERROR)
     end
   else
-    vim.notify("WorktreeAuth <list|set|clear> — see :h WorktreeAuth", vim.log.levels.ERROR)
+    vim.notify("WorktreeAuth <list|set|clear>", vim.log.levels.ERROR)
   end
 end, {
   nargs = "*",
@@ -102,25 +102,15 @@ vim.api.nvim_create_user_command("WorktreeGetPR", function(opts)
   local pr_num = tonumber(arg)
   local function go(num)
     if not num then return end
+    -- B8: act on the repo the cursor/cwd is IN, not blindly repos()[1], and
+    -- REFUSE when cwd is a repo outside the inventory (lector PR #23). The
+    -- resolution + refusal live in worktree.repos.getpr_target_repo so they are
+    -- unit-tested.
     local repos_mod = require("worktree.repos")
-    local root_repos = repos_mod.repos()
-    if not root_repos[1] then
-      vim.notify("WorktreeGetPR: no repository found in workspace", vim.log.levels.ERROR)
+    local repo, rerr = repos_mod.getpr_target_repo(vim.fn.getcwd())
+    if not repo then
+      vim.notify("WorktreeGetPR: " .. tostring(rerr), vim.log.levels.ERROR)
       return
-    end
-    -- B8: act on the repo the cursor/cwd is IN, not blindly repos()[1]. Resolve
-    -- cwd's git common-dir and match it; fall back to the first repo only when
-    -- cwd is not inside any of them (e.g. run from the workspace container).
-    local repo = root_repos[1]
-    local cd = vim.fn.systemlist({ "git", "-C", vim.fn.getcwd(),
-      "rev-parse", "--path-format=absolute", "--git-common-dir" })
-    if vim.v.shell_error == 0 and cd[1] and cd[1] ~= "" then
-      local want = vim.fs.normalize((cd[1]):gsub("/+$", ""))
-      for _, r in ipairs(root_repos) do
-        if r.common_dir and vim.fs.normalize((r.common_dir):gsub("/+$", "")) == want then
-          repo = r; break
-        end
-      end
     end
     local pr_mod = require("worktree.pr")
     local res = pr_mod.fetch_and_create_worktree(repo, num)

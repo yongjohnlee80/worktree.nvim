@@ -215,10 +215,19 @@ function M.resolve_token(key, host)
     prof = M.get_profile(host)
   end
   if not prof then
-    -- Env fallback, keyed on the HOST (or the literal "default").
+    -- Env fallback via GITHUB_TOKEN — but ONLY for a host that is genuinely
+    -- github.com (lector PR #23 must-fix). `host:find("github")` matched
+    -- `notgithub.example` and `github.attacker.example`, handing a malicious
+    -- remote the ambient GitHub token; and `key == "default"` handed it out
+    -- even with a concrete non-GitHub host. The rule is now EXACT: `github.com`
+    -- itself, or a `*.github.com` subdomain (api.github.com, an enterprise
+    -- subdomain). "default" is honoured only when NO concrete host was given.
     local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
-    local host_is_github = type(host) == "string" and host:find("github") ~= nil
-    if env_pat and env_pat ~= "" and (host_is_github or key == "default" or host == "default") then
+    local function is_github_host(h)
+      return type(h) == "string" and (h == "github.com" or h:match("%.github%.com$") ~= nil)
+    end
+    local no_host = host == nil or host == "" or host == "default"
+    if env_pat and env_pat ~= "" and (is_github_host(host) or (no_host and key == "default")) then
       return env_pat, nil
     end
     return nil, string.format(
