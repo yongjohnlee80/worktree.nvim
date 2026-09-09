@@ -354,6 +354,7 @@ function M.get_pr(repo, pr_number)
     state = data.state or "open",
     draft = data.draft == true,
     base_ref = (data.base and data.base.ref) or "main",
+    base_sha = (data.base and data.base.sha) or "",
     head_ref = (data.head and data.head.ref) or "",
     head_sha = (data.head and data.head.sha) or "",
     commits = data.commits or 0,
@@ -675,51 +676,65 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
   }
 end
 
----Resolve `base_branch` to the FRESHEST ref, and range from the merge-base.
+---Resolve the base for a PR range, and range from the merge-base.
 ---
----The old two-dot `local_base..pr_branch` inflated the range whenever the
----LOCAL base lagged the remote — which in this shared bare-repo layout is the
----normal state (peers push; nobody pulled). A PR branch built on the newer
----base then listed the base's own catch-up commits as if the PR added them
----(Johno, 2026-09-06 item B6). Two corrections, both needed:
+---Ground truth is the FORGE's base sha (`base_rev`), passed by a caller that
+---queried the PR. It is authoritative and — this is the part that makes it
+---usable locally — always PRESENT locally once the PR head is fetched, because
+---for a PR based on that commit the base sha is an ancestor of the head. So
+---`merge-base(base_rev, pr_branch)` needs no network.
 ---
----  * prefer `origin/<base>` when it exists — the remote-tracking ref is the
----    freshest base available WITHOUT a network fetch, and it is what the PR
----    was actually opened against;
----  * range from `merge-base(base_ref, pr_branch)`, not the base tip — so a
----    base that has diverged with commits the PR does not contain still yields
----    only what the PR adds since divergence.
+---Without it, the best LOCAL answer is a BEST EFFORT and is surfaced as such
+---(second return `stale`). The old two-dot `local_base..pr_branch` inflated the
+---range whenever the local base lagged the remote — the normal state in this
+---shared bare-repo layout (peers push; nobody pulled) — listing the base's own
+---catch-up commits as the PR's. `origin/<base>` + merge-base narrows that, but
+---lector's counterexample (PR #22) is exact: local C1, origin/base C2, true
+---base C3, PR=C3+F1 → `merge-base(origin/base, PR)=C2` still misreports C3. A
+---remote-tracking ref nobody fetched is not ground truth, so this path returns
+---`stale = true` and the caller should say so rather than trust the count.
 ---@param dir string  a directory git can resolve refs in
 ---@param base_branch string
 ---@param pr_branch string
----@return string range  a `<rev>..<pr_branch>` range
-local function _pr_range(dir, base_branch, pr_branch)
+---@param base_rev string?  the forge's authoritative base sha, when known
+---@return string range      a `<rev>..<pr_branch>` range
+---@return boolean stale     true when the range is a local best-effort (no base_rev)
+local function _pr_range(dir, base_branch, pr_branch, base_rev)
   local function rev(ref)
     local o = vim.system({ "git", "-C", dir, "rev-parse", "--verify", "--quiet", ref },
       { text = true }):wait()
     return o.code == 0 and vim.trim(o.stdout or "") ~= "" and vim.trim(o.stdout) or nil
   end
-  -- Freshest base ref: origin/<base> if present, else the local branch.
-  local base_ref = rev("origin/" .. base_branch) and ("origin/" .. base_branch) or base_branch
-  local mb = vim.system({ "git", "-C", dir, "merge-base", base_ref, pr_branch },
-    { text = true }):wait()
-  if mb.code == 0 and vim.trim(mb.stdout or "") ~= "" then
-    return string.format("%s..%s", vim.trim(mb.stdout), pr_branch)
+  local function mbase(a, b)
+    local o = vim.system({ "git", "-C", dir, "merge-base", a, b }, { text = true }):wait()
+    return o.code == 0 and vim.trim(o.stdout or "") ~= "" and vim.trim(o.stdout) or nil
   end
-  -- No common ancestor (unrelated histories): fall back to the base ref tip.
-  return string.format("%s..%s", base_ref, pr_branch)
+
+  -- Authoritative path: the forge base sha, if we can resolve it locally.
+  if type(base_rev) == "string" and base_rev ~= "" and rev(base_rev) then
+    local mb = mbase(base_rev, pr_branch)
+    return string.format("%s..%s", mb or base_rev, pr_branch), false
+  end
+
+  -- Best-effort local path: freshest available base ref, merge-base floor.
+  local base_ref = rev("origin/" .. base_branch) and ("origin/" .. base_branch) or base_branch
+  local mb = mbase(base_ref, pr_branch)
+  return string.format("%s..%s", mb or base_ref, pr_branch), true
 end
 
 ---pr_diff_commits collects commits and changed files for a multi-commit diffview (Action 2).
 ---@param repo table
 ---@param base_branch string
 ---@param pr_branch string
+---@param opts table?  { base_rev: string? }  the forge's authoritative base sha
 ---@return table[] commits
-function M.pr_diff_commits(repo, base_branch, pr_branch)
+---@return boolean stale  true when the range is a local best-effort (no base_rev)
+function M.pr_diff_commits(repo, base_branch, pr_branch, opts)
   local dir = repo.common_dir or repo.sample_worktree or repo.path
-  if not dir then return {} end
+  if not dir then return {}, false end
 
-  local range = _pr_range(dir, base_branch, pr_branch)
+  local base_rev = type(opts) == "table" and opts.base_rev or nil
+  local range, stale = _pr_range(dir, base_branch, pr_branch, base_rev)
   -- `--format=%H %s`, NOT `--oneline`.
   --
   -- `--oneline` implies `--abbrev-commit`, so `sha` came back abbreviated —
@@ -737,7 +752,7 @@ function M.pr_diff_commits(repo, base_branch, pr_branch)
   -- it is fixed at the source instead — `short` is now a real abbreviation of
   -- a real sha rather than a truncation of a truncation (Johno, 2026-09-08).
   local log_out = vim.system({ "git", "-C", dir, "log", "--format=%H %s", "--reverse", range }, { text = true }):wait()
-  if log_out.code ~= 0 or not log_out.stdout or log_out.stdout == "" then return {} end
+  if log_out.code ~= 0 or not log_out.stdout or log_out.stdout == "" then return {}, stale end
 
   local commits = {}
   local lines = vim.split(log_out.stdout, "\n", { trimempty = true })
@@ -767,7 +782,7 @@ function M.pr_diff_commits(repo, base_branch, pr_branch)
       })
     end
   end
-  return commits
+  return commits, stale
 end
 
 ---find_for_worktree searches local KB PR documents and receipts for a PR matching a worktree branch.

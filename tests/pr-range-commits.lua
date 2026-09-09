@@ -148,55 +148,63 @@ ok("[6] *** the sha is still 40 hex and the subject is intact ***",
     and hexy[1].subject == "deadbeef cafe fix the thing",
   hexy[1] and ("%s | %s"):format(hexy[1].sha, hexy[1].subject) or "nil")
 
-print("\n[7] a STALE local base does not inflate the range (B6)")
--- The bug: `pr_diff_commits` used a two-dot `local_base..pr_branch`. When the
--- LOCAL base branch lags the remote (peers push; nobody pulled), and the PR
--- branch was built on the NEWER base, the range lists the base's own catch-up
--- commits as if the PR added them. The fix resolves the base to the freshest
--- ref available (origin/<base> when present) and ranges from the merge-base.
+print("\n[7] the range against a stale base (B6, lector three-level fixture)")
+-- Three ref levels that disagree, exactly the counterexample from PR #22:
+--   local base   = C1  (stale local branch)
+--   origin/base  = C2  (stale remote-tracking ref nobody re-fetched)
+--   forge base   = C3  (ground truth: what the PR was actually opened against)
+--   PR branch    = C3 + F1
+-- Only the forge base sha yields the correct range (F1). Any LOCAL heuristic
+-- keyed on origin/base still misreports C3, which is why the authoritative
+-- base_rev exists and why its absence is surfaced as `stale`.
 do
-  -- Build a "remote": trunk C1 -> C2 -> C3. A feature branched at C1 then
-  -- rebased onto C3, adding F1, F2. Clone it, then REWIND the clone's local
-  -- trunk to C1 so it is stale, while origin/trunk stays at C3.
-  local up = sb .. "/upstream"; vim.fn.mkdir(up, "p")
-  G(up, "init", "-q", "-b", "trunk")
+  local up = sb .. "/up3"; vim.fn.mkdir(up, "p")
+  G(up, "init", "-q", "-b", "base")
   vim.fn.writefile({ "c1" }, up .. "/a.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C1")
   local c1 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
   vim.fn.writefile({ "c2" }, up .. "/b.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C2")
+  local c2 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
   vim.fn.writefile({ "c3" }, up .. "/c.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "C3")
-  -- feature = C3 + F1 + F2 (as if rebased onto the current trunk).
+  local c3 = vim.trim(G(up, "rev-parse", "HEAD").stdout or "")
   G(up, "checkout", "-q", "-b", "feature")
   vim.fn.writefile({ "f1" }, up .. "/f1.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "F1")
-  vim.fn.writefile({ "f2" }, up .. "/f2.txt"); G(up, "add", "."); G(up, "commit", "-q", "-m", "F2")
-  G(up, "checkout", "-q", "trunk")
+  G(up, "checkout", "-q", "base")
 
-  local clone = sb .. "/clone"
+  local clone = sb .. "/clone3"
   G(sb, "clone", "-q", up, clone)
   G(clone, "fetch", "-q", "origin", "feature:feature")
-  -- Rewind LOCAL trunk to C1 (stale), leaving origin/trunk at C3. `reset --hard`,
-  -- NOT `branch -f`: trunk is the checked-out branch and `branch -f` refuses it,
-  -- which silently left an earlier draft's trunk at C3 and the whole cell green
-  -- against the bug (fixture-preconditions-must-survive-the-action).
+  -- Pin origin/base to C2 (stale tracking ref) and local base to C1.
+  G(clone, "update-ref", "refs/remotes/origin/base", c2)
   G(clone, "reset", "--hard", c1)
 
   local rc = { common_dir = clone .. "/.git", path = clone, sample_worktree = clone }
-  -- PRECONDITION: the bug only exists when local base is behind the remote.
-  -- Assert the stale state actually landed, or this cell proves nothing.
-  local local_trunk = vim.trim(G(clone, "rev-parse", "trunk").stdout or "")
-  local origin_trunk = vim.trim(G(clone, "rev-parse", "origin/trunk").stdout or "")
-  ok("[7] fixture precondition: local trunk is C1 while origin/trunk is ahead",
-    local_trunk == c1 and origin_trunk ~= c1,
-    ("local=%s origin=%s c1=%s"):format(local_trunk:sub(1,7), origin_trunk:sub(1,7), c1:sub(1,7)))
+  -- PRECONDITION: the three levels really disagree.
+  ok("[7] fixture: local=C1, origin/base=C2, forge=C3 all differ",
+    vim.trim(G(clone, "rev-parse", "base").stdout or "") == c1
+      and vim.trim(G(clone, "rev-parse", "origin/base").stdout or "") == c2
+      and c1 ~= c2 and c2 ~= c3,
+    ("c1=%s c2=%s c3=%s"):format(c1:sub(1,7), c2:sub(1,7), c3:sub(1,7)))
 
-  local commits = pr_mod.pr_diff_commits(rc, "trunk", "feature")
-  local subjects = {}
-  for _, c in ipairs(commits) do subjects[c.subject] = true end
-  ok("[7] *** only the PR's own commits are listed (F1, F2) ***",
-    subjects["F1"] and subjects["F2"] and vim.tbl_count(subjects) == 2,
-    "got: " .. vim.inspect(vim.tbl_keys(subjects)))
-  ok("[7] *** the stale base's catch-up commits (C2, C3) are NOT listed ***",
-    not subjects["C2"] and not subjects["C3"],
-    "got: " .. vim.inspect(vim.tbl_keys(subjects)))
+  -- Authoritative: the forge base sha C3 is present locally (ancestor of the
+  -- fetched head), so merge-base(C3, feature) = C3 and the range is exactly F1.
+  local commits, stale = pr_mod.pr_diff_commits(rc, "base", "feature", { base_rev = c3 })
+  local subj = {}
+  for _, c in ipairs(commits) do subj[c.subject] = true end
+  ok("[7] *** with the forge base sha, only F1 is listed (C2/C3 excluded) ***",
+    subj["F1"] and not subj["C2"] and not subj["C3"] and vim.tbl_count(subj) == 1,
+    "got: " .. vim.inspect(vim.tbl_keys(subj)))
+  ok("[7] *** and it is NOT flagged stale (authoritative) ***", stale == false)
+
+  -- Best-effort (no base_rev): the local heuristic can only reach origin/base=C2,
+  -- so C3 leaks — AND the function says so via `stale = true`, so the caller can
+  -- surface "base may be stale" rather than trust the count.
+  local commits2, stale2 = pr_mod.pr_diff_commits(rc, "base", "feature")
+  local subj2 = {}
+  for _, c in ipairs(commits2) do subj2[c.subject] = true end
+  ok("[7] *** without it, the best-effort range is FLAGGED stale ***",
+    stale2 == true, "stale=" .. tostring(stale2))
+  ok("[7] the best-effort range is a superset that still contains F1",
+    subj2["F1"] == true, "got: " .. vim.inspect(vim.tbl_keys(subj2)))
 end
 
 print("\n[8] find_for_worktree parses base: from the KB PR doc (B7)")
