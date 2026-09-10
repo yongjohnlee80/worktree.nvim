@@ -42,6 +42,17 @@ vim.fn.mkdir(tmp_dir, "p")
 local test_auth_path = tmp_dir .. "/test-worktree-auth.json"
 creds._custom_config_path = test_auth_path
 
+-- The ephemeral curl config goes in the SUITE's directory, not the ambient
+-- $XDG_RUNTIME_DIR. Sections 9 and 11 used the real /run/user/<uid>, so the
+-- suite's result depended on the developer's runtime dir being writable —
+-- exactly what tests-never-touch-the-developer-environment forbids, and it
+-- failed for a reviewer whose sandbox had that directory present but not
+-- writable. The hook already existed and was used only inside one spawned
+-- subprocess; the main body never set it.
+local test_run_dir = tmp_dir .. "/run"
+vim.fn.mkdir(test_run_dir, "p")
+creds._custom_run_dir = test_run_dir
+
 -- 1. Default allowlist validation (MF2)
 for _, cmd in ipairs({ "pass", "op", "gh", "secret-tool", "keyctl", "security" }) do
   ok("default allowlist contains " .. cmd, creds.is_allowlisted(cmd) == true)
@@ -493,6 +504,74 @@ ok("ephemeral curl config includes Accept header", cfg_text:find("application/vn
 
 cleanup_fn()
 ok("cleanup function removed ephemeral curl config file", vim.fn.filereadable(cfg_path) == 0)
+
+-- 9b. The ephemeral config lands INSIDE the suite's sandbox (isolation witness).
+--
+-- Setting `_custom_run_dir` is configuration; this is the observation. Without
+-- a cell the suite could silently drift back to the ambient runtime dir and
+-- still be green on any machine where that happens to be writable — which is
+-- how the coupling survived until a reviewer's sandbox exposed it.
+do
+  local p, cleanup = creds.open_exclusive_config("witness_token")
+  ok("9b: *** the ephemeral credential config is created inside the suite sandbox ***",
+    p:sub(1, #test_run_dir + 1) == test_run_dir .. "/", p)
+  ok("9b: and NOT in the ambient runtime dir",
+    p:find(vim.fn.stdpath("run"), 1, true) ~= 1
+      or vim.fn.stdpath("run") == test_run_dir, p .. " vs " .. vim.fn.stdpath("run"))
+  cleanup()
+  ok("9b: cleanup removes it", vim.fn.filereadable(p) == 0)
+end
+
+-- 9c. An UNWRITABLE run dir refuses with an actionable message, and does NOT
+-- silently degrade to a world-writable /tmp.
+--
+-- The existing fallback covers a MISSING directory; a directory that exists
+-- but cannot be written passed that check and then failed all ten attempts
+-- with a message naming neither the directory nor the cause. That is what a
+-- reviewer hit, and all he could report was "the credential tail failed".
+do
+  local locked = tmp_dir .. "/locked-run"
+  vim.fn.mkdir(locked, "p")
+  vim.fn.setfperm(locked, "r-xr-xr-x")  -- present, not writable
+  local saved = creds._custom_run_dir
+  creds._custom_run_dir = locked
+  local ok_call, err = pcall(creds.open_exclusive_config, "tok")
+  creds._custom_run_dir = saved
+  vim.fn.setfperm(locked, "rwxr-xr-x")  -- restore so cleanup can remove it
+
+  -- The skip branch is where this cell nearly lied. `ok_call == true` has TWO
+  -- causes: permissions do not bind for this user (root — a legitimate skip),
+  -- or the code FELL BACK to a writable directory (the defect). Skipping on
+  -- the boolean alone absorbed the defect: mutating the code to degrade to
+  -- /tmp took the suite from 104/0 to 102/0 — two cells vanished into the
+  -- skip and it still reported all-green.
+  --
+  -- So discriminate on WHERE the file landed, which separates the two causes.
+  if ok_call then
+    local made = err  -- pcall's second return is the path on success
+    local inside = type(made) == "string" and made:sub(1, #locked + 1) == locked .. "/"
+    ok("9c: *** succeeding is only acceptable if it wrote INSIDE the locked dir "
+      .. "(permissions do not bind for this user) — never by falling back ***",
+      inside, "fell back to: " .. tostring(made))
+    if inside then pcall(vim.fn.delete, made) end
+  else
+    -- "Did not fall back" is exactly "did not RETURN A PATH": a fallback
+    -- succeeds and hands back a usable config. Matching the string "/tmp" was
+    -- the wrong instrument — the sandbox itself lives under /tmp, so it fired
+    -- on the directory being named rather than on a fallback happening.
+    ok("9c: *** an unwritable run dir RAISES rather than falling back to a writable one ***",
+      ok_call == false, "returned a path instead: " .. tostring(err))
+    -- Assert OUR phrasing, not merely that the path appears somewhere: libuv's
+    -- own EACCES text already embeds the full file path, so a plain
+    -- `find(locked)` passed even with the directory removed from our message.
+    -- The cell could not tell whose message named it.
+    ok("9c: *** OUR refusal names the directory (not just libuv's errno text) ***",
+      tostring(err):find("credential file in '" .. locked .. "'", 1, true) ~= nil,
+      tostring(err))
+    ok("9c: and names how to fix it",
+      tostring(err):find("XDG_RUNTIME_DIR", 1, true) ~= nil, tostring(err))
+  end
+end
 
 -- 10. Diagnostic redaction
 local leaked = "Error 401: Authorization: Bearer secret_pat_12345 invalid"

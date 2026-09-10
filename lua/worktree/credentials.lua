@@ -418,11 +418,17 @@ function M.open_exclusive_config(token)
     run_dir = "/tmp"
   end
 
+  -- The reason the LAST attempt failed, so a refusal can name a cause instead
+  -- of only a count. A directory that EXISTS but cannot be written — a
+  -- sandbox, a hardened multi-user host, a bind-mounted /run — passes the
+  -- isdirectory() check above and then fails every attempt identically.
+  local last_err
   for attempt = 1, 10 do
     local rand_suffix = M._temp_suffix(attempt)
     local path = string.format("%s/worktree-auth-%s.curlrc", run_dir, rand_suffix)
     -- "wx" maps strictly to O_WRONLY | O_CREAT | O_EXCL
     local fd, err = vim.uv.fs_open(path, "wx", 384) -- mode 0600
+    if not fd then last_err = err end
     if fd then
       local stat = vim.uv.fs_fstat(fd)
       if stat and bit.band(stat.mode, 511) == 384 then
@@ -447,7 +453,30 @@ function M.open_exclusive_config(token)
       pcall(vim.uv.fs_unlink, path)
     end
   end
-  error("worktree.credentials: failed to create exclusive temporary credential file")
+  -- DELIBERATELY NOT a fallback to /tmp, but NOT for a confidentiality reason.
+  --
+  -- My first rationale here was wrong and lector corrected it: a world-writable
+  -- DIRECTORY does not make a mode-0600 FILE readable — permissions live on the
+  -- inode, /tmp is sticky so only the owner can unlink, and the `wx`
+  -- (O_WRONLY|O_CREAT|O_EXCL) open refuses a pre-existing path, so a planted
+  -- symlink fails EEXIST rather than being followed. All three verified. The
+  -- missing-directory fallback above already relies on exactly that property,
+  -- and it stays.
+  --
+  -- The reason to refuse is CONFIGURED-LOCATION AND DIAGNOSTIC INTEGRITY. If an
+  -- operator has pointed $XDG_RUNTIME_DIR somewhere — a tmpfs they chose, a
+  -- per-session dir their init cleans up — and it cannot be written, quietly
+  -- writing somewhere else hides a misconfiguration and puts credential files
+  -- where they were not meant to go. The old message named neither the
+  -- directory nor the cause, so a reviewer who hit this in a sandbox could only
+  -- report "the credential tail failed". An error the operator can act on is
+  -- the better failure.
+  error(string.format(
+    "worktree.credentials: could not create an exclusive 0600 credential file in '%s'"
+    .. " after 10 attempts%s. That directory must be writable by this user;"
+    .. " set $XDG_RUNTIME_DIR to one that is, or override it for a test with"
+    .. " credentials._custom_run_dir.",
+    run_dir, last_err and (" (" .. tostring(last_err) .. ")") or ""))
 end
 
 ---redact strips Authorization headers and tokens from diagnostic strings.
