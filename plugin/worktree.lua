@@ -58,6 +58,33 @@ vim.api.nvim_create_user_command("WorktreeAuth", function(opts)
       lines[#lines + 1] = string.format("  %-28s %s  (%s)", key, shape, p.source or "?")
     end
     vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
+  elseif sub == "status" then
+    -- "Is a token configured FOR THIS REPO" — the question `list` cannot
+    -- answer, because it shows every profile without saying which one (if
+    -- any) the repo you are in would resolve through. Reports the chain's
+    -- outcome; never executes a provider, so it cannot trigger a passphrase
+    -- prompt, and never prints a secret.
+    local repos_mod = require("worktree.repos")
+    local repo = repos_mod.getpr_target_repo(vim.fn.getcwd())
+    if not repo then
+      vim.notify("WorktreeAuth status: no repository found here", vim.log.levels.ERROR)
+      return
+    end
+    local pr_mod = require("worktree.pr")
+    local remote = pr_mod.parse_remote(repo.url or "")
+    local d = creds.describe(repo.slug, remote.host)
+    if d.configured then
+      local shape = d.kind == "env" and ("env " .. tostring(d.var))
+        or d.kind == "command" and ("command " .. table.concat(d.argv or {}, " "))
+        or d.kind
+      vim.notify(string.format(
+        "WorktreeAuth: %s (host %s) resolves through '%s' — %s (%s)",
+        repo.slug, remote.host, d.key, shape, d.source), vim.log.levels.INFO)
+    else
+      vim.notify(string.format(
+        "WorktreeAuth: %s (host %s) has NO credential — %s\n  %s",
+        repo.slug, remote.host, tostring(d.why), d.hint), vim.log.levels.WARN)
+    end
   elseif sub == "clear" then
     local key = a[2]
     if not key then vim.notify("WorktreeAuth clear <key>", vim.log.levels.ERROR); return end
@@ -85,14 +112,14 @@ vim.api.nvim_create_user_command("WorktreeAuth", function(opts)
       vim.notify("WorktreeAuth: " .. tostring(err), vim.log.levels.ERROR)
     end
   else
-    vim.notify("WorktreeAuth <list|set|clear>", vim.log.levels.ERROR)
+    vim.notify("WorktreeAuth <list|status|set|clear>", vim.log.levels.ERROR)
   end
 end, {
   nargs = "*",
-  desc = "Worktree: manage forge credential profiles (list/set/clear)",
+  desc = "Worktree: manage forge credential profiles (list/status/set/clear)",
   complete = function(_, line)
     local n = select(2, line:gsub("%s+", " "))
-    if n <= 1 then return { "list", "set", "clear" } end
+    if n <= 1 then return { "list", "status", "set", "clear" } end
     return {}
   end,
 })

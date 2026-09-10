@@ -186,7 +186,7 @@ use {
 | `:WorktreeCreatePR`       | Open a PR for the active branch, and associate it            |
 | `:WorktreePostPRFeedback <n>` | Post every review associated with PR #n to the forge     |
 | `:WorktreeRecoverPRLock[!] <n>` | Clear a stale posting lock for PR #n (`!` = force)      |
-| `:WorktreeAuth <sub>`     | Manage forge credential profiles (`list` / `set` / `clear`)|
+| `:WorktreeAuth <sub>`     | Manage forge credentials (`list` / `status` / `set` / `clear`)|
 
 ## Forge authentication (for PR features)
 
@@ -205,7 +205,17 @@ registered** — there is no ambient default. Register one with `:WorktreeAuth`:
 " Inspect / remove (the token VALUE is never printed):
 :WorktreeAuth list
 :WorktreeAuth clear github.com
+
+" Will the PR keys work in the repo I am standing in?
+:WorktreeAuth status
 ```
+
+`status` answers the question `list` cannot: `list` shows every profile without
+saying which one — if any — *this* repo resolves through. It reports the chain's
+outcome for the cwd repo and its host, names the winning key and the profile's
+shape, and when nothing resolves it prints the exact `:WorktreeAuth set` line to
+run. It never executes a provider, so it cannot trigger a passphrase prompt, and
+it never prints a secret.
 
 The `<key>` is matched **slug → host → env**, in that order:
 

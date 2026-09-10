@@ -178,6 +178,129 @@ do
   creds.clear_profile("list-mem")
 end
 
+-- 7d. describe — the PREFLIGHT's report (ADR-0083 §2.6 Action 1 step 1).
+--
+-- Action 1 step 1 ("ensure credential profile is configured, prompt if
+-- missing") was never implemented: G/N/S prompted for a PR number and only
+-- discovered a missing token after the forge round trip. `describe` answers
+-- the question BEFORE the prompt.
+--
+-- Two properties matter more than the happy path, and both are asserted
+-- against the real chain rather than a reimplementation of it:
+--   * it must AGREE with resolve_token about which credential applies;
+--   * it must never EXECUTE a provider (a `command` profile would fire a GPG
+--     passphrase prompt on a keypress that has asked for nothing).
+do
+  -- Agreement, driven over the same cases §7b drives resolve_token over. A
+  -- second implementation of "which credential applies" that drifts would
+  -- report "configured" for a key that then fails — the one outcome a
+  -- preflight must never produce.
+  local saved = vim.env.GITHUB_TOKEN
+  vim.env.GITHUB_TOKEN = "env_gh_token_123"
+  creds.set_profile("github.com", { kind = "in_memory", token = "host_token_abc" })
+  creds.set_profile("monstercat__lm", { kind = "in_memory", token = "repo_token_xyz" })
+
+  local cases = {
+    { "monstercat__lm", "github.com" },        -- per-repo wins
+    { "unknown__repo",  "github.com" },        -- host profile
+    { "x__y",           "api.github.com" },    -- env, real subdomain
+    { "x__y",           "notgithub.example" }, -- refused
+    { "x__y",           "github.attacker.example" }, -- refused
+    { "default",        "gitlab.example.com" },-- refused
+    { "acme__thing",    "gitlab.example.com" },-- refused
+  }
+  local agree = true
+  local disagreement
+  for _, c in ipairs(cases) do
+    local tok = select(1, creds.resolve_token(c[1], c[2]))
+    local d = creds.describe(c[1], c[2])
+    if (tok ~= nil) ~= (d.configured == true) then
+      agree = false
+      disagreement = string.format("%s/%s: token=%s describe.configured=%s",
+        c[1], c[2], tostring(tok ~= nil), tostring(d.configured))
+      break
+    end
+  end
+  ok("preflight: *** describe agrees with resolve_token on every chain case ***",
+    agree, tostring(disagreement))
+
+  local d = creds.describe("monstercat__lm", "github.com")
+  ok("preflight: it names WHICH key won", d.key == "monstercat__lm", vim.inspect(d))
+  local dh = creds.describe("unknown__repo", "github.com")
+  ok("preflight: a host profile is reported under the HOST key",
+    dh.configured and dh.key == "github.com", vim.inspect(dh))
+  creds.clear_profile("monstercat__lm")
+  creds.clear_profile("github.com")
+
+  local de = creds.describe("x__y", "api.github.com")
+  ok("preflight: the env fallback is reported as env/GITHUB_TOKEN",
+    de.configured and de.kind == "env" and de.var == "GITHUB_TOKEN", vim.inspect(de))
+
+  -- A qualifying host with the variable UNSET is a different problem from
+  -- "nothing configured", and conflating them sends the user to register a
+  -- profile they do not need.
+  vim.env.GITHUB_TOKEN = nil
+  local du = creds.describe("x__y", "github.com")
+  ok("preflight: *** a github host with $GITHUB_TOKEN unset says so ***",
+    du.configured == false and tostring(du.why):find("GITHUB_TOKEN is unset", 1, true) ~= nil,
+    vim.inspect(du))
+  vim.env.GITHUB_TOKEN = saved
+
+  -- The hint is the LINE TO RUN, with the host filled in. "Configure a
+  -- credential" is not actionable; this is.
+  local dn = creds.describe("acme__thing", "gitlab.example.com")
+  ok("preflight: an unconfigured repo reports configured=false", dn.configured == false)
+  ok("preflight: *** the hint names :WorktreeAuth set AND the real host ***",
+    dn.hint:find(":WorktreeAuth set", 1, true) ~= nil
+      and dn.hint:find("gitlab.example.com", 1, true) ~= nil, dn.hint)
+  ok("preflight: the hint offers both provider forms",
+    dn.hint:find("command", 1, true) ~= nil and dn.hint:find("env GITHUB_TOKEN", 1, true) ~= nil,
+    dn.hint)
+
+  -- NO EXECUTION. The provider is a script that leaves a marker file when it
+  -- runs; describe must leave it absent while resolve_token creates it. A
+  -- positive control, so "no marker" cannot mean "the script was broken".
+  local marker = tmp_dir .. "/describe-ran-the-provider"
+  local script = tmp_dir .. "/probe-provider"
+  vim.fn.writefile({ "#!/bin/sh", "touch " .. marker, "echo tok_from_script" }, script)
+  vim.fn.system({ "chmod", "+x", script })
+  -- An absolute path is only accepted when explicitly allowlisted (the MF2
+  -- traversal guard); keep §7's helper permitted alongside it.
+  config.setup({ auth = { allowed_command_providers = { helper_script, script } } })
+  creds.set_profile("exec__probe", { kind = "command", argv = { script } })
+
+  vim.fn.delete(marker)
+  local dc = creds.describe("exec__probe", "github.com")
+  ok("preflight: a command profile is reported as configured, with its argv",
+    dc.configured and dc.kind == "command" and dc.argv and dc.argv[1] == script, vim.inspect(dc))
+  ok("preflight: *** describe did NOT execute the provider ***",
+    vim.fn.filereadable(marker) == 0,
+    "marker present -- describe ran the command, which would fire a GPG prompt")
+  -- Positive control: the same profile, resolved, DOES run it. Without this,
+  -- an absent marker could just mean the script never worked.
+  local tok = creds.resolve_token("exec__probe", "github.com")
+  ok("preflight: (control) resolve_token DOES execute it, so the probe observes",
+    tok == "tok_from_script" and vim.fn.filereadable(marker) == 1,
+    tostring(tok) .. " / marker=" .. tostring(vim.fn.filereadable(marker)))
+  creds.clear_profile("exec__probe")
+
+  -- And nothing in a report may carry a secret.
+  creds.set_profile("leak__mem", { kind = "in_memory", token = "super_secret_desc_tok" })
+  local dm = creds.describe("leak__mem", "github.com")
+  ok("preflight: *** describe NEVER surfaces the token value ***", (function()
+    for _, v in pairs(dm) do
+      if type(v) == "string" and v:find("super_secret_desc_tok", 1, true) then return false end
+      if type(v) == "table" then
+        for _, vv in ipairs(v) do
+          if type(vv) == "string" and vv:find("super_secret_desc_tok", 1, true) then return false end
+        end
+      end
+    end
+    return true
+  end)(), vim.inspect(dm))
+  creds.clear_profile("leak__mem")
+end
+
 -- 8. Clearing profiles
 creds.clear_profile("in-mem-slug")
 ok("cleared in-memory profile is gone", creds.get_profile("in-mem-slug") == nil)
