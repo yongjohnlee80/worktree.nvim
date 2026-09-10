@@ -2,6 +2,162 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.16] — 2026-09-10 — CreatePR reported failure for PRs it created, and associated them with nothing
+
+Patch. Three defects on the PR path, all on the surface auto-finder's repos
+panel drives. Found while auditing what that panel's `?` help modal fails to
+tell an end user about PR credentials and PR associations — see
+auto-finder.nvim **v0.4.28**, which documents both prerequisites, and ADR-0083
+Amendment r10.
+
+**`create_pr` returned `(pr, err)` while both call sites read `res.ok`.**
+`:WorktreeCreatePR` and auto-finder's `N` both read `res.ok` and
+`res.pr.number`, so a PR that had just been opened on the forge reported
+`could not create PR — unknown`. Probed against a mocked 201 before the fix:
+
+```
+res.number : 77      res.ok : nil
+CALLER SEES: could not create PR — unknown
+CONTROL    : created PR #77          ← same caller branch, {ok=…} shape
+```
+
+It now returns a result envelope like its sibling ACTIONS
+(`fetch_and_create_worktree`, `post_feedback`); the `(value, err)` pair stays
+with the internal fetchers `get_pr` / `get_comments`.
+
+Why no suite observed it, which is the part worth keeping: auto-finder's own
+cell mocked `{ ok = true, pr = { number = 99 } }` — the envelope the caller
+*wished for*, never the one the function returned. A mock written from the
+caller's intent cannot detect a contract mismatch; it encodes it as correct.
+
+**A created PR was associated with nothing.** ADR-0083 §2.6 Action 6 specifies
+"on creation, instantiate the KB PR document"; it was never implemented. A PR
+opened with `N` therefore had no local association — no `[#N]` badge, no `S`,
+and (because a review inherits its `pr` at *draft* time) every review written
+from that worktree afterwards carried no PR and could never be submitted. The
+create → review → submit loop was broken end to end for any branch not named
+`pr-<N>`.
+
+The writer is now one exported function, `worktree.pr.write_kb_doc`, shared
+with `fetch_and_create_worktree` — two writers would be two definitions of what
+an association *is*. A created PR's document also gains `base`, `base_sha` and
+`author`, which the old projection dropped, leaving `open_pr_diff` to fall back
+to the literal `main`. A failed write does **not** fail the action — the PR is
+already open and reporting failure would invite a second create — so it returns
+as `kb_doc_error` and the panel warns.
+
+**`:WorktreeRecoverPRLock` was dead on arrival, twice over.** It called
+`pr_mod.parse_remote_url`, which this module has never exported (`parse_remote`
+returns a *table*, not a `forge, owner, name` triple):
+
+```
+pr.parse_remote_url : nil
+calling it          : attempt to call field 'parse_remote_url' (a nil value)
+```
+
+Repairing the name alone was not enough: it derived `owner .. "/" .. name`
+while `post_feedback` locks under `repo.slug` (`owner__name`), and
+`recover_lock` returns **true** for a lock file that does not exist — so the
+wrong key "recovered" successfully and left the real lock in place. Both paths
+now derive the key from `pr.lock_key`.
+
+README: the PR-association rules (what makes a worktree PR #N, which paths
+write it, how to repoint one by hand), and the three PR commands that were
+missing from the command table.
+
+PR #26. Tests: `tests/adr0083-pr-lifecycle.lua` §5g/5h/5i, +21 cells (75 → 96),
+`run-all.sh` OK at 605 across 11 suites. The association is asserted through its
+consumer (`find_for_worktree`) on an ordinary branch name — `pr-<N>` would match
+by naming convention and prove nothing — with an unrelated branch as the decoy;
+the lock cells assert the FILE, not the return value, because the return value
+is exactly what could not tell the two keys apart; §5i sources
+`plugin/worktree.lua` and drives the registered command. Four falsifications
+recorded, one reversal per fix.
+
+## [v0.5.15] — 2026-09-09 — `review_posted`, and per-review `post_feedback` that never drops a second review
+
+Patch. Companion to the auto-finder PR-association reframe (ADR-0083
+Amendment r9).
+
+`review_posted(repo, review)` answers whether a review's findings are all on
+the forge, read from the two-phase posting RECEIPT — never the
+ADR-0067-immutable review JSON. The repos panel badges a review `[posted]` from
+it. `worktree.repos` exposes the thin panel-facing delegate.
+
+`post_feedback` now merges per-review findings at a shared commit. It batched by
+commit SHA and skipped a batch once committed, so submitting a second review at
+a commit another review already owned dropped that review's findings while
+returning `ok=true`. The batch is now the union of every review's findings for a
+sha: each call merges its `finding_id`s in, done is judged against this call's
+`finding_id`s, only unposted findings go on the wire, and aggregate state is
+recomputed from the comments.
+
+PR #25. Reviewed by lector; approved. New suites `adr0083-review-posted` (9)
+and `adr0083-per-review-post` (8); full suite green.
+
+## [v0.5.14] — 2026-09-09 — authoritative PR-diff base, credential surface, and honest GetPR failures
+
+Patch. Two coupled changes landed together (PR #22 and PR #24, the rebased
+continuation of the auto-closed #23).
+
+**PR-diff range (#22).** The range ignored a base that had advanced, and
+`find_for_worktree` never parsed the base. `pr_diff_commits` now ranges from the
+forge's authoritative base sha when it is resolvable (`stale=false`), and
+otherwise surfaces a flagged best-effort (`stale=true`) instead of the old
+two-dot range that listed the base's own catch-up commits as the PR's.
+
+**Credentials and GetPR robustness (#24).** A real credential surface
+(`:WorktreeAuth list/set/clear`) with a slug → host → env `resolve_token` chain;
+the `GITHUB_TOKEN` env fallback is now restricted to `github.com` and
+`*.github.com` exactly, closing a token-disclosure path where any host
+containing the substring "github" borrowed the ambient token. Review posting
+threads the host like the other verbs. `:WorktreeGetPR` resolves the cwd's repo
+and refuses when cwd is a git repo outside the workspace inventory rather than
+silently acting on the first repo. `fetch_and_create_worktree` now reports
+failure honestly, checking the fetch, worktree-add, and checkout steps.
+Ephemeral curl-config temp names draw from an OS CSPRNG (`vim.uv.random`),
+fixing a deterministic `math.random` collision that made concurrent PR
+operations fail.
+
+Reviewed by lector across the #22 and #23 rounds; approved. Suite: 813 passed,
+0 failed across 11 suites, each new fix covered by a discriminating cell
+verified against its reverted form.
+
+## [v0.5.13] — 2026-09-08 — every range diff died on its first commit; the sha was abbreviated
+
+Patch. `pr_diff_commits` read `git log --oneline`, which implies
+`--abbrev-commit`, so its `sha` field came back seven characters — while the
+next line computed `short = sha:sub(1, 7)`, a truncation of a truncation.
+
+`auto-core.review.draft.scope` requires 40 hex and refuses anything shorter (two
+commits can share a prefix, and a colliding scope would silently merge two
+reviewers' drafts), so building a range diff over a real repository errored on
+its first commit:
+
+```
+auto-core.review.draft: cannot bind a draft — sha="d8e6433"
+… a sha must be the FULL 40 hex characters
+```
+
+Fixed at the producer with `--format=%H %s`. This is the same defect v0.5.12
+(#19) fixed in `graph.lua`, where gitgraph handed out a nine-character hash;
+that one had to be resolved at the consumer because gitgraph's output was not
+ours. One producer was missed in that sweep.
+
+`pr_diff_commits` had **never** been tested: both consumers stubbed it, and both
+stubs returned a full 40-hex sha, so auto-finder's PR-diff suite was green for
+weeks asserting the fixture's contract rather than this function's. Same failure
+mode #19 recorded, one layer down.
+
+Also in this release: CI's auto-core pin was two patches behind its own suites
+(v0.2.15 against a v0.2.22 requirement), so the gate had been red on `main`
+since #19 and could not distinguish a new failure from the standing one.
+
+PR #21. `tests/pr-range-commits.lua` — 16 cells, five of which go red against
+the pre-fix code. The sha is asserted to EQUAL `git rev-parse feature`, not
+merely to be 40 characters long. run-all: OK (769 passed, 0 failed across 11
+suites), first green CI run on this repo since #19.
+
 ## [v0.5.12] — 2026-09-07 — `o` died on every commit; gitgraph abbreviates its hashes
 
 Patch. Fixes a regression shipped in `v0.5.11`.
