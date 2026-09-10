@@ -1237,7 +1237,7 @@ end
 ---@param repo table
 ---@param branch string
 ---@param pr_number integer|string
----@param opts table?  { reassign: boolean?, allow_stub: boolean?, expect: { source: integer|false, target: integer|false }? }
+---@param opts table?  { reassign: boolean?, allow_stub: boolean?, expect: { source: integer|false, target: { number: integer, branch: string }|false }? }
 ---@return table result  { ok, pr?, kb_doc?, stub?, reason?, code?, error?, conflict? }
 function M.associate(repo, branch, pr_number, opts)
   opts = opts or {}
@@ -1350,17 +1350,45 @@ function M.associate(repo, branch, pr_number, opts)
     -- from the snapshot means "I saw none there", so a conflict appearing
     -- under the prompt refuses too.
     if opts.expect ~= nil then
+      -- The SOURCE end is identified by its PR number: its branch is the
+      -- branch being requested, which cannot move under the prompt.
+      --
+      -- The TARGET end is the other way round. Its number is the PR the user
+      -- ASKED for, so it is constant by construction and pins nothing — the
+      -- thing that can move is which branch currently holds it. Binding only
+      -- the number let another actor move #42 alpha -> gamma mid-prompt and
+      -- have the confirmation displace gamma, which the user never saw
+      -- (lector r2). `expect.target` is therefore `false` or a
+      -- `{ number, branch }` pair.
       local want_s = opts.expect.source or false
-      local want_t = opts.expect.target or false
+      local et = opts.expect.target
       local got_s = source_conflict and source_conflict.number or false
-      local got_t = target_conflict and target_conflict.number or false
-      local function shown(v) return v and ("#" .. tostring(v)) or "none" end
-      if tostring(want_s) ~= tostring(got_s) or tostring(want_t) ~= tostring(got_t) then
+      local got_t_num = target_conflict and target_conflict.number or false
+      local got_t_branch = target_conflict and target_conflict.branch or false
+
+      -- A bare number is the OLD, weaker snapshot. Fail CLOSED rather than
+      -- accepting a binding that cannot detect the drift this exists for.
+      if et ~= nil and et ~= false and type(et) ~= "table" then
+        return { ok = false, code = "incomplete_expectation",
+          error = "expect.target must be { number = N, branch = '<branch>' }: "
+            .. "a bare number cannot detect the PR being moved to another branch" }
+      end
+      local want_t_num = (type(et) == "table" and et.number) or false
+      local want_t_branch = (type(et) == "table" and et.branch) or false
+
+      local function shown(n, b)
+        if not n then return "none" end
+        return b and ("#" .. tostring(n) .. " on " .. tostring(b)) or ("#" .. tostring(n))
+      end
+      if tostring(want_s) ~= tostring(got_s)
+        or tostring(want_t_num) ~= tostring(got_t_num)
+        or tostring(want_t_branch) ~= tostring(got_t_branch) then
         local c = select(1, describe_conflict())
         return { ok = false, code = "incumbent_drift", conflict = c,
           error = string.format(
             "the association changed while you were deciding: expected branch-holder %s / PR-holder %s, found %s / %s",
-            shown(want_s), shown(want_t), shown(got_s), shown(got_t)) }
+            shown(want_s), shown(want_t_num, want_t_branch),
+            shown(got_s), shown(got_t_num, got_t_branch)) }
       end
     end
 

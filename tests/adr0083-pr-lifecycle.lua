@@ -942,7 +942,7 @@ do
   -- With explicit reassignment it moves — and STILL preserves the metadata,
   -- because re-rendering an existing document from a stub destroys it.
   local moved = pr_mod.associate(repo, "feat/widget-x", 42,
-    { reassign = true, expect = { target = 42 } })
+    { reassign = true, expect = { target = { number = 42, branch = "main" } } })
   ok("5k P1-2: explicit reassign moves the PR to the new branch", moved.ok == true,
     vim.inspect(moved))
   ok("5k P1-2: and reports which branch it was taken from",
@@ -1080,14 +1080,14 @@ do
       and tostring((pr_mod.find_for_worktree(repo, { branch = "beta" }) or {}).number) == "43")
 
   reset()
-  local half2 = pr_mod.associate(repo, "beta", 42, { reassign = true, expect = { target = 42 } })
+  local half2 = pr_mod.associate(repo, "beta", 42, { reassign = true, expect = { target = { number = 42, branch = "main" } } })
   ok("5m: *** confirming only the target refuses when a source is also occupied ***",
     half2.ok == false and half2.code == "incumbent_drift", vim.inspect(half2))
 
   -- Binding BOTH succeeds, and reports BOTH displacements.
   reset()
   local full = pr_mod.associate(repo, "beta", 42,
-    { reassign = true, expect = { source = 43, target = 42 } })
+    { reassign = true, expect = { source = 43, target = { number = 42, branch = "alpha" } } })
   ok("5m: *** confirming both endpoints succeeds ***", full.ok == true, vim.inspect(full))
   ok("5m: and it reports both displacements",
     tostring(full.reassigned_from) == "43" and full.took_from_branch == "alpha"
@@ -1110,6 +1110,40 @@ do
     { reassign = true, expect = { source = false, target = false } })
   ok("5m: *** a TARGET conflict appearing after the prompt refuses ***",
     app_t.ok == false and app_t.code == "incumbent_drift", vim.inspect(app_t))
+
+  -- lector r2: the TARGET's number is the PR the user ASKED for, so it is
+  -- constant by construction and pins nothing. What can move is which branch
+  -- holds it. Binding only the number let another actor move #42 alpha ->
+  -- gamma mid-prompt and have the confirmation displace gamma unseen.
+  vim.fn.system({ "git", "-C", dir, "branch", "gamma" })
+  reset()
+  local seen = pr_mod.associate(repo, "beta", 42)
+  ok("5m r2: (setup) the prompt shows #42 on alpha",
+    seen.conflict.target.branch == "alpha", vim.inspect(seen.conflict.target))
+  -- Another actor moves it while the prompt is open.
+  pr_mod.set_kb_doc_branch(pr_mod.kb_doc_path(repo, 42), "gamma")
+  local moved_under = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = { number = 42, branch = "alpha" } } })
+  ok("5m r2: *** the PR moving to another branch mid-prompt REFUSES ***",
+    moved_under.ok == false and moved_under.code == "incumbent_drift", vim.inspect(moved_under))
+  ok("5m r2: the refusal names the branch expected and the branch found",
+    tostring(moved_under.error):find("on alpha", 1, true) ~= nil
+      and tostring(moved_under.error):find("on gamma", 1, true) ~= nil, tostring(moved_under.error))
+  ok("5m r2: *** and gamma was not displaced ***",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "gamma" }) or {}).number) == "42")
+  -- Control: confirming what is actually there succeeds.
+  local agreed_g = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = { number = 42, branch = "gamma" } } })
+  ok("5m r2: (control) confirming the CURRENT branch succeeds", agreed_g.ok == true,
+    vim.inspect(agreed_g))
+
+  -- A bare number is the old, weaker snapshot: fail CLOSED rather than accept
+  -- a binding that cannot detect this drift.
+  reset()
+  local bare = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = 42 } })
+  ok("5m r2: *** a bare-number target expectation is refused, not accepted ***",
+    bare.ok == false and bare.code == "incomplete_expectation", vim.inspect(bare))
 
   vim.fn.delete(dir, "rf")
   vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
