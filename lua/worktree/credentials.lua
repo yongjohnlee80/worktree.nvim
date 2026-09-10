@@ -205,31 +205,54 @@ end
 ---was `key:find("github")` — a slug like `monstercat__lm` never contains
 ---"github", so `GITHUB_TOKEN` was unreachable for every real repo. A github
 ---HOST is what actually decides whether `GITHUB_TOKEN` applies.
+---_is_github_host is the EXACT github.com test the env fallback turns on.
+---
+---`github.com` itself or a `*.github.com` subdomain — never a substring match.
+---`host:find("github")` matched `notgithub.example` and
+---`github.attacker.example`, handing a malicious remote the ambient token
+---(lector PR #23 must-fix).
+local function _is_github_host(h)
+  return type(h) == "string" and (h == "github.com" or h:match("%.github%.com$") ~= nil)
+end
+
+---_select selects WHICH credential a key/host pair resolves through, without
+---retrieving anything.
+---
+---Split out of `resolve_token` so `describe` can report the chain's outcome
+---without executing a provider. Two implementations of "which credential
+---applies" would be two answers to the question the preflight exists to ask
+---([[shared-resolver-single-source-of-truth]]) — and the one that drifted
+---would be the one reporting "configured" for a key that then fails.
+---@param key string
+---@param host string?
+---@return table? profile, string? matched_key, string? via  ("profile"|"env")
+local function _select(key, host)
+  local prof = M.get_profile(key)
+  if prof then return prof, key, "profile" end
+  -- SLUG → HOST profile fallback: a per-host profile keyed `github.com` is
+  -- reachable when no per-repo profile exists.
+  if type(host) == "string" and host ~= "" and host ~= key then
+    prof = M.get_profile(host)
+    if prof then return prof, host, "profile" end
+  end
+  -- Env fallback via GITHUB_TOKEN, and "default" only when NO concrete host
+  -- was given.
+  local no_host = host == nil or host == "" or host == "default"
+  if _is_github_host(host) or (no_host and key == "default") then
+    return nil, "GITHUB_TOKEN", "env"
+  end
+  return nil, nil, nil
+end
+
 ---@param key string           repo slug (or any primary key)
 ---@param host string?         forge host, for the profile + env fallback
 ---@return string? token, string? err
 function M.resolve_token(key, host)
-  local prof = M.get_profile(key)
-  -- SLUG → HOST profile fallback: a per-host profile keyed `github.com` is now
-  -- reachable when no per-repo profile exists.
-  if not prof and type(host) == "string" and host ~= "" and host ~= key then
-    prof = M.get_profile(host)
-  end
+  local prof, _, via = _select(key, host)
   if not prof then
-    -- Env fallback via GITHUB_TOKEN — but ONLY for a host that is genuinely
-    -- github.com (lector PR #23 must-fix). `host:find("github")` matched
-    -- `notgithub.example` and `github.attacker.example`, handing a malicious
-    -- remote the ambient GitHub token; and `key == "default"` handed it out
-    -- even with a concrete non-GitHub host. The rule is now EXACT: `github.com`
-    -- itself, or a `*.github.com` subdomain (api.github.com, an enterprise
-    -- subdomain). "default" is honoured only when NO concrete host was given.
-    local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
-    local function is_github_host(h)
-      return type(h) == "string" and (h == "github.com" or h:match("%.github%.com$") ~= nil)
-    end
-    local no_host = host == nil or host == "" or host == "default"
-    if env_pat and env_pat ~= "" and (is_github_host(host) or (no_host and key == "default")) then
-      return env_pat, nil
+    if via == "env" then
+      local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
+      if env_pat and env_pat ~= "" then return env_pat, nil end
     end
     return nil, string.format(
       "no credential profile configured for '%s'%s — register one with :WorktreeAuth set",
@@ -264,6 +287,94 @@ function M.resolve_token(key, host)
   end
 
   return nil, string.format("unsupported profile kind '%s'", tostring(prof.kind))
+end
+
+---describe reports WHICH credential a key/host pair would resolve through,
+---without retrieving it (ADR-0083 §2.6 Action 1 step 1).
+---
+---The preflight this exists for runs before every `G`/`N`/`S`, so it must be
+---SIDE-EFFECT FREE: executing a `command` provider here would fire a GPG
+---passphrase prompt on a keypress that has not asked for anything yet. It
+---therefore answers "is one configured, and which", never "does it work" —
+---`configured = true` on a `command` profile can still fail at use time, and
+---`resolve_token` names the provider when it does.
+---
+---The token VALUE never appears in the result, by construction: the `env` and
+---`command` branches carry the variable name and the argv, and `in_memory`
+---carries nothing but its kind.
+---@param key string    repo slug (or any primary key)
+---@param host string?  forge host
+---@return table report { configured, key?, kind?, source?, var?, argv?, host?, hint }
+function M.describe(key, host)
+  local prof, matched, via = _select(key, host)
+
+  -- The hint is the LINE TO RUN, with the host filled in — the point of the
+  -- preflight is that "configure a credential" is not actionable and
+  -- ":WorktreeAuth set github.com env GITHUB_TOKEN" is.
+  local h = (type(host) == "string" and host ~= "" and host) or "github.com"
+  local hint = string.format(
+    ":WorktreeAuth set %s command pass show <path/to/token>   (or: env GITHUB_TOKEN)", h)
+
+  local function report(t)
+    t.host, t.hint = host, hint
+    -- `configured` is the single boolean an older consumer reads. Defined as
+    -- "selected AND not KNOWN-unavailable", so such a consumer refuses on a
+    -- broken env profile and still allows an unprobed command provider —
+    -- correct behaviour from the coarse field, with the two facts also exposed
+    -- separately for callers that can use them.
+    t.configured = (t.selected == true) and (t.readiness ~= "unavailable")
+    return t
+  end
+
+  if via == "env" then
+    -- The ambient GITHUB_TOKEN is a SELECTED source whenever the host
+    -- qualifies; whether the variable holds anything is a separate fact.
+    local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
+    local ready = env_pat ~= nil and env_pat ~= ""
+    return report({
+      selected = true, key = "GITHUB_TOKEN", kind = "env",
+      source = "environment", var = "GITHUB_TOKEN",
+      readiness = ready and "ready" or "unavailable",
+      why = (not ready) and "$GITHUB_TOKEN is unset or empty (this host would accept it)" or nil,
+    })
+  end
+
+  if not prof then
+    return report({
+      selected = false, readiness = "unavailable",
+      why = string.format("no profile for '%s'%s", tostring(key),
+        host and (" or host '" .. host .. "'") or ""),
+    })
+  end
+
+  local source = M._in_memory[matched] and "memory" or "disk"
+  local base = { selected = true, key = matched, kind = prof.kind, source = source,
+                 var = prof.var, argv = prof.argv }
+
+  -- READINESS, modelled separately from selection (lector r0 P1-1). Reporting
+  -- "configured" for a selected-but-broken source is the exact state the
+  -- preflight exists to catch: an env profile naming an unset variable passed
+  -- every gate and then failed at the forge.
+  if prof.kind == "in_memory" then
+    base.readiness = "ready"
+  elseif prof.kind == "env" then
+    -- Side-effect free: reading an environment variable executes nothing.
+    local v = prof.var and (os.getenv(prof.var) or vim.env[prof.var]) or nil
+    if v and v ~= "" then
+      base.readiness = "ready"
+    else
+      base.readiness = "unavailable"
+      base.why = string.format("environment variable '%s' is unset or empty", tostring(prof.var))
+    end
+  else
+    -- A command provider's readiness CANNOT be known without running it, and
+    -- running it here would fire a GPG passphrase prompt on a keypress that
+    -- has asked for nothing. Unknown is the honest answer; the caller allows
+    -- it and lets the real action surface a failure.
+    base.readiness = "unknown"
+    base.why = "readiness not probed — a command provider is only run by the action itself"
+  end
+  return report(base)
 end
 
 ---_temp_suffix returns a hex suffix for an ephemeral credential-config name.
