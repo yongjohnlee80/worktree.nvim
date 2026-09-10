@@ -752,11 +752,13 @@ do
   local clash = pr_mod.associate(repo, "feat/widget-x", 99)
   ok("5j: *** a second PR for the same branch is refused (conflict) ***",
     clash.ok == false and clash.code == "conflict"
-      and tostring(clash.conflict and clash.conflict.number) == "42", vim.inspect(clash))
+      and tostring(clash.conflict and clash.conflict.source and clash.conflict.source.number) == "42",
+    vim.inspect(clash))
   ok("5j: the refused re-point left #42 in place",
     tostring(pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }).number) == "42")
 
-  local moved = pr_mod.associate(repo, "feat/widget-x", 99, { reassign = true })
+  local moved = pr_mod.associate(repo, "feat/widget-x", 99,
+    { reassign = true, expect = { source = 42 } })
   ok("5j: reassign=true re-points the branch", moved.ok == true, vim.inspect(moved))
   ok("5j: it reports which PR it was released from",
     tostring(moved.reassigned_from) == "42", tostring(moved.reassigned_from))
@@ -928,8 +930,8 @@ do
   ok("5k P1-2: *** associating a PR owned by another branch is REFUSED ***",
     steal.ok == false and steal.code == "conflict", vim.inspect(steal))
   ok("5k P1-2: the conflict names the incumbent BRANCH, not just the number",
-    steal.conflict and steal.conflict.branch == "main" and steal.conflict.kind == "target",
-    vim.inspect(steal.conflict))
+    steal.conflict and steal.conflict.target and steal.conflict.target.branch == "main"
+      and steal.conflict.kind == "target", vim.inspect(steal.conflict))
   ok("5k P1-2: *** the refusal left main's association intact ***",
     tostring((pr_mod.find_for_worktree(repo, { branch = "main" }) or {}).number) == "42")
   local kept = pr_mod.read_kb_doc(pr_mod.kb_doc_path(repo, 42))
@@ -939,7 +941,8 @@ do
 
   -- With explicit reassignment it moves — and STILL preserves the metadata,
   -- because re-rendering an existing document from a stub destroys it.
-  local moved = pr_mod.associate(repo, "feat/widget-x", 42, { reassign = true })
+  local moved = pr_mod.associate(repo, "feat/widget-x", 42,
+    { reassign = true, expect = { target = 42 } })
   ok("5k P1-2: explicit reassign moves the PR to the new branch", moved.ok == true,
     vim.inspect(moved))
   ok("5k P1-2: and reports which branch it was taken from",
@@ -981,13 +984,13 @@ do
   -- Expected-state binding: a confirmation is authority over the incumbent the
   -- USER SAW, not over whatever is current when they answer.
   local drift = pr_mod.associate(repo, "spare", 45,
-    { reassign = true, expect_incumbent = 99 })
+    { reassign = true, expect = { source = 99 } })
   ok("5k P1-3: *** a re-point refuses when the incumbent drifted under it ***",
     drift.ok == false and drift.code == "incumbent_drift", vim.inspect(drift))
   ok("5k P1-3: the drift refusal names what was expected and what was found",
-    tostring(drift.error):find("expected PR #99", 1, true) ~= nil, tostring(drift.error))
+    tostring(drift.error):find("expected branch-holder #99", 1, true) ~= nil, tostring(drift.error))
   local agreed = pr_mod.associate(repo, "spare", 45,
-    { reassign = true, expect_incumbent = 44 })
+    { reassign = true, expect = { source = 44 } })
   ok("5k P1-3: (control) the same call with the CORRECT incumbent succeeds",
     agreed.ok == true, vim.inspect(agreed))
 
@@ -997,6 +1000,116 @@ do
   local d_ok = pr_mod.dissociate(repo, "spare", { expect_pr = 45 })
   ok("5k P1-3: (control) dissociate with the correct expectation succeeds",
     d_ok.ok == true, vim.inspect(d_ok))
+
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
+-- 5m. Lector r1 — SIMULTANEOUS source and target occupancy.
+--
+-- Reproduced before folding, on lector's exact shape (#43 -> beta,
+-- #42 -> alpha, request beta -> #42): the envelope was internally MIXED —
+-- number and document from the source (#43, pr-43.md), branch and kind from
+-- the target (alpha) — so the panel announced "PR #43 is currently on alpha",
+-- a PR and a branch with nothing to do with each other. Confirming that one
+-- displayed number then displaced BOTH endpoints.
+--
+-- The four occupancy cases are driven explicitly, because "a conflict" was
+-- exactly the collapsing that produced the defect.
+do
+  local kb = vim.fn.tempname() .. "-kb-r1"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local dir = assoc_fixture("r1")
+  vim.fn.system({ "git", "-C", dir, "branch", "alpha" })
+  vim.fn.system({ "git", "-C", dir, "branch", "beta" })
+  local repo = { slug = "acme__r1", path = dir, url = "git@github.com:acme/r1.git",
+                 remote = "git@github.com:acme/r1.git" }
+  local function reset()
+    vim.fn.delete(kb, "rf")
+    pr_mod.write_kb_doc(repo, { number = 43, title = "fortythree", state = "open" }, "beta")
+    pr_mod.write_kb_doc(repo, { number = 42, title = "fortytwo", state = "open" }, "alpha")
+  end
+
+  -- NEITHER: an unoccupied pair still associates.
+  vim.fn.delete(kb, "rf")
+  local none = pr_mod.associate(repo, "beta", 50)
+  ok("5m: neither endpoint occupied -> plain success", none.ok == true, vim.inspect(none))
+
+  -- SOURCE only.
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 43, title = "x", state = "open" }, "beta")
+  local so = pr_mod.associate(repo, "beta", 42)
+  ok("5m: source-only reports a source conflict and NO target",
+    so.code == "conflict" and so.conflict.kind == "source"
+      and so.conflict.source and tostring(so.conflict.source.number) == "43"
+      and so.conflict.target == nil, vim.inspect(so.conflict))
+
+  -- TARGET only.
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 42, title = "x", state = "open" }, "alpha")
+  local to = pr_mod.associate(repo, "beta", 42)
+  ok("5m: target-only reports a target conflict and NO source",
+    to.code == "conflict" and to.conflict.kind == "target"
+      and to.conflict.target and to.conflict.target.branch == "alpha"
+      and to.conflict.source == nil, vim.inspect(to.conflict))
+
+  -- BOTH — the reported defect.
+  reset()
+  local both = pr_mod.associate(repo, "beta", 42)
+  ok("5m: *** both occupied is reported as BOTH, not as one of them ***",
+    both.code == "conflict" and both.conflict.kind == "both", vim.inspect(both.conflict))
+  ok("5m: *** the source half is #43 on beta, undiluted ***",
+    tostring(both.conflict.source.number) == "43"
+      and both.conflict.source.kb_doc:find("pr%-43%.md") ~= nil, vim.inspect(both.conflict.source))
+  ok("5m: *** the target half is #42 on alpha, undiluted ***",
+    tostring(both.conflict.target.number) == "42" and both.conflict.target.branch == "alpha"
+      and both.conflict.target.kb_doc:find("pr%-42%.md") ~= nil, vim.inspect(both.conflict.target))
+  ok("5m: the message names BOTH losses, so a single prompt can be honest",
+    both.error:find("#43", 1, true) ~= nil and both.error:find("alpha", 1, true) ~= nil
+      and both.error:find("#42", 1, true) ~= nil, both.error)
+
+  -- Binding ONE endpoint must no longer authorise displacing the other.
+  reset()
+  local half = pr_mod.associate(repo, "beta", 42, { reassign = true, expect = { source = 43 } })
+  ok("5m: *** confirming only the source refuses when a target is also occupied ***",
+    half.ok == false and half.code == "incumbent_drift", vim.inspect(half))
+  ok("5m: and nothing moved",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "alpha" }) or {}).number) == "42"
+      and tostring((pr_mod.find_for_worktree(repo, { branch = "beta" }) or {}).number) == "43")
+
+  reset()
+  local half2 = pr_mod.associate(repo, "beta", 42, { reassign = true, expect = { target = 42 } })
+  ok("5m: *** confirming only the target refuses when a source is also occupied ***",
+    half2.ok == false and half2.code == "incumbent_drift", vim.inspect(half2))
+
+  -- Binding BOTH succeeds, and reports BOTH displacements.
+  reset()
+  local full = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = 42 } })
+  ok("5m: *** confirming both endpoints succeeds ***", full.ok == true, vim.inspect(full))
+  ok("5m: and it reports both displacements",
+    tostring(full.reassigned_from) == "43" and full.took_from_branch == "alpha"
+      and tostring(full.took_from_pr) == "42", vim.inspect(full))
+  ok("5m: beta now holds #42 and alpha holds nothing",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "beta" }) or {}).number) == "42"
+      and pr_mod.find_for_worktree(repo, { branch = "alpha" }) == nil)
+
+  -- Independent drift witnesses: a conflict APPEARING under the prompt on
+  -- either endpoint must refuse, because "I saw none there" is a snapshot too.
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 43, title = "x", state = "open" }, "beta")
+  local app_s = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = false, target = false } })
+  ok("5m: *** a SOURCE conflict appearing after the prompt refuses ***",
+    app_s.ok == false and app_s.code == "incumbent_drift", vim.inspect(app_s))
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 42, title = "x", state = "open" }, "alpha")
+  local app_t = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = false, target = false } })
+  ok("5m: *** a TARGET conflict appearing after the prompt refuses ***",
+    app_t.ok == false and app_t.code == "incumbent_drift", vim.inspect(app_t))
 
   vim.fn.delete(dir, "rf")
   vim.env.AUTO_AGENTS_KB_ROOT = saved_kb

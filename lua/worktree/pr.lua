@@ -1237,7 +1237,7 @@ end
 ---@param repo table
 ---@param branch string
 ---@param pr_number integer|string
----@param opts table?  { reassign: boolean?, allow_stub: boolean?, expect_incumbent: integer|string? }
+---@param opts table?  { reassign: boolean?, allow_stub: boolean?, expect: { source: integer|false, target: integer|false }? }
 ---@return table result  { ok, pr?, kb_doc?, stub?, reason?, code?, error?, conflict? }
 function M.associate(repo, branch, pr_number, opts)
   opts = opts or {}
@@ -1316,33 +1316,51 @@ function M.associate(repo, branch, pr_number, opts)
       end
     end
 
-    local conflict = source_conflict or target_conflict
-    if conflict and not opts.reassign then
-      return { ok = false, code = "conflict",
-        conflict = {
-          number = conflict.number,
-          branch = target_conflict and target_conflict.branch or branch,
-          kb_doc = conflict.kb_doc,
-          kind = target_conflict and "target" or "source",
-        },
-        error = target_conflict
-          and string.format("PR #%s is already associated with '%s' (%s)",
-            tostring(target_conflict.number), tostring(target_conflict.branch), target_conflict.kb_doc)
-          or string.format("'%s' is already associated with PR #%s (%s)",
-            branch, tostring(source_conflict.number), source_conflict.kb_doc) }
+    -- BOTH endpoints are reported, each under its own key. Collapsing them
+    -- into one "the conflict" produced an internally MIXED envelope when both
+    -- were occupied: the number and document came from the source while the
+    -- branch and kind came from the target, so the panel announced
+    -- "PR #43 is currently on alpha" — a PR and a branch that had nothing to
+    -- do with each other (lector r1).
+    local function describe_conflict()
+      local c = { source = source_conflict, target = target_conflict }
+      c.kind = (source_conflict and target_conflict and "both")
+        or (target_conflict and "target") or "source"
+      local parts = {}
+      if source_conflict then
+        parts[#parts + 1] = string.format("'%s' is already associated with PR #%s (%s)",
+          branch, tostring(source_conflict.number), source_conflict.kb_doc)
+      end
+      if target_conflict then
+        parts[#parts + 1] = string.format("PR #%s is already associated with '%s' (%s)",
+          tostring(target_conflict.number), tostring(target_conflict.branch), target_conflict.kb_doc)
+      end
+      return c, table.concat(parts, "; and ")
     end
 
-    -- Expected-state binding. A panel confirmation is authority over the
-    -- incumbent the USER SAW; if another actor moved it while the prompt was
-    -- open, the confirmation does not cover the new one (lector r0 P1-3).
-    if opts.expect_incumbent ~= nil then
-      local actual = conflict and conflict.number or nil
-      if tostring(actual) ~= tostring(opts.expect_incumbent) then
-        return { ok = false, code = "incumbent_drift",
-          conflict = conflict,
+    if (source_conflict or target_conflict) and not opts.reassign then
+      local c, msg = describe_conflict()
+      return { ok = false, code = "conflict", conflict = c, error = msg }
+    end
+
+    -- Expected-state binding, on BOTH endpoints. A confirmation is authority
+    -- over what the user SAW, and with two occupied ends one bound number
+    -- authorised displacing the other silently: confirming "#43" also moved
+    -- #42 off alpha (lector r1). `opts.expect` snapshots both; a key absent
+    -- from the snapshot means "I saw none there", so a conflict appearing
+    -- under the prompt refuses too.
+    if opts.expect ~= nil then
+      local want_s = opts.expect.source or false
+      local want_t = opts.expect.target or false
+      local got_s = source_conflict and source_conflict.number or false
+      local got_t = target_conflict and target_conflict.number or false
+      local function shown(v) return v and ("#" .. tostring(v)) or "none" end
+      if tostring(want_s) ~= tostring(got_s) or tostring(want_t) ~= tostring(got_t) then
+        local c = select(1, describe_conflict())
+        return { ok = false, code = "incumbent_drift", conflict = c,
           error = string.format(
-            "the association changed while you were deciding: expected PR #%s, found %s",
-            tostring(opts.expect_incumbent), actual and ("#" .. tostring(actual)) or "none") }
+            "the association changed while you were deciding: expected branch-holder %s / PR-holder %s, found %s / %s",
+            shown(want_s), shown(want_t), shown(got_s), shown(got_t)) }
       end
     end
 
@@ -1374,8 +1392,11 @@ function M.associate(repo, branch, pr_number, opts)
 
     return { ok = true, pr = pr, kb_doc = kb_doc, branch = branch,
              stub = stub, reason = reason,
+             -- Both displacements, so a caller reporting the outcome cannot
+             -- mention one and hide the other.
              reassigned_from = source_conflict and source_conflict.number or nil,
-             took_from_branch = target_conflict and target_conflict.branch or nil }
+             took_from_branch = target_conflict and target_conflict.branch or nil,
+             took_from_pr = target_conflict and target_conflict.number or nil }
   end)
 
   if type(result) ~= "table" then
