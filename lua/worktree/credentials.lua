@@ -315,28 +315,66 @@ function M.describe(key, host)
   local hint = string.format(
     ":WorktreeAuth set %s command pass show <path/to/token>   (or: env GITHUB_TOKEN)", h)
 
+  local function report(t)
+    t.host, t.hint = host, hint
+    -- `configured` is the single boolean an older consumer reads. Defined as
+    -- "selected AND not KNOWN-unavailable", so such a consumer refuses on a
+    -- broken env profile and still allows an unprobed command provider —
+    -- correct behaviour from the coarse field, with the two facts also exposed
+    -- separately for callers that can use them.
+    t.configured = (t.selected == true) and (t.readiness ~= "unavailable")
+    return t
+  end
+
   if via == "env" then
+    -- The ambient GITHUB_TOKEN is a SELECTED source whenever the host
+    -- qualifies; whether the variable holds anything is a separate fact.
     local env_pat = os.getenv("GITHUB_TOKEN") or vim.env.GITHUB_TOKEN
-    if env_pat and env_pat ~= "" then
-      return { configured = true, key = "GITHUB_TOKEN", kind = "env",
-               source = "environment", var = "GITHUB_TOKEN", host = host, hint = hint }
-    end
-    -- The host qualifies for the ambient token but the variable is unset. That
-    -- is a DIFFERENT problem from "nothing configured", and saying so saves
-    -- the user registering a profile they did not need.
-    return { configured = false, host = host, hint = hint,
-             why = "$GITHUB_TOKEN is unset or empty (this host would accept it)" }
+    local ready = env_pat ~= nil and env_pat ~= ""
+    return report({
+      selected = true, key = "GITHUB_TOKEN", kind = "env",
+      source = "environment", var = "GITHUB_TOKEN",
+      readiness = ready and "ready" or "unavailable",
+      why = (not ready) and "$GITHUB_TOKEN is unset or empty (this host would accept it)" or nil,
+    })
   end
 
   if not prof then
-    return { configured = false, host = host, hint = hint,
-             why = string.format("no profile for '%s'%s", tostring(key),
-               host and (" or host '" .. host .. "'") or "") }
+    return report({
+      selected = false, readiness = "unavailable",
+      why = string.format("no profile for '%s'%s", tostring(key),
+        host and (" or host '" .. host .. "'") or ""),
+    })
   end
 
   local source = M._in_memory[matched] and "memory" or "disk"
-  return { configured = true, key = matched, kind = prof.kind, source = source,
-           var = prof.var, argv = prof.argv, host = host, hint = hint }
+  local base = { selected = true, key = matched, kind = prof.kind, source = source,
+                 var = prof.var, argv = prof.argv }
+
+  -- READINESS, modelled separately from selection (lector r0 P1-1). Reporting
+  -- "configured" for a selected-but-broken source is the exact state the
+  -- preflight exists to catch: an env profile naming an unset variable passed
+  -- every gate and then failed at the forge.
+  if prof.kind == "in_memory" then
+    base.readiness = "ready"
+  elseif prof.kind == "env" then
+    -- Side-effect free: reading an environment variable executes nothing.
+    local v = prof.var and (os.getenv(prof.var) or vim.env[prof.var]) or nil
+    if v and v ~= "" then
+      base.readiness = "ready"
+    else
+      base.readiness = "unavailable"
+      base.why = string.format("environment variable '%s' is unset or empty", tostring(prof.var))
+    end
+  else
+    -- A command provider's readiness CANNOT be known without running it, and
+    -- running it here would fire a GPG passphrase prompt on a keypress that
+    -- has asked for nothing. Unknown is the honest answer; the caller allows
+    -- it and lets the real action surface a failure.
+    base.readiness = "unknown"
+    base.why = "readiness not probed — a command provider is only run by the action itself"
+  end
+  return report(base)
 end
 
 ---_temp_suffix returns a hex suffix for an ephemeral credential-config name.

@@ -211,11 +211,17 @@ registered** — there is no ambient default. Register one with `:WorktreeAuth`:
 ```
 
 `status` answers the question `list` cannot: `list` shows every profile without
-saying which one — if any — *this* repo resolves through. It reports the chain's
-outcome for the cwd repo and its host, names the winning key and the profile's
-shape, and when nothing resolves it prints the exact `:WorktreeAuth set` line to
-run. It never executes a provider, so it cannot trigger a passphrase prompt, and
-it never prints a secret.
+saying which one — if any — *this* repo would use. It reports **two separate
+facts** for the cwd repo and its host:
+
+- **which source is selected** (the winning key and the profile's shape), and
+- **its readiness** — `ready`, `unavailable` (an env variable that is unset;
+  nothing selected at all), or `unknown`.
+
+`unknown` is the honest answer for a command provider: knowing would mean
+running it, and a status check must not fire a GPG passphrase prompt. It never
+executes a provider and never prints a secret; when nothing is usable it prints
+the exact `:WorktreeAuth set` line to run.
 
 The `<key>` is matched **slug → host → env**, in that order:
 

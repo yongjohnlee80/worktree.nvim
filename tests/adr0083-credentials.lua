@@ -301,6 +301,177 @@ do
   creds.clear_profile("leak__mem")
 end
 
+-- 7e. SELECTION vs READINESS (lector r0 P1-1).
+--
+-- describe() reported `configured=true` for every selected profile, without
+-- checking whether an explicit env profile's variable held anything. An
+-- independent probe confirmed the two APIs disagreeing on exactly the state
+-- the preflight exists to catch: describe said configured, resolve_token said
+-- "environment variable ... is unset or empty", and the panel gate let G/N/S
+-- through to fail at the forge.
+--
+-- The §7d agreement cell did not catch it because its seven cases contained
+-- no explicit-env profile at all — an agreement test is only as good as its
+-- case list, which is the lesson worth keeping here.
+do
+  local saved_env = vim.env.GITHUB_TOKEN
+  vim.env.GITHUB_TOKEN = nil
+
+  -- env, SET -> selected + ready
+  vim.env.WT_READY_VAR = "tok_ready"
+  creds.set_profile("env__ready", { kind = "env", var = "WT_READY_VAR" })
+  local dr = creds.describe("env__ready", "gitlab.example.com")
+  ok("7e: a set env profile is selected and READY",
+    dr.selected == true and dr.readiness == "ready", vim.inspect(dr))
+  ok("7e: and its coarse `configured` stays true for older consumers",
+    dr.configured == true)
+
+  -- env, UNSET -> selected but UNAVAILABLE (the reported defect)
+  vim.env.WT_BROKEN_VAR = nil
+  creds.set_profile("env__broken", { kind = "env", var = "WT_BROKEN_VAR" })
+  local db = creds.describe("env__broken", "gitlab.example.com")
+  ok("7e: *** an UNSET env profile is still SELECTED ***", db.selected == true, vim.inspect(db))
+  ok("7e: *** but its readiness is UNAVAILABLE, not ready ***",
+    db.readiness == "unavailable", vim.inspect(db))
+  ok("7e: it names the variable in the reason",
+    tostring(db.why):find("WT_BROKEN_VAR", 1, true) ~= nil, tostring(db.why))
+  ok("7e: *** and the coarse `configured` is FALSE, so an older gate refuses ***",
+    db.configured == false, vim.inspect(db))
+  ok("7e: (agreement) resolve_token also refuses it",
+    select(1, creds.resolve_token("env__broken", "gitlab.example.com")) == nil)
+
+  -- command -> selected, readiness UNKNOWN, and NOT executed
+  local marker = tmp_dir .. "/readiness-probe-ran"
+  local script = tmp_dir .. "/readiness-provider"
+  vim.fn.writefile({ "#!/bin/sh", "touch " .. marker, "echo tok" }, script)
+  vim.fn.system({ "chmod", "+x", script })
+  config.setup({ auth = { allowed_command_providers = { helper_script, script } } })
+  creds.set_profile("cmd__unknown", { kind = "command", argv = { script } })
+  vim.fn.delete(marker)
+  local dc = creds.describe("cmd__unknown", "gitlab.example.com")
+  ok("7e: *** a command provider is selected with readiness UNKNOWN ***",
+    dc.selected == true and dc.readiness == "unknown", vim.inspect(dc))
+  ok("7e: *** and describing it still does not RUN it ***",
+    vim.fn.filereadable(marker) == 0)
+  ok("7e: unknown is permissive in the coarse boolean (a working provider must not be blocked)",
+    dc.configured == true, vim.inspect(dc))
+
+  -- SELECTION IDENTITY: when both a slug and a host profile could answer, the
+  -- report must say WHICH won — `configured` alone cannot.
+  creds.set_profile("gitlab.example.com", { kind = "in_memory", token = "host_tok" })
+  creds.set_profile("both__slug", { kind = "in_memory", token = "slug_tok" })
+  local dboth = creds.describe("both__slug", "gitlab.example.com")
+  ok("7e: *** with both candidates usable, the report names the SLUG as the winner ***",
+    dboth.key == "both__slug" and dboth.readiness == "ready", vim.inspect(dboth))
+  ok("7e: (agreement) and resolve_token returns that same source's token",
+    creds.resolve_token("both__slug", "gitlab.example.com") == "slug_tok")
+  creds.clear_profile("both__slug")
+  local dhost = creds.describe("both__slug", "gitlab.example.com")
+  ok("7e: removing the slug profile moves the winner to the host",
+    dhost.key == "gitlab.example.com", vim.inspect(dhost))
+  creds.clear_profile("gitlab.example.com")
+
+  -- The ambient token is a SELECTED source too; its emptiness is readiness.
+  vim.env.GITHUB_TOKEN = nil
+  local damb = creds.describe("x__y", "github.com")
+  ok("7e: an unset ambient GITHUB_TOKEN is selected-but-unavailable, not unselected",
+    damb.selected == true and damb.readiness == "unavailable", vim.inspect(damb))
+  vim.env.GITHUB_TOKEN = "amb_tok"
+  local damb2 = creds.describe("x__y", "github.com")
+  ok("7e: (control) setting it makes the same source ready",
+    damb2.selected == true and damb2.readiness == "ready", vim.inspect(damb2))
+
+  -- readiness == "unavailable" must IMPLY resolve_token fails, across every
+  -- state above. This is the invariant the panel gate actually relies on.
+  local implication_holds, offender = true, nil
+  for _, c in ipairs({
+    { "env__ready", "gitlab.example.com" }, { "env__broken", "gitlab.example.com" },
+    { "cmd__unknown", "gitlab.example.com" }, { "x__y", "github.com" },
+    { "nobody__nothing", "gitlab.example.com" },
+  }) do
+    local d = creds.describe(c[1], c[2])
+    local tok = select(1, creds.resolve_token(c[1], c[2]))
+    if d.readiness == "unavailable" and tok ~= nil then
+      implication_holds, offender = false, c[1] .. "/" .. c[2]
+    end
+    if d.readiness == "ready" and tok == nil then
+      implication_holds, offender = false, "ready-but-nil: " .. c[1] .. "/" .. c[2]
+    end
+  end
+  ok("7e: *** unavailable implies resolve fails, and ready implies it succeeds ***",
+    implication_holds, tostring(offender))
+
+  creds.clear_profile("env__ready"); creds.clear_profile("env__broken")
+  creds.clear_profile("cmd__unknown")
+  vim.env.GITHUB_TOKEN = saved_env
+end
+
+-- 7f. :WorktreeAuth status reports readiness, and does not overstate it.
+--
+-- Testing describe() alone does not pin the command surface: the overstatement
+-- lector found was in the STATUS WORDING as much as in the report.
+do
+  local repos_mod = require("worktree.repos")
+  local saved_repos = repos_mod.repos
+  local saved_target = repos_mod.getpr_target_repo
+  -- The host is a variable: on github.com the ambient GITHUB_TOKEN is always a
+  -- SELECTED source (ready or not), so "nothing is selected" can only be shown
+  -- on a host that does not qualify for it.
+  local status_url = "git@gitlab.example.com:acme/status.git"
+  repos_mod.getpr_target_repo = function()
+    return { slug = "acme__status", url = status_url }
+  end
+  vim.g.loaded_worktree = nil
+  pcall(vim.cmd, "source " .. plugin_root .. "/plugin/worktree.lua")
+  ok("7f: :WorktreeAuth is registered", vim.fn.exists(":WorktreeAuth") == 2)
+
+  local said = {}
+  local saved_notify = vim.notify
+  vim.notify = function(m) said[#said + 1] = tostring(m) end
+  local function run() said = {}; pcall(vim.cmd, "WorktreeAuth status"); return table.concat(said, "\n") end
+
+  local saved_env = vim.env.GITHUB_TOKEN
+  vim.env.GITHUB_TOKEN = nil
+  local out_none = run()
+  ok("7f: with nothing selected it says NO credential and gives the line to run",
+    out_none:find("NO credential", 1, true) ~= nil
+      and out_none:find(":WorktreeAuth set", 1, true) ~= nil, out_none)
+
+  -- On a github host the ambient token is selected even when empty, so the
+  -- honest report is "selected but UNAVAILABLE" — not "no credential".
+  status_url = "git@github.com:acme/status.git"
+  local out_amb = run()
+  ok("7f: *** an empty ambient GITHUB_TOKEN reports selected-but-UNAVAILABLE ***",
+    out_amb:find("UNAVAILABLE", 1, true) ~= nil
+      and out_amb:find("GITHUB_TOKEN", 1, true) ~= nil, out_amb)
+  status_url = "git@gitlab.example.com:acme/status.git"
+
+  vim.env.WT_STATUS_BROKEN = nil
+  creds.set_profile("acme__status", { kind = "env", var = "WT_STATUS_BROKEN" })
+  local out_broken = run()
+  ok("7f: *** a broken env profile is reported UNAVAILABLE, never 'resolves through' ***",
+    out_broken:find("UNAVAILABLE", 1, true) ~= nil
+      and out_broken:find("resolves through", 1, true) == nil, out_broken)
+
+  vim.env.WT_STATUS_BROKEN = "now_set"
+  local out_ready = run()
+  ok("7f: (control) setting the variable flips it to 'resolves through'",
+    out_ready:find("resolves through", 1, true) ~= nil, out_ready)
+
+  creds.set_profile("acme__status", { kind = "command", argv = { helper_script } })
+  local out_cmd = run()
+  ok("7f: *** a command provider is reported as readiness UNKNOWN, not resolved ***",
+    out_cmd:find("readiness unknown", 1, true) ~= nil
+      and out_cmd:find("resolves through", 1, true) == nil, out_cmd)
+
+  vim.notify = saved_notify
+  vim.env.GITHUB_TOKEN = saved_env
+  vim.env.WT_STATUS_BROKEN = nil
+  creds.clear_profile("acme__status")
+  repos_mod.repos = saved_repos
+  repos_mod.getpr_target_repo = saved_target
+end
+
 -- 8. Clearing profiles
 creds.clear_profile("in-mem-slug")
 ok("cleared in-memory profile is gone", creds.get_profile("in-mem-slug") == nil)

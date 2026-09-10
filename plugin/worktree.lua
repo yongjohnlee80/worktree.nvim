@@ -73,17 +73,33 @@ vim.api.nvim_create_user_command("WorktreeAuth", function(opts)
     local pr_mod = require("worktree.pr")
     local remote = pr_mod.parse_remote(repo.url or "")
     local d = creds.describe(repo.slug, remote.host)
-    if d.configured then
-      local shape = d.kind == "env" and ("env " .. tostring(d.var))
-        or d.kind == "command" and ("command " .. table.concat(d.argv or {}, " "))
-        or d.kind
-      vim.notify(string.format(
-        "WorktreeAuth: %s (host %s) resolves through '%s' — %s (%s)",
-        repo.slug, remote.host, d.key, shape, d.source), vim.log.levels.INFO)
-    else
+    if not d.selected then
       vim.notify(string.format(
         "WorktreeAuth: %s (host %s) has NO credential — %s\n  %s",
         repo.slug, remote.host, tostring(d.why), d.hint), vim.log.levels.WARN)
+      return
+    end
+    local shape = d.kind == "env" and ("env " .. tostring(d.var))
+      or d.kind == "command" and ("command " .. table.concat(d.argv or {}, " "))
+      or d.kind
+    -- SELECTION and READINESS are reported separately. Saying a repo
+    -- "resolves through" a source we have not checked — or have checked and
+    -- found broken — is the overstatement that let an env profile with an
+    -- unset variable pass every gate (lector r0 P1-1).
+    if d.readiness == "ready" then
+      vim.notify(string.format(
+        "WorktreeAuth: %s (host %s) resolves through '%s' — %s (%s)",
+        repo.slug, remote.host, d.key, shape, d.source), vim.log.levels.INFO)
+    elseif d.readiness == "unavailable" then
+      vim.notify(string.format(
+        "WorktreeAuth: %s (host %s) selects '%s' — %s (%s), but it is UNAVAILABLE: %s\n  %s",
+        repo.slug, remote.host, d.key, shape, d.source, tostring(d.why), d.hint),
+        vim.log.levels.WARN)
+    else
+      vim.notify(string.format(
+        "WorktreeAuth: %s (host %s) selects '%s' — %s (%s); readiness unknown "
+        .. "(a command provider is only run by the action itself)",
+        repo.slug, remote.host, d.key, shape, d.source), vim.log.levels.INFO)
     end
   elseif sub == "clear" then
     local key = a[2]
