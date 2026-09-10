@@ -1181,8 +1181,24 @@ end
 ---@return string? detail
 local function _credential_state(repo, host)
   local d = credentials.describe(repo.slug, host)
-  if not d.configured then
+  if not d.selected then
     return "unconfigured", nil, d.why
+  end
+
+  -- A selected source that is KNOWN not to work is `unusable` — verification
+  -- was set up and failed, so a stub would paper over it.
+  --
+  -- ONE exception, and it is about what the USER did rather than about the
+  -- mechanism: the ambient $GITHUB_TOKEN is "selected" on any github host
+  -- whether or not it exists, and an unset one means nothing was configured
+  -- at all — which is precisely the offline case the stub policy serves.
+  -- `source == "environment"` is the ambient fallback; an explicit env
+  -- PROFILE reports "disk" or "memory" and does refuse.
+  if d.readiness == "unavailable" then
+    if d.source == "environment" then
+      return "unconfigured", nil, d.why
+    end
+    return "unusable", nil, d.why
   end
   -- A configured provider may THROW (a non-allowlisted executable). That must
   -- become an envelope, not an escaping error: `associate` documents a result.

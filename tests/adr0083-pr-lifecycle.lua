@@ -887,6 +887,21 @@ do
     vim.fn.filereadable(pr_mod.kb_doc_path(repo, 28)) == 0)
   creds.clear_profile(slug)
 
+  -- The ONE exception, and it is about what the user did: the ambient
+  -- $GITHUB_TOKEN is "selected" on any github host whether or not it exists.
+  -- An unset one means nothing was configured, which is the offline case the
+  -- stub serves — unlike an explicit env PROFILE naming an unset variable,
+  -- which is a setup that failed and refuses above.
+  do
+    local saved_gh = vim.env.GITHUB_TOKEN
+    vim.env.GITHUB_TOKEN = nil
+    local amb = pr_mod.associate(repo, "spare", 31)
+    ok("5k P1-1: *** an unset AMBIENT token is 'nothing configured', so it stubs ***",
+      amb.ok == true and amb.stub == true, vim.inspect(amb))
+    pr_mod.dissociate(repo, "spare")
+    vim.env.GITHUB_TOKEN = saved_gh
+  end
+
   -- A configured provider that THROWS (non-allowlisted) must become an
   -- envelope, not an escaping error: associate documents a result.
   creds._in_memory[slug] = { kind = "command", argv = { "definitely-not-allowlisted" } }
