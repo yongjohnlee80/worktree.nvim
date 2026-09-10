@@ -184,6 +184,8 @@ use {
 | `:WorktreeGraphRefresh`   | Refresh the graph view (drops `auto-core.git.graph` caches)|
 | `:WorktreeGetPR <n>`      | Fetch PR #n's branch into a worktree (acts on the repo at cwd)|
 | `:WorktreeCreatePR`       | Open a PR for the active branch, and associate it            |
+| `:WorktreeAssociatePR[!] <n>` | Bind the cwd branch to an existing PR #n (`!` re-points) |
+| `:WorktreeDissociatePR`   | Release the cwd branch from its PR                           |
 | `:WorktreePostPRFeedback <n>` | Post every review associated with PR #n to the forge     |
 | `:WorktreeRecoverPRLock[!] <n>` | Clear a stale posting lock for PR #n (`!` = force)      |
 | `:WorktreeAuth <sub>`     | Manage forge credentials (`list` / `status` / `set` / `clear`)|
@@ -261,8 +263,50 @@ is not associated when you open the diff, reviews written from it carry no PR
 and cannot be submitted with `S` — associate first (fetch or create the PR),
 then draft.
 
-To associate a branch by hand, or to repoint one, edit that document's
-`branch:` line; deleting the document dissociates the worktree.
+### Binding a branch that already has a PR
+
+When the PR was opened elsewhere — `gh pr create` outside nvim, a colleague's
+PR, or a branch you renamed — nothing has written that document yet:
+
+```vim
+:WorktreeAssociatePR 43     " bind the branch you are on to PR #43
+:WorktreeAssociatePR        " prompts for the number
+:WorktreeAssociatePR! 44    " re-point a branch that already claims a PR
+:WorktreeDissociatePR       " release it again
+```
+
+Both act on the branch checked out at the cwd, and on the repo that owns it —
+the same resolution `:WorktreeGetPR` uses, so a cwd inside a repo outside the
+workspace inventory is refused rather than silently applied elsewhere.
+
+What they guarantee:
+
+- **A branch git cannot resolve is refused.** An association to a typo'd
+  branch would write a document that matches nothing.
+- **One branch claims at most one PR.** A second claim is refused and names
+  the incumbent; `!` re-points, releasing the old document first.
+- **One PR claims at most one branch, too.** Associating a PR that another
+  branch already holds is refused and names that branch; `!` moves it, and an
+  offline move re-points the existing document *in place* so its recorded
+  title, base and description survive.
+- **The whole transition is serialized** under a per-repository association
+  lock, so two actors cannot both pass the uniqueness check and write.
+- **A stub is only for "nothing was configured to ask with."** With a usable
+  token the record is the forge's — title, state, base and `base_sha`, so a
+  range diff is immediately real. If a credential *is* configured but cannot be
+  used (unset variable, failing or non-allowlisted provider), or the forge
+  denies the PR, the write is **refused** and the existing document is left
+  untouched: attempted verification that failed must not be papered over with a
+  fictional record.
+- **A branch literally named `pr-<N>` cannot be dissociated**, because the name
+  *is* the association. `:WorktreeDissociatePR` says so and tells you to
+  rename, instead of reporting a success that changes nothing.
+
+An explicit document wins over the `pr-<N>` naming convention, so a branch
+called `pr-7` can be bound to #8 and reads as #8.
+
+You can also edit a document's `branch:` line by hand; deleting the document
+dissociates the worktree.
 
 ## Multi-repo graph view (`worktree.graph`)
 

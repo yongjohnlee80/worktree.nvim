@@ -91,19 +91,42 @@ local INVENTORY = {
       fs_open = 1,
       fs_unlink = 2,
       fs_write = 1,
+      -- +3 on 2026-09-10: NOT new I/O. `_read_disk_config` / `_write_disk_config`
+      -- have always called these through `pcall(vim.fn.X, …)`, which the scanner
+      -- could not see until it stopped requiring a trailing paren. Nothing in
+      -- this file changed; the pin caught up with it.
+      mkdir = 1,
+      readfile = 1,
+      writefile = 1,
     },
   },
   ["pr.lua"] = {
     scope = "permitted", phase = nil,
     why = "PR RECEIPT & LOCK STORE (ADR-0083 §2.6 Action 4): exclusive file locking with"
-      .. " live-owner immunity, fail-closed dead-owner recovery (ADR-0083 r1 MF1), and atomic receipt persistence.",
+      .. " live-owner immunity, fail-closed dead-owner recovery (ADR-0083 r1 MF1), and atomic receipt persistence."
+      .. " Also the KB PR DOCUMENT (ADR-0083 §2.5, r10.7): the association between a branch and a PR is a"
+      .. " markdown file, so read/write/mkdir of it are this module's own artifact, not a review document.",
     calls = {
       fs_close = 1,
       fs_open = 1,
       fs_rename = 1,
       fs_unlink = 5,
       fs_write = 1,
-      readfile = 1,
+      -- readfile 1 -> 7, writefile 0 -> 4, mkdir 0 -> 2 on 2026-09-10, and only
+      -- FOUR of those are new code. The pin said `readfile = 1` while the file
+      -- held one paren-form call and six `pcall(vim.fn.readfile, …)` ones the
+      -- scanner's trailing-paren requirement could not see — so the number was
+      -- fiction, not an undercount. Refactoring the single visible call into
+      -- `read_kb_doc` took the visible count to 0 and the guard read that as a
+      -- phase landing. The scanner now counts by-reference call sites for the
+      -- vim.fn.* family too (as it already did for uv.* and os.*), and these
+      -- are the real numbers, verified by hand against the stripped source.
+      --   readfile  : lock read x4, load_receipt, read_kb_doc*, set_kb_doc_branch*
+      --   writefile : lock write, receipt tmp, write_kb_doc*, set_kb_doc_branch*
+      --   mkdir     : receipts dir, write_kb_doc*        (* = KB PR document)
+      mkdir = 2,
+      readfile = 7,
+      writefile = 4,
       ["vim.fn.globpath"] = 1,
     },
   },
@@ -136,9 +159,18 @@ local function _scan_file(path)
   -- `vim.uv.fs_x(` also matches the `uv%.` pattern above (it ends in "uv."), so
   -- it is already counted; counting it again would double every such call.
   for _ in src:gmatch("io%.open%s*%(") do bump("io.open") end
-  for _ in src:gmatch("vim%.fn%.mkdir%s*%(") do bump("mkdir") end
-  for _ in src:gmatch("vim%.fn%.readfile%s*%(") do bump("readfile") end
-  for _ in src:gmatch("vim%.fn%.writefile%s*%(") do bump("writefile") end
+  -- NO trailing `(` on the vim.fn.* spellings either, for the third time and
+  -- the same reason as the libuv and os.* families below: `pcall(vim.fn.readfile,
+  -- path)` passes the function by REFERENCE and is every bit as much a call
+  -- site. Requiring the paren made the pin FICTION rather than merely
+  -- incomplete -- pr.lua was pinned `readfile = 1` while holding one
+  -- paren-form call and three by-reference ones, so refactoring the single
+  -- visible one away dropped the count to 0 and the guard reported a phase
+  -- landing that had not happened (2026-09-10). Counting by reference is what
+  -- the two families below already do; this closes the last spelling.
+  for _ in src:gmatch("vim%.fn%.mkdir") do bump("mkdir") end
+  for _ in src:gmatch("vim%.fn%.readfile") do bump("readfile") end
+  for _ in src:gmatch("vim%.fn%.writefile") do bump("writefile") end
   -- EVERY spelling production admits. The scanner missed `os.remove`, which
   -- session.lua has used all along, so the inventory and its arithmetic were
   -- false while the test was green (lector MF4). A blind spelling in a
@@ -272,13 +304,22 @@ for phase, n in pairs(by_phase) do print(("        %s owns %d"):format(phase, n)
 -- explanatory sentence said "five" for a while after the sixth was pinned
 -- (lector r3 SF1), so the number now appears in the failure detail too.
 ok("[3] the remaining work is enumerated, not estimated",
-  delegate_total == 0 and permitted_total == 25,
+  delegate_total == 0 and permitted_total == 40,
   ("delegate=%d permitted=%d — if a phase just landed, update this figure too")
     :format(delegate_total, permitted_total))
 -- AC1 IS MET, and by arithmetic: zero raw document-I/O calls remain in
--- worktree's production code. The twenty-five permitted ones are named and reasoned
+-- worktree's production code. The forty permitted ones are named and reasoned
 -- above. If this number ever rises, the phase that raised it has to say why
 -- here, in the same commit.
+--
+-- 25 -> 40 on 2026-09-10, and ELEVEN of the fifteen were always there. The
+-- scanner required a trailing `(` on the vim.fn.* spellings, so every
+-- `pcall(vim.fn.readfile, path)` — the form pr.lua and credentials.lua use
+-- throughout — was invisible; "25" was the count of the calls the scanner
+-- could see, not of the calls that exist. Dropping the paren (as this file
+-- already had for uv.* and os.*) makes the figure real. The four genuinely
+-- new ones are r10.7's KB-document read/write in `read_kb_doc` and
+-- `set_kb_doc_branch`, plus `write_kb_doc`'s pre-existing fallback pair.
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail > 0 and 1 or 0)

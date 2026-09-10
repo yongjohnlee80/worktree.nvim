@@ -693,6 +693,463 @@ do
   repos_mod.repos = saved_repos
 end
 
+-- 5j. associate / dissociate — binding an EXISTING branch to a PR (r10.7).
+--
+-- Until now an association could only be made as a side effect of GetPR or
+-- CreatePR, so a branch that already had a PR (opened with `gh` outside nvim,
+-- or renamed) could be bound only by hand-editing the KB document.
+--
+-- Every cell asserts through the CONSUMER (`find_for_worktree`) wherever the
+-- claim is "this is now associated" — the point of the verb is the badge, not
+-- the file.
+local function assoc_fixture(name)
+  -- A real repo, because associate REFUSES a branch git cannot resolve; a
+  -- fixture that skipped this would pass while asserting nothing about it.
+  local dir = vim.fn.tempname() .. "-" .. name
+  vim.fn.mkdir(dir, "p")
+  local function g(...) return vim.fn.system({ "git", "-C", dir,
+    "-c", "user.email=t@t", "-c", "user.name=t", ... }) end
+  vim.fn.system({ "git", "-C", dir, "init", "-q", "-b", "main" })
+  vim.fn.writefile({ "x" }, dir .. "/f.txt"); g("add", "."); g("commit", "-qm", "c1")
+  g("branch", "feat/widget-x"); g("branch", "pr-7"); g("branch", "spare")
+  return dir
+end
+
+do
+  local kb = vim.fn.tempname() .. "-kb-assoc"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+
+  local dir = assoc_fixture("assoc")
+  local slug = "acme__assoc"
+  local repo = { slug = slug, path = dir, url = "git@github.com:acme/assoc.git",
+                 remote = "git@github.com:acme/assoc.git" }
+
+  -- (1) No credential: an unverified STUB, flagged, and the badge appears.
+  local res = pr_mod.associate(repo, "feat/widget-x", 42)
+  ok("5j: *** associate with no token writes an unverified stub ***",
+    res.ok == true and res.stub == true, vim.inspect(res))
+  ok("5j: the stub says WHY it is unverified and how to fix it",
+    type(res.reason) == "string" and res.reason:find("WorktreeAuth", 1, true) ~= nil,
+    tostring(res.reason))
+  local found = pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" })
+  ok("5j: *** the branch is now PR #42 to find_for_worktree ***",
+    found ~= nil and tostring(found.number) == "42", vim.inspect(found))
+  ok("5j: an unrelated branch is still unassociated",
+    pr_mod.find_for_worktree(repo, { branch = "main" }) == nil)
+
+  -- (2) Refusals, by CODE not by message text.
+  local bad = pr_mod.associate(repo, "feat/widget-x", "not-a-number")
+  ok("5j: a non-numeric PR is refused with code bad_number",
+    bad.ok == false and bad.code == "bad_number", vim.inspect(bad))
+  local ghost = pr_mod.associate(repo, "no/such/branch", 43)
+  ok("5j: *** a branch git cannot resolve is refused (no_such_branch) ***",
+    ghost.ok == false and ghost.code == "no_such_branch", vim.inspect(ghost))
+  ok("5j: and refusing it wrote nothing",
+    pr_mod.find_for_worktree(repo, { branch = "no/such/branch" }) == nil)
+
+  -- (3) One branch, one PR. A second claim needs an explicit re-point.
+  local clash = pr_mod.associate(repo, "feat/widget-x", 99)
+  ok("5j: *** a second PR for the same branch is refused (conflict) ***",
+    clash.ok == false and clash.code == "conflict"
+      and tostring(clash.conflict and clash.conflict.source and clash.conflict.source.number) == "42",
+    vim.inspect(clash))
+  ok("5j: the refused re-point left #42 in place",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }).number) == "42")
+
+  local moved = pr_mod.associate(repo, "feat/widget-x", 99,
+    { reassign = true, expect = { source = 42 } })
+  ok("5j: reassign=true re-points the branch", moved.ok == true, vim.inspect(moved))
+  ok("5j: it reports which PR it was released from",
+    tostring(moved.reassigned_from) == "42", tostring(moved.reassigned_from))
+  ok("5j: *** the branch now resolves to #99, not #42 ***",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }).number) == "99")
+  -- Specificity: the OLD document must have released the branch, or two
+  -- documents claim it and the badge depends on glob order.
+  local still_42 = false
+  for _, d in ipairs(pr_mod.kb_docs(repo)) do
+    if tostring(d.fields.number) == "42" and d.fields.branch == "feat/widget-x" then still_42 = true end
+  end
+  ok("5j: *** the released document no longer claims the branch ***", still_42 == false)
+
+  -- (4) An explicit association beats the pr-<N> naming convention.
+  --
+  -- The fixture has to be ADVERSARIAL to test this at all. `globpath` returns
+  -- lexical order, so associating `pr-7` with #12 proves nothing: `pr-12.md`
+  -- sorts first and wins under first-match-wins too — the cell passes on sort
+  -- order, not on precedence (caught by falsification: reverting the rule left
+  -- it green). The discriminating shape needs the NAME-matching document
+  -- (`pr-7.md`) to be reached BEFORE the BRANCH-matching one, so: give #7 to a
+  -- different branch, then associate `pr-7` with #8. `pr-7.md` < `pr-8.md`.
+  local other7 = pr_mod.associate(repo, "main", 7)
+  ok("5j: (fixture) #7 belongs to another branch, so pr-7.md exists and sorts first",
+    other7.ok == true, vim.inspect(other7))
+  local named = pr_mod.associate(repo, "pr-7", 8)
+  ok("5j: a pr-<N>-named branch can be associated with a different PR", named.ok == true,
+    vim.inspect(named))
+  ok("5j: *** the document wins over the branch NAME (#8, not #7) ***",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "pr-7" }).number) == "8",
+    vim.inspect(pr_mod.find_for_worktree(repo, { branch = "pr-7" })))
+
+  -- (5) dissociate
+  local rel = pr_mod.dissociate(repo, "feat/widget-x")
+  ok("5j: dissociate releases the branch", rel.ok == true and tostring(rel.number) == "99",
+    vim.inspect(rel))
+  ok("5j: *** and find_for_worktree no longer sees a PR ***",
+    pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }) == nil)
+  ok("5j: dissociating an unassociated branch is refused, not a silent no-op",
+    (function() local r = pr_mod.dissociate(repo, "spare")
+       return r.ok == false and r.code == "not_associated" end)())
+
+  -- A pr-<N>-named branch falls BACK to its name once its document releases.
+  -- Reporting plain success there would be a lie: the badge stays.
+  local rel7 = pr_mod.dissociate(repo, "pr-7")
+  ok("5j: releasing a pr-<N> branch's document succeeds", rel7.ok == true, vim.inspect(rel7))
+  ok("5j: *** but it says the NAME still associates it ***",
+    rel7.still_named_pr == 7, vim.inspect(rel7))
+  ok("5j: and the badge really does come back as #7 (the warning is true)",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "pr-7" }).number) == "7")
+  local named_only = pr_mod.dissociate(repo, "pr-7")
+  ok("5j: dissociating a name-only association is refused with a rename instruction",
+    named_only.ok == false and named_only.code == "branch_name_association"
+      and tostring(named_only.error):find("rename", 1, true) ~= nil, vim.inspect(named_only))
+
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
+do
+  -- (6) WITH a credential: the full forge record, and a forge refusal is not
+  -- papered over with a stub.
+  local kb = vim.fn.tempname() .. "-kb-assoc2"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local dir = assoc_fixture("assoc2")
+  local slug = "acme__assoc2"
+  local repo = { slug = slug, path = dir, url = "git@github.com:acme/assoc2.git",
+                 remote = "git@github.com:acme/assoc2.git" }
+  creds.set_profile(slug, { kind = "in_memory", token = "tok" })
+
+  pr_mod._mock_http = function(method, url)
+    if method == "GET" and url:find("/pulls/55$") then
+      return 200, vim.json.encode({ number = 55, title = "Real One", body = "b",
+        state = "open", draft = false,
+        base = { ref = "develop", sha = "aaaa000000000000000000000000000000000000" },
+        head = { ref = "feat/widget-x", sha = "bbbb" }, user = { login = "johno" } })
+    end
+    return 404, '{"message":"Not Found"}'
+  end
+
+  local full = pr_mod.associate(repo, "feat/widget-x", 55)
+  ok("5j: *** with a token the record is the forge's, not a stub ***",
+    full.ok == true and full.stub ~= true, vim.inspect(full))
+  local f = pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" })
+  ok("5j: the association carries the forge title", f and f.title == "Real One", vim.inspect(f))
+  ok("5j: and the authoritative base + base_sha, so a range diff is real",
+    f and f.base == "develop" and f.base_sha == "aaaa000000000000000000000000000000000000",
+    vim.inspect(f))
+
+  local gone = pr_mod.associate(repo, "pr-7", 404)
+  ok("5j: *** a PR the forge denies is REFUSED, never stubbed ***",
+    gone.ok == false and gone.code == "forge_refused", vim.inspect(gone))
+  ok("5j: and nothing was written for it",
+    pr_mod.find_for_worktree(repo, { branch = "pr-7" }) ~= nil
+      and tostring(pr_mod.find_for_worktree(repo, { branch = "pr-7" }).number) == "7",
+    "pr-7 should still resolve by NAME only")
+
+  pr_mod._mock_http = nil
+  creds.clear_profile(slug)
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
+-- 5k. Lector r0 milestone-1 findings, folded (P1-1 / P1-2 / P1-3).
+--
+-- All three were independently reproduced against the pre-fix branch before
+-- being accepted; each cell here is the reproduction turned into a guard.
+do
+  local kb = vim.fn.tempname() .. "-kb-r0"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local dir = assoc_fixture("r0")
+  local slug = "acme__r0"
+  local repo = { slug = slug, path = dir, url = "git@github.com:acme/r0.git",
+                 remote = "git@github.com:acme/r0.git" }
+
+  -- P1-1. A nil token is FOUR states, and only "no profile at all" may stub.
+  -- Configured-but-unusable means verification was set up and failed.
+  vim.env.WT_R0_UNSET = nil
+  creds.set_profile(slug, { kind = "env", var = "WT_R0_UNSET" })
+  local unusable = pr_mod.associate(repo, "feat/widget-x", 28)
+  ok("5k P1-1: *** a configured env var that is UNSET refuses, never stubs ***",
+    unusable.ok == false and unusable.code == "credential_unusable", vim.inspect(unusable))
+  ok("5k P1-1: and it wrote no document",
+    vim.fn.filereadable(pr_mod.kb_doc_path(repo, 28)) == 0)
+  creds.clear_profile(slug)
+
+  -- The ONE exception, and it is about what the user did: the ambient
+  -- $GITHUB_TOKEN is "selected" on any github host whether or not it exists.
+  -- An unset one means nothing was configured, which is the offline case the
+  -- stub serves — unlike an explicit env PROFILE naming an unset variable,
+  -- which is a setup that failed and refuses above.
+  do
+    local saved_gh = vim.env.GITHUB_TOKEN
+    vim.env.GITHUB_TOKEN = nil
+    local amb = pr_mod.associate(repo, "spare", 31)
+    ok("5k P1-1: *** an unset AMBIENT token is 'nothing configured', so it stubs ***",
+      amb.ok == true and amb.stub == true, vim.inspect(amb))
+    pr_mod.dissociate(repo, "spare")
+    vim.env.GITHUB_TOKEN = saved_gh
+  end
+
+  -- A configured provider that THROWS (non-allowlisted) must become an
+  -- envelope, not an escaping error: associate documents a result.
+  creds._in_memory[slug] = { kind = "command", argv = { "definitely-not-allowlisted" } }
+  local threw = pr_mod.associate(repo, "feat/widget-x", 29)
+  ok("5k P1-1: *** a throwing provider returns an envelope, not a raised error ***",
+    type(threw) == "table" and threw.ok == false and threw.code == "credential_error",
+    vim.inspect(threw))
+  creds._in_memory[slug] = nil
+
+  -- And with NO profile at all the stub policy still stands.
+  local stubbed = pr_mod.associate(repo, "feat/widget-x", 30)
+  ok("5k P1-1: with no credential configured at all, the stub policy stands",
+    stubbed.ok == true and stubbed.stub == true, vim.inspect(stubbed))
+  pr_mod.dissociate(repo, "feat/widget-x")
+
+  -- P1-2. Both endpoints. A PR document already naming ANOTHER branch must not
+  -- be silently stolen, and its cached metadata must survive.
+  pr_mod.write_kb_doc(repo, {
+    number = 42, title = "Existing full record", body = "preserve me",
+    state = "open", draft = false, base_ref = "develop",
+    base_sha = "abc1230000000000000000000000000000000000", author = "someone",
+  }, "main")
+  local steal = pr_mod.associate(repo, "feat/widget-x", 42)
+  ok("5k P1-2: *** associating a PR owned by another branch is REFUSED ***",
+    steal.ok == false and steal.code == "conflict", vim.inspect(steal))
+  ok("5k P1-2: the conflict names the incumbent BRANCH, not just the number",
+    steal.conflict and steal.conflict.target and steal.conflict.target.branch == "main"
+      and steal.conflict.kind == "target", vim.inspect(steal.conflict))
+  ok("5k P1-2: *** the refusal left main's association intact ***",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "main" }) or {}).number) == "42")
+  local kept = pr_mod.read_kb_doc(pr_mod.kb_doc_path(repo, 42))
+  ok("5k P1-2: *** and its title / base / base_sha were not overwritten ***",
+    kept.title == "Existing full record" and kept.base == "develop"
+      and kept.base_sha == "abc1230000000000000000000000000000000000", vim.inspect(kept))
+
+  -- With explicit reassignment it moves — and STILL preserves the metadata,
+  -- because re-rendering an existing document from a stub destroys it.
+  local moved = pr_mod.associate(repo, "feat/widget-x", 42,
+    { reassign = true, expect = { target = { number = 42, branch = "main" } } })
+  ok("5k P1-2: explicit reassign moves the PR to the new branch", moved.ok == true,
+    vim.inspect(moved))
+  ok("5k P1-2: and reports which branch it was taken from",
+    moved.took_from_branch == "main", tostring(moved.took_from_branch))
+  local after = pr_mod.read_kb_doc(pr_mod.kb_doc_path(repo, 42))
+  ok("5k P1-2: *** an offline re-point preserves the recorded metadata ***",
+    after.title == "Existing full record" and after.base == "develop"
+      and after.base_sha == "abc1230000000000000000000000000000000000", vim.inspect(after))
+  ok("5k P1-2: the branch really moved",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }) or {}).number) == "42"
+      and pr_mod.find_for_worktree(repo, { branch = "main" }) == nil)
+
+  -- P1-3. The transition is serialized. A competing association injected into
+  -- the final check-to-write window must not produce two claims.
+  local real_write = pr_mod.write_kb_doc
+  local reentered, inner_res = false, nil
+  pr_mod.write_kb_doc = function(r, p, br)
+    if not reentered then
+      reentered = true
+      inner_res = pr_mod.associate(r, br, 43)
+    end
+    return real_write(r, p, br)
+  end
+  pr_mod.dissociate(repo, "feat/widget-x")
+  local outer = pr_mod.associate(repo, "spare", 44)
+  pr_mod.write_kb_doc = real_write
+  ok("5k P1-3: (control) the injection actually ran", reentered == true)
+  ok("5k P1-3: *** the competing association inside the write window is refused ***",
+    inner_res and inner_res.ok == false, vim.inspect(inner_res))
+  local claims = {}
+  for _, d in ipairs(pr_mod.kb_docs(repo)) do
+    if d.fields.branch == "spare" then claims[#claims + 1] = tostring(d.fields.number) end
+  end
+  ok("5k P1-3: *** exactly ONE PR claims the branch afterwards ***",
+    #claims == 1, "{" .. table.concat(claims, ", ") .. "}")
+  ok("5k P1-3: and the outer transition still succeeded (uncontended semantics kept)",
+    outer.ok == true, vim.inspect(outer))
+
+  -- Expected-state binding: a confirmation is authority over the incumbent the
+  -- USER SAW, not over whatever is current when they answer.
+  local drift = pr_mod.associate(repo, "spare", 45,
+    { reassign = true, expect = { source = 99 } })
+  ok("5k P1-3: *** a re-point refuses when the incumbent drifted under it ***",
+    drift.ok == false and drift.code == "incumbent_drift", vim.inspect(drift))
+  ok("5k P1-3: the drift refusal names what was expected and what was found",
+    tostring(drift.error):find("expected branch-holder #99", 1, true) ~= nil, tostring(drift.error))
+  local agreed = pr_mod.associate(repo, "spare", 45,
+    { reassign = true, expect = { source = 44 } })
+  ok("5k P1-3: (control) the same call with the CORRECT incumbent succeeds",
+    agreed.ok == true, vim.inspect(agreed))
+
+  local d_drift = pr_mod.dissociate(repo, "spare", { expect_pr = 44 })
+  ok("5k P1-3: *** dissociate refuses when the displayed PR is no longer the one held ***",
+    d_drift.ok == false and d_drift.code == "incumbent_drift", vim.inspect(d_drift))
+  local d_ok = pr_mod.dissociate(repo, "spare", { expect_pr = 45 })
+  ok("5k P1-3: (control) dissociate with the correct expectation succeeds",
+    d_ok.ok == true, vim.inspect(d_ok))
+
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
+-- 5m. Lector r1 — SIMULTANEOUS source and target occupancy.
+--
+-- Reproduced before folding, on lector's exact shape (#43 -> beta,
+-- #42 -> alpha, request beta -> #42): the envelope was internally MIXED —
+-- number and document from the source (#43, pr-43.md), branch and kind from
+-- the target (alpha) — so the panel announced "PR #43 is currently on alpha",
+-- a PR and a branch with nothing to do with each other. Confirming that one
+-- displayed number then displaced BOTH endpoints.
+--
+-- The four occupancy cases are driven explicitly, because "a conflict" was
+-- exactly the collapsing that produced the defect.
+do
+  local kb = vim.fn.tempname() .. "-kb-r1"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local dir = assoc_fixture("r1")
+  vim.fn.system({ "git", "-C", dir, "branch", "alpha" })
+  vim.fn.system({ "git", "-C", dir, "branch", "beta" })
+  local repo = { slug = "acme__r1", path = dir, url = "git@github.com:acme/r1.git",
+                 remote = "git@github.com:acme/r1.git" }
+  local function reset()
+    vim.fn.delete(kb, "rf")
+    pr_mod.write_kb_doc(repo, { number = 43, title = "fortythree", state = "open" }, "beta")
+    pr_mod.write_kb_doc(repo, { number = 42, title = "fortytwo", state = "open" }, "alpha")
+  end
+
+  -- NEITHER: an unoccupied pair still associates.
+  vim.fn.delete(kb, "rf")
+  local none = pr_mod.associate(repo, "beta", 50)
+  ok("5m: neither endpoint occupied -> plain success", none.ok == true, vim.inspect(none))
+
+  -- SOURCE only.
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 43, title = "x", state = "open" }, "beta")
+  local so = pr_mod.associate(repo, "beta", 42)
+  ok("5m: source-only reports a source conflict and NO target",
+    so.code == "conflict" and so.conflict.kind == "source"
+      and so.conflict.source and tostring(so.conflict.source.number) == "43"
+      and so.conflict.target == nil, vim.inspect(so.conflict))
+
+  -- TARGET only.
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 42, title = "x", state = "open" }, "alpha")
+  local to = pr_mod.associate(repo, "beta", 42)
+  ok("5m: target-only reports a target conflict and NO source",
+    to.code == "conflict" and to.conflict.kind == "target"
+      and to.conflict.target and to.conflict.target.branch == "alpha"
+      and to.conflict.source == nil, vim.inspect(to.conflict))
+
+  -- BOTH — the reported defect.
+  reset()
+  local both = pr_mod.associate(repo, "beta", 42)
+  ok("5m: *** both occupied is reported as BOTH, not as one of them ***",
+    both.code == "conflict" and both.conflict.kind == "both", vim.inspect(both.conflict))
+  ok("5m: *** the source half is #43 on beta, undiluted ***",
+    tostring(both.conflict.source.number) == "43"
+      and both.conflict.source.kb_doc:find("pr%-43%.md") ~= nil, vim.inspect(both.conflict.source))
+  ok("5m: *** the target half is #42 on alpha, undiluted ***",
+    tostring(both.conflict.target.number) == "42" and both.conflict.target.branch == "alpha"
+      and both.conflict.target.kb_doc:find("pr%-42%.md") ~= nil, vim.inspect(both.conflict.target))
+  ok("5m: the message names BOTH losses, so a single prompt can be honest",
+    both.error:find("#43", 1, true) ~= nil and both.error:find("alpha", 1, true) ~= nil
+      and both.error:find("#42", 1, true) ~= nil, both.error)
+
+  -- Binding ONE endpoint must no longer authorise displacing the other.
+  reset()
+  local half = pr_mod.associate(repo, "beta", 42, { reassign = true, expect = { source = 43 } })
+  ok("5m: *** confirming only the source refuses when a target is also occupied ***",
+    half.ok == false and half.code == "incumbent_drift", vim.inspect(half))
+  ok("5m: and nothing moved",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "alpha" }) or {}).number) == "42"
+      and tostring((pr_mod.find_for_worktree(repo, { branch = "beta" }) or {}).number) == "43")
+
+  reset()
+  local half2 = pr_mod.associate(repo, "beta", 42, { reassign = true, expect = { target = { number = 42, branch = "main" } } })
+  ok("5m: *** confirming only the target refuses when a source is also occupied ***",
+    half2.ok == false and half2.code == "incumbent_drift", vim.inspect(half2))
+
+  -- Binding BOTH succeeds, and reports BOTH displacements.
+  reset()
+  local full = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = { number = 42, branch = "alpha" } } })
+  ok("5m: *** confirming both endpoints succeeds ***", full.ok == true, vim.inspect(full))
+  ok("5m: and it reports both displacements",
+    tostring(full.reassigned_from) == "43" and full.took_from_branch == "alpha"
+      and tostring(full.took_from_pr) == "42", vim.inspect(full))
+  ok("5m: beta now holds #42 and alpha holds nothing",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "beta" }) or {}).number) == "42"
+      and pr_mod.find_for_worktree(repo, { branch = "alpha" }) == nil)
+
+  -- Independent drift witnesses: a conflict APPEARING under the prompt on
+  -- either endpoint must refuse, because "I saw none there" is a snapshot too.
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 43, title = "x", state = "open" }, "beta")
+  local app_s = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = false, target = false } })
+  ok("5m: *** a SOURCE conflict appearing after the prompt refuses ***",
+    app_s.ok == false and app_s.code == "incumbent_drift", vim.inspect(app_s))
+  vim.fn.delete(kb, "rf")
+  pr_mod.write_kb_doc(repo, { number = 42, title = "x", state = "open" }, "alpha")
+  local app_t = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = false, target = false } })
+  ok("5m: *** a TARGET conflict appearing after the prompt refuses ***",
+    app_t.ok == false and app_t.code == "incumbent_drift", vim.inspect(app_t))
+
+  -- lector r2: the TARGET's number is the PR the user ASKED for, so it is
+  -- constant by construction and pins nothing. What can move is which branch
+  -- holds it. Binding only the number let another actor move #42 alpha ->
+  -- gamma mid-prompt and have the confirmation displace gamma unseen.
+  vim.fn.system({ "git", "-C", dir, "branch", "gamma" })
+  reset()
+  local seen = pr_mod.associate(repo, "beta", 42)
+  ok("5m r2: (setup) the prompt shows #42 on alpha",
+    seen.conflict.target.branch == "alpha", vim.inspect(seen.conflict.target))
+  -- Another actor moves it while the prompt is open.
+  pr_mod.set_kb_doc_branch(pr_mod.kb_doc_path(repo, 42), "gamma")
+  local moved_under = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = { number = 42, branch = "alpha" } } })
+  ok("5m r2: *** the PR moving to another branch mid-prompt REFUSES ***",
+    moved_under.ok == false and moved_under.code == "incumbent_drift", vim.inspect(moved_under))
+  ok("5m r2: the refusal names the branch expected and the branch found",
+    tostring(moved_under.error):find("on alpha", 1, true) ~= nil
+      and tostring(moved_under.error):find("on gamma", 1, true) ~= nil, tostring(moved_under.error))
+  ok("5m r2: *** and gamma was not displaced ***",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "gamma" }) or {}).number) == "42")
+  -- Control: confirming what is actually there succeeds.
+  local agreed_g = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = { number = 42, branch = "gamma" } } })
+  ok("5m r2: (control) confirming the CURRENT branch succeeds", agreed_g.ok == true,
+    vim.inspect(agreed_g))
+
+  -- A bare number is the old, weaker snapshot: fail CLOSED rather than accept
+  -- a binding that cannot detect this drift.
+  reset()
+  local bare = pr_mod.associate(repo, "beta", 42,
+    { reassign = true, expect = { source = 43, target = 42 } })
+  ok("5m r2: *** a bare-number target expectation is refused, not accepted ***",
+    bare.ok == false and bare.code == "incomplete_expectation", vim.inspect(bare))
+
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",
