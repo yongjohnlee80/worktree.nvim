@@ -2,6 +2,71 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.17] — 2026-09-11 — bind a branch that already has a PR, and report a credential honestly
+
+Patch. ADR-0083 Amendment r10.7 — the two increments deferred from r10. Pairs
+with auto-finder.nvim **v0.4.29**, which adds the panel keys and the preflight.
+Reviewed by lector across four rounds; twelve findings, all folded.
+
+**`associate` / `dissociate` (#28).** An association could only be made as a
+*side effect* of GetPR or CreatePR, so a branch that already had a PR — opened
+with `gh` outside nvim, a colleague's, or one you renamed — could be bound only
+by hand-editing the KB document. That is not cosmetic: a review inherits its
+`pr` at **draft** time, so an unassociable worktree yields reviews `S` can
+never submit.
+
+`pr.associate(repo, branch, n, opts)` and `pr.dissociate(repo, branch, opts)`,
+plus `:WorktreeAssociatePR[!] <n>` and `:WorktreeDissociatePR`, both acting on
+the cwd branch and the repo that owns it. What they guarantee:
+
+- A branch git cannot resolve is refused — otherwise the document matches
+  nothing and reports success.
+- **Both ends of the relation are checked.** A branch may hold one PR *and* a
+  PR may sit on one branch; either occupancy requires explicit reassignment,
+  and the conflict names the incumbent branch and which end collided.
+- **A stub is only for "nothing was configured to ask with."** With a usable
+  token the record is the forge's. If a credential *is* configured but cannot
+  be used, or the forge denies the PR, the write is refused and the existing
+  document is left untouched — attempted verification that failed must not be
+  papered over with a fictional record. An offline re-point moves only the
+  `branch:` line, so a recorded title, base and `base_sha` survive.
+- **The whole transition is serialized** under a per-repository association
+  lock; forge verification stays outside it, so network latency does not hold
+  the lock.
+- **Confirmations authorize the state the user saw.** `opts.expect` snapshots
+  both ends — the source by PR number, the target by `{number, branch}`,
+  because the target's number is the PR you asked for and cannot differ. A
+  bare-number target snapshot is refused rather than accepted.
+- A branch literally named `pr-<N>` cannot be dissociated: the name *is* the
+  association, so it says so and names the remedy.
+
+Also: an explicit `branch:` document now beats the `pr-<N>` naming convention
+in `find_for_worktree`. It was first-match-wins over `globpath`, so which badge
+appeared depended on filesystem iteration order.
+
+**`credentials.describe` (#29).** ADR-0083 §2.6 Action 1 step 1 ("ensure a
+credential profile is configured") was specified and never built. `describe`
+reports **selection** (which key wins, and its shape) and **readiness**
+(`ready` / `unavailable` / `unknown`) as two separate facts:
+
+- `in_memory` is ready; an `env` profile is resolved by a side-effect-free
+  variable lookup; a **command** provider is honestly `unknown`, because
+  knowing would mean running it and a status check must not fire a GPG
+  passphrase prompt;
+- the ambient `$GITHUB_TOKEN` is a *selected* source whenever the host
+  qualifies — whether it holds anything is readiness, not selection.
+
+`:WorktreeAuth status` reports all three states for the repo at cwd, in its own
+words: "resolves through" only for ready, "selects X … but it is UNAVAILABLE"
+for a known-bad source, "readiness unknown" for a command provider.
+
+Profile selection is now shared between `describe` and `resolve_token`, so the
+two cannot disagree about which credential applies.
+
+PRs #28 and #29. Tests: `adr0083-pr-lifecycle` 96 → 167, `adr0083-credentials`
+62 → 98; `run-all.sh` OK on merged `main`. Every fix carries a falsification —
+one revert per claim, including reproductions of each reviewer probe.
+
 ## [v0.5.16] — 2026-09-10 — CreatePR reported failure for PRs it created, and associated them with nothing
 
 Patch. Three defects on the PR path, all on the surface auto-finder's repos
