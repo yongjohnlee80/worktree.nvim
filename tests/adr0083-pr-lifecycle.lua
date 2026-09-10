@@ -863,6 +863,131 @@ do
   vim.fn.delete(kb, "rf")
 end
 
+-- 5k. Lector r0 milestone-1 findings, folded (P1-1 / P1-2 / P1-3).
+--
+-- All three were independently reproduced against the pre-fix branch before
+-- being accepted; each cell here is the reproduction turned into a guard.
+do
+  local kb = vim.fn.tempname() .. "-kb-r0"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local dir = assoc_fixture("r0")
+  local slug = "acme__r0"
+  local repo = { slug = slug, path = dir, url = "git@github.com:acme/r0.git",
+                 remote = "git@github.com:acme/r0.git" }
+
+  -- P1-1. A nil token is FOUR states, and only "no profile at all" may stub.
+  -- Configured-but-unusable means verification was set up and failed.
+  vim.env.WT_R0_UNSET = nil
+  creds.set_profile(slug, { kind = "env", var = "WT_R0_UNSET" })
+  local unusable = pr_mod.associate(repo, "feat/widget-x", 28)
+  ok("5k P1-1: *** a configured env var that is UNSET refuses, never stubs ***",
+    unusable.ok == false and unusable.code == "credential_unusable", vim.inspect(unusable))
+  ok("5k P1-1: and it wrote no document",
+    vim.fn.filereadable(pr_mod.kb_doc_path(repo, 28)) == 0)
+  creds.clear_profile(slug)
+
+  -- A configured provider that THROWS (non-allowlisted) must become an
+  -- envelope, not an escaping error: associate documents a result.
+  creds._in_memory[slug] = { kind = "command", argv = { "definitely-not-allowlisted" } }
+  local threw = pr_mod.associate(repo, "feat/widget-x", 29)
+  ok("5k P1-1: *** a throwing provider returns an envelope, not a raised error ***",
+    type(threw) == "table" and threw.ok == false and threw.code == "credential_error",
+    vim.inspect(threw))
+  creds._in_memory[slug] = nil
+
+  -- And with NO profile at all the stub policy still stands.
+  local stubbed = pr_mod.associate(repo, "feat/widget-x", 30)
+  ok("5k P1-1: with no credential configured at all, the stub policy stands",
+    stubbed.ok == true and stubbed.stub == true, vim.inspect(stubbed))
+  pr_mod.dissociate(repo, "feat/widget-x")
+
+  -- P1-2. Both endpoints. A PR document already naming ANOTHER branch must not
+  -- be silently stolen, and its cached metadata must survive.
+  pr_mod.write_kb_doc(repo, {
+    number = 42, title = "Existing full record", body = "preserve me",
+    state = "open", draft = false, base_ref = "develop",
+    base_sha = "abc1230000000000000000000000000000000000", author = "someone",
+  }, "main")
+  local steal = pr_mod.associate(repo, "feat/widget-x", 42)
+  ok("5k P1-2: *** associating a PR owned by another branch is REFUSED ***",
+    steal.ok == false and steal.code == "conflict", vim.inspect(steal))
+  ok("5k P1-2: the conflict names the incumbent BRANCH, not just the number",
+    steal.conflict and steal.conflict.branch == "main" and steal.conflict.kind == "target",
+    vim.inspect(steal.conflict))
+  ok("5k P1-2: *** the refusal left main's association intact ***",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "main" }) or {}).number) == "42")
+  local kept = pr_mod.read_kb_doc(pr_mod.kb_doc_path(repo, 42))
+  ok("5k P1-2: *** and its title / base / base_sha were not overwritten ***",
+    kept.title == "Existing full record" and kept.base == "develop"
+      and kept.base_sha == "abc1230000000000000000000000000000000000", vim.inspect(kept))
+
+  -- With explicit reassignment it moves — and STILL preserves the metadata,
+  -- because re-rendering an existing document from a stub destroys it.
+  local moved = pr_mod.associate(repo, "feat/widget-x", 42, { reassign = true })
+  ok("5k P1-2: explicit reassign moves the PR to the new branch", moved.ok == true,
+    vim.inspect(moved))
+  ok("5k P1-2: and reports which branch it was taken from",
+    moved.took_from_branch == "main", tostring(moved.took_from_branch))
+  local after = pr_mod.read_kb_doc(pr_mod.kb_doc_path(repo, 42))
+  ok("5k P1-2: *** an offline re-point preserves the recorded metadata ***",
+    after.title == "Existing full record" and after.base == "develop"
+      and after.base_sha == "abc1230000000000000000000000000000000000", vim.inspect(after))
+  ok("5k P1-2: the branch really moved",
+    tostring((pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }) or {}).number) == "42"
+      and pr_mod.find_for_worktree(repo, { branch = "main" }) == nil)
+
+  -- P1-3. The transition is serialized. A competing association injected into
+  -- the final check-to-write window must not produce two claims.
+  local real_write = pr_mod.write_kb_doc
+  local reentered, inner_res = false, nil
+  pr_mod.write_kb_doc = function(r, p, br)
+    if not reentered then
+      reentered = true
+      inner_res = pr_mod.associate(r, br, 43)
+    end
+    return real_write(r, p, br)
+  end
+  pr_mod.dissociate(repo, "feat/widget-x")
+  local outer = pr_mod.associate(repo, "spare", 44)
+  pr_mod.write_kb_doc = real_write
+  ok("5k P1-3: (control) the injection actually ran", reentered == true)
+  ok("5k P1-3: *** the competing association inside the write window is refused ***",
+    inner_res and inner_res.ok == false, vim.inspect(inner_res))
+  local claims = {}
+  for _, d in ipairs(pr_mod.kb_docs(repo)) do
+    if d.fields.branch == "spare" then claims[#claims + 1] = tostring(d.fields.number) end
+  end
+  ok("5k P1-3: *** exactly ONE PR claims the branch afterwards ***",
+    #claims == 1, "{" .. table.concat(claims, ", ") .. "}")
+  ok("5k P1-3: and the outer transition still succeeded (uncontended semantics kept)",
+    outer.ok == true, vim.inspect(outer))
+
+  -- Expected-state binding: a confirmation is authority over the incumbent the
+  -- USER SAW, not over whatever is current when they answer.
+  local drift = pr_mod.associate(repo, "spare", 45,
+    { reassign = true, expect_incumbent = 99 })
+  ok("5k P1-3: *** a re-point refuses when the incumbent drifted under it ***",
+    drift.ok == false and drift.code == "incumbent_drift", vim.inspect(drift))
+  ok("5k P1-3: the drift refusal names what was expected and what was found",
+    tostring(drift.error):find("expected PR #99", 1, true) ~= nil, tostring(drift.error))
+  local agreed = pr_mod.associate(repo, "spare", 45,
+    { reassign = true, expect_incumbent = 44 })
+  ok("5k P1-3: (control) the same call with the CORRECT incumbent succeeds",
+    agreed.ok == true, vim.inspect(agreed))
+
+  local d_drift = pr_mod.dissociate(repo, "spare", { expect_pr = 44 })
+  ok("5k P1-3: *** dissociate refuses when the displayed PR is no longer the one held ***",
+    d_drift.ok == false and d_drift.code == "incumbent_drift", vim.inspect(d_drift))
+  local d_ok = pr_mod.dissociate(repo, "spare", { expect_pr = 45 })
+  ok("5k P1-3: (control) dissociate with the correct expectation succeeds",
+    d_ok.ok == true, vim.inspect(d_ok))
+
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",

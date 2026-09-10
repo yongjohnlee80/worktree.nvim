@@ -199,7 +199,11 @@ vim.api.nvim_create_user_command("WorktreeAssociatePR", function(opts)
   if not repo then return end
   local pr_mod = require("worktree.pr")
   local function go(num)
-    local res = pr_mod.associate(repo, branch, num, { reassign = opts.bang })
+    local ok_call, res = pcall(pr_mod.associate, repo, branch, num, { reassign = opts.bang })
+    if not ok_call then
+      vim.notify("WorktreeAssociatePR: errored — " .. tostring(res), vim.log.levels.ERROR)
+      return
+    end
     if not res.ok then
       local msg = "WorktreeAssociatePR: " .. tostring(res.error)
       if res.code == "conflict" then
@@ -229,7 +233,11 @@ end, { bang = true, nargs = "?", desc = "Worktree: associate the cwd branch with
 vim.api.nvim_create_user_command("WorktreeDissociatePR", function()
   local repo, branch = _cwd_repo_and_branch("WorktreeDissociatePR")
   if not repo then return end
-  local res = require("worktree.pr").dissociate(repo, branch)
+  local ok_call, res = pcall(require("worktree.pr").dissociate, repo, branch)
+  if not ok_call then
+    vim.notify("WorktreeDissociatePR: errored — " .. tostring(res), vim.log.levels.ERROR)
+    return
+  end
   if not res.ok then
     vim.notify("WorktreeDissociatePR: " .. tostring(res.error), vim.log.levels.ERROR)
     return

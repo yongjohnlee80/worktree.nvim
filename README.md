@@ -285,12 +285,19 @@ What they guarantee:
   branch would write a document that matches nothing.
 - **One branch claims at most one PR.** A second claim is refused and names
   the incumbent; `!` re-points, releasing the old document first.
-- **With a token, the record is the forge's** — title, state, base and
-  `base_sha`, so a range diff is immediately real. **Without one**, an
-  unverified stub is written and flagged, telling you to register a token and
-  re-run. **If the forge is reachable and denies the PR, the write is refused**
-  rather than stubbed: recording a PR that does not exist is worse than
-  recording nothing.
+- **One PR claims at most one branch, too.** Associating a PR that another
+  branch already holds is refused and names that branch; `!` moves it, and an
+  offline move re-points the existing document *in place* so its recorded
+  title, base and description survive.
+- **The whole transition is serialized** under a per-repository association
+  lock, so two actors cannot both pass the uniqueness check and write.
+- **A stub is only for "nothing was configured to ask with."** With a usable
+  token the record is the forge's — title, state, base and `base_sha`, so a
+  range diff is immediately real. If a credential *is* configured but cannot be
+  used (unset variable, failing or non-allowlisted provider), or the forge
+  denies the PR, the write is **refused** and the existing document is left
+  untouched: attempted verification that failed must not be papered over with a
+  fictional record.
 - **A branch literally named `pr-<N>` cannot be dissociated**, because the name
   *is* the association. `:WorktreeDissociatePR` says so and tells you to
   rename, instead of reporting a success that changes nothing.
