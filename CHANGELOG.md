@@ -2,6 +2,36 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.18] — 2026-09-11 — an unwritable runtime dir now says which one, and the suite stops using yours
+
+Patch. Test isolation and one diagnostic message; no behaviour change to any
+working setup. Reviewed by lector (two rounds).
+
+`open_exclusive_config` falls back to `/tmp` only when the runtime directory is
+**missing**. A directory that exists but cannot be written — a sandbox, a
+hardened multi-user host, a bind-mounted `/run` — passed that check, failed all
+ten `O_EXCL` attempts, and raised *"failed to create exclusive temporary
+credential file"*, naming neither the directory nor the cause. The refusal now
+names the directory, the errno, and the two ways to fix it.
+
+It still refuses rather than widening the fallback, and the recorded reason is
+**configured-location and diagnostic integrity**: if you have pointed
+`$XDG_RUNTIME_DIR` somewhere and it cannot be written, quietly writing
+elsewhere hides a misconfiguration and puts credential files where they were
+not meant to go. (An earlier draft justified this on confidentiality grounds;
+that was wrong and lector corrected it — a mode-0600 file created `O_EXCL` is
+protected regardless of the directory's writability, which is exactly what the
+missing-directory fallback already relies on.)
+
+`tests/adr0083-credentials.lua` set the run-dir override only inside one
+spawned subprocess, so its own sections used the real `/run/user/<uid>` and the
+suite's result depended on the developer's runtime directory. It now uses its
+own sandbox, with a cell witnessing that the ephemeral config lands there —
+configuring isolation is not observing it. Verified with `$XDG_RUNTIME_DIR`
+pointed at a nonexistent path: 104/0 either way.
+
+PR #31. Tests: `adr0083-credentials` 100 → 104; `run-all.sh` OK.
+
 ## [v0.5.17] — 2026-09-11 — bind a branch that already has a PR, and report a credential honestly
 
 Patch. ADR-0083 Amendment r10.7 — the two increments deferred from r10. Pairs
