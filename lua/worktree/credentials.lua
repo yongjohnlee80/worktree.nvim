@@ -418,11 +418,17 @@ function M.open_exclusive_config(token)
     run_dir = "/tmp"
   end
 
+  -- The reason the LAST attempt failed, so a refusal can name a cause instead
+  -- of only a count. A directory that EXISTS but cannot be written — a
+  -- sandbox, a hardened multi-user host, a bind-mounted /run — passes the
+  -- isdirectory() check above and then fails every attempt identically.
+  local last_err
   for attempt = 1, 10 do
     local rand_suffix = M._temp_suffix(attempt)
     local path = string.format("%s/worktree-auth-%s.curlrc", run_dir, rand_suffix)
     -- "wx" maps strictly to O_WRONLY | O_CREAT | O_EXCL
     local fd, err = vim.uv.fs_open(path, "wx", 384) -- mode 0600
+    if not fd then last_err = err end
     if fd then
       local stat = vim.uv.fs_fstat(fd)
       if stat and bit.band(stat.mode, 511) == 384 then
@@ -447,7 +453,22 @@ function M.open_exclusive_config(token)
       pcall(vim.uv.fs_unlink, path)
     end
   end
-  error("worktree.credentials: failed to create exclusive temporary credential file")
+  -- DELIBERATELY NOT a fallback to /tmp. The missing-directory fallback above
+  -- predates this and stays, but degrading an UNWRITABLE run dir to a
+  -- world-writable /tmp would trade the one property this file exists for —
+  -- a mode-0600 config no other user can read the bearer token out of — for
+  -- convenience, and would do it silently. An error the operator can act on is
+  -- the better failure ([[a-warning-is-not-a-gate]]: the fix must be a
+  -- decision, not a default).
+  --
+  -- The old message named neither the directory nor the cause, so a reviewer
+  -- hitting it in a sandbox could only report "the credential tail failed".
+  error(string.format(
+    "worktree.credentials: could not create an exclusive 0600 credential file in '%s'"
+    .. " after 10 attempts%s. That directory must be writable by this user;"
+    .. " set $XDG_RUNTIME_DIR to one that is, or override it for a test with"
+    .. " credentials._custom_run_dir.",
+    run_dir, last_err and (" (" .. tostring(last_err) .. ")") or ""))
 end
 
 ---redact strips Authorization headers and tokens from diagnostic strings.
