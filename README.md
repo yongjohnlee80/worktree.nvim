@@ -183,6 +183,9 @@ use {
 | `:WorktreeGraph`          | Toggle the multi-repo graph dashboard                     |
 | `:WorktreeGraphRefresh`   | Refresh the graph view (drops `auto-core.git.graph` caches)|
 | `:WorktreeGetPR <n>`      | Fetch PR #n's branch into a worktree (acts on the repo at cwd)|
+| `:WorktreeCreatePR`       | Open a PR for the active branch, and associate it            |
+| `:WorktreePostPRFeedback <n>` | Post every review associated with PR #n to the forge     |
+| `:WorktreeRecoverPRLock[!] <n>` | Clear a stale posting lock for PR #n (`!` = force)      |
 | `:WorktreeAuth <sub>`     | Manage forge credential profiles (`list` / `set` / `clear`)|
 
 ## Forge authentication (for PR features)
@@ -215,6 +218,35 @@ The `<key>` is matched **slug → host → env**, in that order:
 Profiles persist in `~/.config/nvim/.auto-agents-config/worktree-auth.json`
 (mode 0600, token-free — it stores the *reference*, never the secret). The
 allowlist is extendable via `setup({ auth = { allowed_command_providers = {…} } })`.
+
+## How a worktree is associated with a PR
+
+Everything downstream of a PR — the `[#N]` badge in auto-finder's repos panel,
+`O`'s range diff against the PR's base, and a review's `pr` tag (which is what
+makes it submittable) — is read from **one association**. A worktree is PR #N
+when either of these holds (`worktree.pr.find_for_worktree`):
+
+1. its branch is literally named `pr-<N>`; **or**
+2. a KB document `$AUTO_AGENTS_KB_ROOT/shared/prs/<slug>/pr-<N>.md` carries
+   `branch: <that worktree's branch>`.
+
+Both PR-opening paths write that document, so the ordinary flows need no
+manual step:
+
+- `:WorktreeGetPR <n>` (`G` in the panel) fetches into `pr-<n>` and writes it;
+- `:WorktreeCreatePR` (`N` in the panel) writes it for the branch it opened the
+  PR from — so a PR on `feat/anything` is associated just as well as `pr-42`.
+
+The document also records `base:` and `base_sha:` (the forge's authoritative
+base commit), which is what keeps a range diff from falling back to `main`.
+
+A review inherits its `pr` from the worktree **at draft time**. If a worktree
+is not associated when you open the diff, reviews written from it carry no PR
+and cannot be submitted with `S` — associate first (fetch or create the PR),
+then draft.
+
+To associate a branch by hand, or to repoint one, edit that document's
+`branch:` line; deleting the document dissociates the worktree.
 
 ## Multi-repo graph view (`worktree.graph`)
 

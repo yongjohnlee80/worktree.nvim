@@ -326,6 +326,25 @@ local function _get_repo_remote_url(repo)
   return ""
 end
 
+---lock_key derives the `(forge, slug)` pair that NAMES a PR's lock and receipt.
+---
+---Exported because a lock is only recoverable under the key it was taken with.
+---`:WorktreeRecoverPRLock` built its own — `owner .. "/" .. name` — while
+---`post_feedback` takes the lock under `repo.slug` (`owner__name`), so the
+---command addressed a lock file that never existed and "recovered" nothing.
+---One derivation, so the taker and the recoverer cannot disagree
+---([[shared-resolver-single-source-of-truth]]).
+---@param repo table?
+---@param remote_info table?  an already-parsed `parse_remote` result, to avoid a second `git config`
+---@return string forge, string slug
+function M.lock_key(repo, remote_info)
+  remote_info = remote_info
+    or M.parse_remote(repo and (repo.url or _get_repo_remote_url(repo)) or "")
+  local slug = (repo and repo.slug) or remote_info.repo
+  if not slug or slug == "" then slug = "repo" end
+  return remote_info.forge, slug
+end
+
 ---get_pr fetches pull request metadata from the forge.
 ---@param repo table
 ---@param pr_number integer|string
@@ -389,21 +408,93 @@ function M.get_comments(repo, pr_number)
   return data, nil
 end
 
+---write_kb_doc writes the KB PR document — the record that ASSOCIATES a PR
+---with a branch (ADR-0083 §2.5, Action 1 step 3 and Action 6).
+---
+---This is the association itself, not a by-product of it. `find_for_worktree`
+---knows a worktree is PR #N by exactly two facts: the branch is literally
+---named `pr-<N>`, or a doc under `shared/prs/<slug>/` carries
+---`branch: <that branch>`. A PR whose head is an ordinary branch name — every
+---PR opened by `create_pr` — has only the second, so writing this doc is what
+---makes the `[#N]` badge, `O`'s range diff, and a review's `pr` tag exist at
+---all.
+---
+---ONE writer, because two would be two definitions of what an association is
+---([[shared-resolver-single-source-of-truth]]). `fetch_and_create_worktree`
+---and `create_pr` differ only in which branch heads the PR.
+---@param repo table
+---@param pr table      the forge PR record (see `get_pr`)
+---@param branch string the LOCAL branch this PR is associated with
+---@return string? path, string? err
+function M.write_kb_doc(repo, pr, branch)
+  if type(pr) ~= "table" or pr.number == nil then
+    return nil, "write_kb_doc: a PR record with a number is required"
+  end
+  local kb_root = vim.env.AUTO_AGENTS_KB_ROOT or (vim.fn.expand("~/.config/nvim/.auto-agents-config/kb"))
+  local slug = repo and repo.slug or "repo"
+  local path = string.format("%s/shared/prs/%s/pr-%s.md", kb_root, slug, tostring(pr.number))
+  local content = table.concat({
+    "---",
+    "type: pr",
+    string.format("repo: %s", slug),
+    string.format("number: %s", tostring(pr.number)),
+    string.format("title: %q", pr.title or ""),
+    string.format("state: %s", pr.draft and "draft" or (pr.state or "open")),
+    string.format("branch: %s", tostring(branch or "")),
+    string.format("base: %s", pr.base_ref or "main"),
+    string.format("base_sha: %s", pr.base_sha or ""),
+    string.format("author: %s", pr.author or ""),
+    string.format("created: %s", (pr.created_at ~= "" and pr.created_at) or os.date("%Y-%m-%d")),
+    string.format("updated: %s", (pr.updated_at ~= "" and pr.updated_at) or os.date("%Y-%m-%d")),
+    "---",
+    "",
+    string.format("# PR #%s — %s", tostring(pr.number), pr.title or ""),
+    "",
+    "## Description",
+    pr.body or "",
+    "",
+  }, "\n")
+
+  local ok_atomic, fs_atomic = pcall(require, "auto-core.fs.atomic")
+  if ok_atomic and type(fs_atomic.write) == "function" then
+    local wok, werr = fs_atomic.write(path, content, { mkdir = true })
+    if not wok then return nil, tostring(werr or "atomic write failed") end
+    return path, nil
+  end
+  local mkok = pcall(vim.fn.mkdir, vim.fs.dirname(path), "p")
+  if not mkok then return nil, "could not create " .. vim.fs.dirname(path) end
+  local wok = pcall(vim.fn.writefile, vim.split(content, "\n"), path)
+  if not wok then return nil, "could not write " .. path end
+  return path, nil
+end
+
 ---create_pr creates a new pull request on the forge (Action 6).
+---
+---Returns a RESULT ENVELOPE (`{ ok, pr, kb_doc, branch, error }`), like its
+---sibling actions `fetch_and_create_worktree` and `post_feedback` — not the
+---`(value, err)` pair of the internal fetchers `get_pr` / `get_comments`.
+---
+---It always meant to: both call sites (`:WorktreeCreatePR` and auto-finder's
+---`N`) read `res.ok` and `res.pr.number`, and auto-finder's own test mocked
+---`{ ok = true, pr = { number = 99 } }`. The function returned `(pr, err)`
+---instead, so `res.ok` was nil for a PR that had just been created — every
+---successful create reported "could not create PR — unknown", and the mock
+---meant no suite ever observed it ([[validate-the-verifier]]).
 ---@param repo table
 ---@param opts table { title: string, body: string, head: string, base: string, draft: boolean? }
----@return table pr, string? err
+---@return table result
 function M.create_pr(repo, opts)
   opts = opts or {}
   local remote_url = _get_repo_remote_url(repo)
   local remote_info = M.parse_remote(remote_url)
   local token, terr = credentials.resolve_token(repo.slug, remote_info.host)
-  if not token then return nil, terr end
+  if not token then return { ok = false, error = terr } end
 
+  local head = opts.head
   local payload = vim.json.encode({
     title = opts.title or "PR",
     body = opts.body or "",
-    head = opts.head,
+    head = head,
     base = opts.base or "main",
     draft = opts.draft == true,
   })
@@ -411,22 +502,52 @@ function M.create_pr(repo, opts)
   local url = string.format("%s/repos/%s/%s/pulls", remote_info.api_base, remote_info.owner, remote_info.repo)
   local code, body = M._http_request("POST", url, token, payload)
   if code ~= 201 and code ~= 200 then
-    return nil, string.format("failed to create PR, HTTP %d: %s", code, credentials.redact(body))
+    return { ok = false, error = string.format(
+      "failed to create PR, HTTP %d: %s", code, credentials.redact(body)) }
   end
 
   local dok, data = pcall(vim.json.decode, body)
   if not dok or type(data) ~= "table" then
-    return nil, "failed to parse created PR response JSON"
+    return { ok = false, error = "failed to parse created PR response JSON" }
   end
 
-  return {
+  -- The SAME projection `get_pr` returns, so the KB doc a created PR writes is
+  -- indistinguishable from the one a fetched PR writes — base/base_sha/author
+  -- were dropped here before, leaving `open_pr_diff` to fall back to "main".
+  local pr = {
     number = data.number,
-    title = data.title,
-    body = data.body,
-    state = data.state,
+    title = data.title or "",
+    body = data.body or "",
+    state = data.state or "open",
     draft = data.draft == true,
-    html_url = data.html_url,
-  }, nil
+    base_ref = (data.base and data.base.ref) or opts.base or "main",
+    base_sha = (data.base and data.base.sha) or "",
+    head_ref = (data.head and data.head.ref) or head or "",
+    head_sha = (data.head and data.head.sha) or "",
+    author = (data.user and data.user.login) or "",
+    html_url = data.html_url or "",
+    created_at = data.created_at or "",
+    updated_at = data.updated_at or "",
+    forge = remote_info.forge,
+  }
+
+  -- Associate the PR with the branch that heads it (Action 6: "on creation,
+  -- instantiate the KB PR document"). Without this the PR exists on the forge
+  -- and nowhere locally: no `[#N]` badge, no `S`, and every review drafted
+  -- afterwards carries no `pr`, so it can never be submitted.
+  --
+  -- A failed write does NOT fail the action — the PR is already open, and
+  -- reporting failure would invite a second create. It is returned instead, so
+  -- the caller can say the association is missing and the user can re-run GetPR.
+  local kb_doc, kberr = M.write_kb_doc(repo, pr, pr.head_ref ~= "" and pr.head_ref or head)
+
+  return {
+    ok = true,
+    pr = pr,
+    branch = pr.head_ref ~= "" and pr.head_ref or head,
+    kb_doc = kb_doc,
+    kb_doc_error = kberr,
+  }
 end
 
 ---post_feedback executes the four-step resilient review posting lifecycle (ADR-0083 §2.6 Action 4).
@@ -439,8 +560,7 @@ function M.post_feedback(repo, pr_number, reviews, opts)
   opts = opts or {}
   local remote_url = _get_repo_remote_url(repo)
   local remote_info = M.parse_remote(remote_url)
-  local slug = repo.slug or remote_info.repo
-  local forge = remote_info.forge
+  local forge, slug = M.lock_key(repo, remote_info)
 
   -- Acquire exclusive lock with live-owner immunity
   local lock = M.acquire_lock(forge, slug, pr_number)
@@ -726,44 +846,18 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
       tostring(pr_number), vim.trim(add_res.stderr or add_res.stdout or "")) }
   end
 
-  -- 3. Create KB document shared/prs/<repo_slug>/pr-<number>.md
-  local kb_root = vim.env.AUTO_AGENTS_KB_ROOT or (vim.fn.expand("~/.config/nvim/.auto-agents-config/kb"))
-  local kb_doc_path = string.format("%s/shared/prs/%s/pr-%s.md", kb_root, repo.slug or "repo", tostring(pr_number))
-  local doc_content = table.concat({
-    "---",
-    "type: pr",
-    string.format("repo: %s", repo.slug or "repo"),
-    string.format("number: %s", tostring(pr_number)),
-    string.format("title: %q", pr.title),
-    string.format("state: %s", pr.draft and "draft" or pr.state),
-    string.format("branch: %s", branch),
-    string.format("base: %s", pr.base_ref or "main"),
-    string.format("base_sha: %s", pr.base_sha or ""),
-    string.format("author: %s", pr.author or ""),
-    string.format("created: %s", pr.created_at or os.date("%Y-%m-%d")),
-    string.format("updated: %s", pr.updated_at or os.date("%Y-%m-%d")),
-    "---",
-    "",
-    string.format("# PR #%s — %s", tostring(pr_number), pr.title),
-    "",
-    "## Description",
-    pr.body,
-    "",
-  }, "\n")
-
-  local ok_atomic, fs_atomic = pcall(require, "auto-core.fs.atomic")
-  if ok_atomic and type(fs_atomic.write) == "function" then
-    fs_atomic.write(kb_doc_path, doc_content, { mkdir = true })
-  else
-    pcall(vim.fn.mkdir, vim.fs.dirname(kb_doc_path), "p")
-    pcall(vim.fn.writefile, vim.split(doc_content, "\n"), kb_doc_path)
-  end
+  -- 3. Associate: write shared/prs/<repo_slug>/pr-<number>.md. `pr.number` may
+  -- be absent from a sparse forge response, so pin the number the caller asked
+  -- for — the doc's filename and `number:` field must agree with it.
+  local kb_doc, kberr = M.write_kb_doc(repo,
+    vim.tbl_extend("force", pr, { number = pr.number or pr_number }), branch)
 
   return {
     ok = true,
     pr = pr,
     worktree_path = wt_path,
-    kb_doc = kb_doc_path,
+    kb_doc = kb_doc,
+    kb_doc_error = kberr,
     branch = branch,
   }
 end

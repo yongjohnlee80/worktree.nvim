@@ -517,6 +517,182 @@ do
   vim.fn.delete(outside, "rf"); vim.fn.delete(wtlink, "rf")
 end
 
+-- 5g. create_pr — the RESULT ENVELOPE, and the association it must write.
+--
+-- Two defects in one call.
+--   1. create_pr returned `(pr, err)` while BOTH call sites — :WorktreeCreatePR
+--      and auto-finder's `N` — read `res.ok`, so a PR that had just been opened
+--      on the forge reported "could not create PR — unknown". No suite observed
+--      it because auto-finder's own test MOCKED `{ ok = true, pr = {…} }`: the
+--      shape it wished for, never the one the function returned
+--      ([[validate-the-verifier]]).
+--   2. nothing wrote the KB PR doc (ADR-0083 §2.6 Action 6: "on creation,
+--      instantiate the KB PR document"), so the new PR was associated with
+--      NOTHING — no `[#N]` badge, no `S`, and every review drafted afterwards
+--      carried no `pr`, hence could never be submitted.
+--
+-- The association cells assert through its CONSUMER (`find_for_worktree`),
+-- not by re-reading the file the code just wrote.
+do
+  local kb = vim.fn.tempname() .. "-kb-createpr"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+
+  local slug = "acme__widget"
+  local repo = { slug = slug, remote = "git@github.com:acme/widget.git" }
+  creds.set_profile(slug, { kind = "in_memory", token = "cr34te" })
+
+  pr_mod._mock_http = function(method, url)
+    if method == "POST" and url:find("/pulls$") then
+      return 201, vim.json.encode({
+        number = 77, title = "Widget X", body = "why", state = "open", draft = false,
+        base = { ref = "develop", sha = "b45e5ha000000000000000000000000000000000" },
+        head = { ref = "feat/widget-x", sha = "h34d5ha000000000000000000000000000000000" },
+        user = { login = "johno" },
+        html_url = "https://github.com/acme/widget/pull/77",
+        created_at = "2026-09-10T00:00:00Z", updated_at = "2026-09-10T01:00:00Z",
+      })
+    end
+    return 404, "nf"
+  end
+
+  local res = pr_mod.create_pr(repo,
+    { title = "Widget X", body = "why", head = "feat/widget-x", base = "develop" })
+
+  -- (1) the envelope, read exactly as the callers read it
+  ok("5g: *** create_pr reports ok=true for a PR it created (callers read res.ok) ***",
+    type(res) == "table" and res.ok == true, vim.inspect(res))
+  ok("5g: the envelope carries the number the callers print (res.pr.number)",
+    res and res.pr and res.pr.number == 77, res and vim.inspect(res.pr) or "nil")
+  -- The caller's literal branch, so the cell fails if either half regresses.
+  local caller_says = (res and res.ok)
+    and ("created PR #" .. tostring(res.pr and res.pr.number or ""))
+    or ("could not create PR — " .. tostring(res and res.error or "unknown"))
+  ok("5g: *** the caller's own branch renders the success message ***",
+    caller_says == "created PR #77", caller_says)
+
+  -- (2) the association — proven through find_for_worktree, on an ORDINARY
+  -- branch name. `pr-<N>` would match by naming convention alone and would
+  -- prove nothing about the doc.
+  local found = pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" })
+  ok("5g: *** the created PR is now ASSOCIATED with its head branch ***",
+    found ~= nil and tostring(found.number) == "77", vim.inspect(found))
+  ok("5g: the association records the real base, not the 'main' fallback",
+    found and found.base == "develop", found and tostring(found.base) or "nil")
+  ok("5g: the association records the forge's authoritative base sha",
+    found and found.base_sha == "b45e5ha000000000000000000000000000000000",
+    found and tostring(found.base_sha) or "nil")
+  ok("5g: the association records the author",
+    res.kb_doc ~= nil and table.concat(vim.fn.readfile(res.kb_doc), "\n"):find("author: johno", 1, true) ~= nil)
+  -- Specificity: a DIFFERENT branch in the same repo must NOT inherit it,
+  -- or "associated" would mean "any doc matches any worktree".
+  local decoy = pr_mod.find_for_worktree(repo, { branch = "feat/something-else" })
+  ok("5g: an unrelated branch in the same repo is NOT associated with #77",
+    decoy == nil, vim.inspect(decoy))
+  ok("5g: the envelope names the branch the PR is associated with",
+    res.branch == "feat/widget-x", tostring(res and res.branch))
+
+  -- (3) failures are envelopes too — a bare nil would crash `res.ok` callers.
+  pr_mod._mock_http = function() return 422, '{"message":"No commits between"}' end
+  local bad = pr_mod.create_pr(repo, { title = "T", head = "feat/x", base = "develop" })
+  ok("5g: a forge rejection returns ok=false, not a bare nil",
+    type(bad) == "table" and bad.ok == false, vim.inspect(bad))
+  ok("5g: the rejection carries the HTTP status in its error",
+    bad and type(bad.error) == "string" and bad.error:find("422", 1, true) ~= nil,
+    bad and tostring(bad.error) or "nil")
+
+  creds.clear_profile(slug)
+  local noauth = pr_mod.create_pr({ slug = "nobody__nothing", remote = "git@example.invalid:n/n.git" },
+    { title = "T", head = "b", base = "main" })
+  ok("5g: a missing credential returns ok=false and names :WorktreeAuth",
+    type(noauth) == "table" and noauth.ok == false
+      and tostring(noauth.error):find("WorktreeAuth", 1, true) ~= nil,
+    vim.inspect(noauth))
+
+  -- write_kb_doc refuses a record it cannot name, rather than writing pr-nil.md
+  local nopath, noerr = pr_mod.write_kb_doc(repo, { title = "x" }, "b")
+  ok("5g: write_kb_doc refuses a PR record with no number",
+    nopath == nil and type(noerr) == "string", tostring(nopath) .. " / " .. tostring(noerr))
+
+  pr_mod._mock_http = nil
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
+-- 5h. lock_key — the poster and the recoverer must name the SAME lock file.
+--
+-- `:WorktreeRecoverPRLock` derived `owner .. "/" .. name` while post_feedback
+-- locks under `repo.slug` (`owner__name`). recover_lock returns TRUE for a lock
+-- file that does not exist, so the wrong key "recovered" successfully and left
+-- the real lock in place — the return value could not tell the two apart. These
+-- cells assert the FILE, not the return.
+do
+  local repo = { slug = "acme__widget", url = "git@github.com:acme/widget.git" }
+  local forge, key = pr_mod.lock_key(repo)
+  ok("5h: lock_key returns the repo slug the poster locks under",
+    forge == "github" and key == "acme__widget", tostring(forge) .. " / " .. tostring(key))
+
+  local lock = pr_mod.acquire_lock(forge, key, 77)
+  local real_path = lock.path
+  ok("5h: the taken lock is at _lock_path(lock_key(repo), n)",
+    real_path == pr_mod._lock_path(forge, key, 77), real_path)
+
+  -- The OLD derivation, verbatim, as a decoy.
+  local remote = pr_mod.parse_remote(repo.url)
+  local old_key = remote.owner .. "/" .. remote.repo
+  local old_ok = pr_mod.recover_lock(remote.forge, old_key, 77, { force = true })
+  ok("5h: *** the old owner/name key reports success while the lock SURVIVES ***",
+    old_ok == true and vim.fn.filereadable(real_path) == 1,
+    "returned " .. tostring(old_ok) .. ", lock present=" .. tostring(vim.fn.filereadable(real_path)))
+
+  local new_ok = pr_mod.recover_lock(forge, key, 77, { force = true })
+  ok("5h: *** lock_key's key actually removes the lock ***",
+    new_ok == true and vim.fn.filereadable(real_path) == 0,
+    "returned " .. tostring(new_ok) .. ", lock present=" .. tostring(vim.fn.filereadable(real_path)))
+  pcall(function() lock:release() end)
+end
+
+-- 5i. :WorktreeRecoverPRLock actually runs, and removes the REAL lock.
+--
+-- The command called `pr_mod.parse_remote_url` — a function `worktree.pr` has
+-- never exported — so it died on its first line with "attempt to call field
+-- 'parse_remote_url' (a nil value)". Nothing exercised the command, so the
+-- crash shipped. This drives the registered command itself, with the repo
+-- inventory stubbed, and asserts the lock file the poster would have taken is
+-- the one that goes away.
+do
+  local repos_mod = require("worktree.repos")
+  local saved_repos = repos_mod.repos
+  repos_mod.repos = function()
+    return { { slug = "acme__widget", url = "git@github.com:acme/widget.git" } }
+  end
+
+  vim.g.loaded_worktree = nil -- the plugin file guards on this
+  local sourced = pcall(vim.cmd, "source " .. plugin_root .. "/plugin/worktree.lua")
+  ok("5i: plugin/worktree.lua sources and registers the command",
+    sourced and vim.fn.exists(":WorktreeRecoverPRLock") == 2)
+
+  local forge, key = pr_mod.lock_key({ slug = "acme__widget", url = "git@github.com:acme/widget.git" })
+  local lock = pr_mod.acquire_lock(forge, key, 88)
+  local notified = {}
+  local saved_notify = vim.notify
+  vim.notify = function(msg) notified[#notified + 1] = tostring(msg) end
+  -- `!` is force, which skips the vim.ui.select confirmation.
+  local ran, cmd_err = pcall(vim.cmd, "WorktreeRecoverPRLock! 88")
+  vim.notify = saved_notify
+
+  ok("5i: *** the command runs instead of raising a nil-call ***",
+    ran == true, tostring(cmd_err))
+  ok("5i: *** it removes the lock the poster would have taken ***",
+    vim.fn.filereadable(lock.path) == 0, lock.path)
+  ok("5i: it reports the recovery",
+    #notified > 0 and table.concat(notified, "\n"):find("recovered lock for PR #88", 1, true) ~= nil,
+    table.concat(notified, " | "))
+
+  pcall(function() lock:release() end)
+  repos_mod.repos = saved_repos
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",
