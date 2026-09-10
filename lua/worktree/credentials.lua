@@ -453,16 +453,24 @@ function M.open_exclusive_config(token)
       pcall(vim.uv.fs_unlink, path)
     end
   end
-  -- DELIBERATELY NOT a fallback to /tmp. The missing-directory fallback above
-  -- predates this and stays, but degrading an UNWRITABLE run dir to a
-  -- world-writable /tmp would trade the one property this file exists for —
-  -- a mode-0600 config no other user can read the bearer token out of — for
-  -- convenience, and would do it silently. An error the operator can act on is
-  -- the better failure ([[a-warning-is-not-a-gate]]: the fix must be a
-  -- decision, not a default).
+  -- DELIBERATELY NOT a fallback to /tmp, but NOT for a confidentiality reason.
   --
-  -- The old message named neither the directory nor the cause, so a reviewer
-  -- hitting it in a sandbox could only report "the credential tail failed".
+  -- My first rationale here was wrong and lector corrected it: a world-writable
+  -- DIRECTORY does not make a mode-0600 FILE readable — permissions live on the
+  -- inode, /tmp is sticky so only the owner can unlink, and the `wx`
+  -- (O_WRONLY|O_CREAT|O_EXCL) open refuses a pre-existing path, so a planted
+  -- symlink fails EEXIST rather than being followed. All three verified. The
+  -- missing-directory fallback above already relies on exactly that property,
+  -- and it stays.
+  --
+  -- The reason to refuse is CONFIGURED-LOCATION AND DIAGNOSTIC INTEGRITY. If an
+  -- operator has pointed $XDG_RUNTIME_DIR somewhere — a tmpfs they chose, a
+  -- per-session dir their init cleans up — and it cannot be written, quietly
+  -- writing somewhere else hides a misconfiguration and puts credential files
+  -- where they were not meant to go. The old message named neither the
+  -- directory nor the cause, so a reviewer who hit this in a sandbox could only
+  -- report "the credential tail failed". An error the operator can act on is
+  -- the better failure.
   error(string.format(
     "worktree.credentials: could not create an exclusive 0600 credential file in '%s'"
     .. " after 10 attempts%s. That directory must be writable by this user;"
