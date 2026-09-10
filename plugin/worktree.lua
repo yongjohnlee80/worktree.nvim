@@ -193,8 +193,16 @@ vim.api.nvim_create_user_command("WorktreeRecoverPRLock", function(opts)
   local repo_mod = require("worktree.repos")
   local repos = repo_mod.repos()
   local r = repos and repos[1]
-  local forge, owner, name = pr_mod.parse_remote_url(r and r.url or "")
-  local repo_slug = (owner and name) and (owner .. "/" .. name) or (r and r.slug or "repo")
+  -- `pr.lock_key`, not a local derivation. Two defects, one line:
+  --   1. `pr_mod.parse_remote_url` has never existed (the module exports
+  --      `parse_remote`, returning a TABLE, not a `forge, owner, name`
+  --      triple), so this command died on its first line with "attempt to
+  --      call field 'parse_remote_url' (a nil value)" — the documented
+  --      recovery for a stuck PR lock could not be run at all.
+  --   2. even repaired in place, `owner .. "/" .. name` is not the key
+  --      `post_feedback` locks under (`repo.slug`, i.e. `owner__name`), so it
+  --      would address a lock file that never existed.
+  local forge, repo_slug = pr_mod.lock_key(r)
   local pr_num = tonumber(opts.args)
   local force = opts.bang
   local function go(num)
