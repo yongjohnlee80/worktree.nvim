@@ -408,6 +408,94 @@ function M.get_comments(repo, pr_number)
   return data, nil
 end
 
+-- ── where an association lives ────────────────────────────────
+--
+-- Four call sites now need the same three answers — which slug names this
+-- repo's PR documents, which directory holds them, and which file is PR #N.
+-- They were open-coded in `write_kb_doc` and `find_for_worktree` with the
+-- kb-root fallback spelled slightly differently in each, and `associate` /
+-- `dissociate` would have made a third and fourth copy. One derivation, so a
+-- writer and a reader cannot disagree about where an association is
+-- ([[shared-resolver-single-source-of-truth]]).
+
+---kb_root resolves the knowledge-base root the PR documents live under.
+---@return string
+function M.kb_root()
+  local r = vim.env.AUTO_AGENTS_KB_ROOT
+  if r and r ~= "" then return r end
+  return vim.fn.expand("~/.config/nvim/.auto-agents-config/kb")
+end
+
+---kb_slug names a repo's PR-document namespace.
+---@param repo table?
+---@return string
+function M.kb_slug(repo)
+  local s = repo and repo.slug
+  if type(s) == "string" and s ~= "" then return s end
+  return "repo"
+end
+
+---prs_dir is the directory holding every PR document for `repo`.
+---@param repo table?
+---@return string
+function M.prs_dir(repo)
+  return string.format("%s/shared/prs/%s", M.kb_root(), M.kb_slug(repo))
+end
+
+---kb_doc_path is the document that records PR #`number` for `repo`.
+---@param repo table?
+---@param number integer|string
+---@return string
+function M.kb_doc_path(repo, number)
+  return string.format("%s/pr-%s.md", M.prs_dir(repo), tostring(number))
+end
+
+---read_kb_doc parses a PR document's frontmatter into a flat field table.
+---
+---Returns the RAW fields — no defaults applied. `find_for_worktree` owns the
+---defaulting, because "no `state:` recorded" and "state is open" are different
+---facts and only the consumer knows which it wants.
+---@param path string
+---@return table? fields   { number, title, state, branch, draft, base, base_sha }
+function M.read_kb_doc(path)
+  if vim.fn.filereadable(path) ~= 1 then return nil end
+  local ok, lines = pcall(vim.fn.readfile, path, "", 30)
+  if not ok or type(lines) ~= "table" then return nil end
+  local f, in_fm = {}, false
+  for _, l in ipairs(lines) do
+    if l == "---" then
+      if not in_fm then in_fm = true else break end
+    elseif in_fm then
+      local k, v = l:match("^([%w_]+):%s*(.*)$")
+      local function unquote(s) return (s:gsub('^"(.*)"$', "%1")) end
+      if k == "number" then f.number = tonumber(v) or v
+      elseif k == "title" then f.title = unquote(v)
+      elseif k == "state" then f.state = v
+      elseif k == "branch" then f.branch = v
+      elseif k == "draft" then f.draft = (v == "true")
+      -- Accept both `base:` and the `base_ref:` some writers emit (B7).
+      elseif k == "base" or k == "base_ref" then f.base = unquote(v)
+      elseif k == "base_sha" then f.base_sha = unquote(v)
+      end
+    end
+  end
+  return f
+end
+
+---kb_docs lists every PR document for `repo`, parsed, as { path = …, fields = … }.
+---@param repo table?
+---@return table[]
+function M.kb_docs(repo)
+  local dir = M.prs_dir(repo)
+  if vim.fn.isdirectory(dir) ~= 1 then return {} end
+  local out = {}
+  for _, p in ipairs(vim.fn.globpath(dir, "pr-*.md", false, true)) do
+    local fields = M.read_kb_doc(p)
+    if fields then out[#out + 1] = { path = p, fields = fields } end
+  end
+  return out
+end
+
 ---write_kb_doc writes the KB PR document — the record that ASSOCIATES a PR
 ---with a branch (ADR-0083 §2.5, Action 1 step 3 and Action 6).
 ---
@@ -430,9 +518,8 @@ function M.write_kb_doc(repo, pr, branch)
   if type(pr) ~= "table" or pr.number == nil then
     return nil, "write_kb_doc: a PR record with a number is required"
   end
-  local kb_root = vim.env.AUTO_AGENTS_KB_ROOT or (vim.fn.expand("~/.config/nvim/.auto-agents-config/kb"))
-  local slug = repo and repo.slug or "repo"
-  local path = string.format("%s/shared/prs/%s/pr-%s.md", kb_root, slug, tostring(pr.number))
+  local path = M.kb_doc_path(repo, pr.number)
+  local slug = M.kb_slug(repo)
   local content = table.concat({
     "---",
     "type: pr",
@@ -991,50 +1078,33 @@ function M.find_for_worktree(repo, wt)
   -- 1. Check if branch is named pr-<number>
   local pr_num_from_branch = wt.branch:match("^pr%-(%d+)$")
 
-  -- 2. Scan shared/prs/<repo_slug>/
-  local kb_root = vim.env.AUTO_AGENTS_KB_ROOT or vim.fn.expand("~/.config/nvim/.auto-agents-config/kb")
-  local prs_dir = string.format("%s/shared/prs/%s", kb_root, slug)
-  if vim.fn.isdirectory(prs_dir) == 1 then
-    local files = vim.fn.globpath(prs_dir, "pr-*.md", false, true)
-    for _, f in ipairs(files) do
-      local lines = vim.fn.readfile(f, "", 30)
-      local num, title, state, branch, draft, base, base_sha
-      local in_fm = false
-      for _, l in ipairs(lines) do
-        if l == "---" then
-          if not in_fm then in_fm = true else break end
-        elseif in_fm then
-          local k, v = l:match("^([%w_]+):%s*(.*)$")
-          if k == "number" then num = tonumber(v) or v
-          elseif k == "title" then title = v:gsub('^"(.*)"$', "%1")
-          elseif k == "state" then state = v
-          elseif k == "branch" then branch = v
-          elseif k == "draft" then draft = (v == "true")
-          -- B7: `base:` was never parsed, so `open_pr_diff` always fell back to
-          -- "main" and diffed against the wrong branch. Accept both `base:` and
-          -- the `base_ref:` the writer emits.
-          elseif k == "base" or k == "base_ref" then base = v:gsub('^"(.*)"$', "%1")
-          -- base_sha: the FORGE's authoritative base commit, written by
-          -- fetch_and_create_worktree. It is what lets open_pr_diff pass an
-          -- authoritative base_rev to repos.pr_diff (B6 wiring, lector #22 r1).
-          elseif k == "base_sha" then base_sha = v:gsub('^"(.*)"$', "%1")
-          end
-        end
-      end
-      if (branch and branch == wt.branch) or (pr_num_from_branch and tostring(num) == pr_num_from_branch) then
-        return {
-          number = num or pr_num_from_branch,
-          title = title or ("PR #" .. tostring(num or pr_num_from_branch)),
-          state = state or "open",
-          draft = draft == true or state == "draft",
-          branch = branch or wt.branch,
-          base = base,
-          base_sha = (base_sha and base_sha ~= "") and base_sha or nil,
-          kb_doc = f,
-        }
-      end
+  -- 2. Scan shared/prs/<repo_slug>/. An EXPLICIT branch match wins over a
+  -- match on the pr-<N> naming convention: when a branch called `pr-7` has
+  -- been deliberately associated with #12, the document is the newer, more
+  -- specific statement, and letting glob order decide between them made the
+  -- badge depend on filesystem iteration.
+  local by_name
+  for _, doc in ipairs(M.kb_docs(repo)) do
+    local d, f = doc.fields, doc.path
+    local function hit()
+      return {
+        number = d.number or pr_num_from_branch,
+        title = d.title or ("PR #" .. tostring(d.number or pr_num_from_branch)),
+        state = d.state or "open",
+        draft = d.draft == true or d.state == "draft",
+        branch = d.branch or wt.branch,
+        base = d.base,
+        base_sha = (d.base_sha and d.base_sha ~= "") and d.base_sha or nil,
+        kb_doc = f,
+      }
+    end
+    if d.branch and d.branch == wt.branch then
+      return hit()
+    elseif pr_num_from_branch and tostring(d.number) == pr_num_from_branch then
+      by_name = by_name or hit()
     end
   end
+  if by_name then return by_name end
 
   -- If branch is pr-<num> but no KB doc yet, return a minimal stub
   if pr_num_from_branch then
@@ -1048,6 +1118,221 @@ function M.find_for_worktree(repo, wt)
   end
 
   return nil
+end
+
+-- ── associate / dissociate (ADR-0083 r10.7) ───────────────────
+--
+-- Until now an association could only be MADE as a side effect of opening or
+-- fetching a PR. A branch that already exists and already has a PR — the
+-- common case after `gh pr create` outside nvim, after a rename, or after
+-- someone else opened the PR — could be bound only by hand-editing the KB
+-- document. These two verbs are that missing edge, and they go through
+-- `write_kb_doc` so an association made here is the same artifact as one made
+-- by GetPR.
+
+---_branch_exists reports whether `branch` resolves in the repo.
+---
+---Checked because an association to a branch git cannot resolve is dead on
+---arrival: the badge needs a worktree row to hang on, and there is none. A
+---typo'd branch would otherwise write a document that silently matches
+---nothing ([[prove-the-instrument-observes]] — a write that observes nothing
+---is not a write worth reporting as success).
+local function _branch_exists(repo, branch)
+  local dir = repo and (repo.common_dir or repo.sample_worktree or repo.path)
+  if not dir or not branch or branch == "" then return false end
+  local o = vim.system({ "git", "-C", dir, "rev-parse", "--verify", "--quiet",
+    "refs/heads/" .. branch }, { text = true }):wait()
+  return o.code == 0 and vim.trim(o.stdout or "") ~= ""
+end
+
+---associate binds `branch` to PR #`pr_number` by writing the KB PR document.
+---
+---Three outcomes, and the difference between them is whether we could ASK the
+---forge — never a guess:
+---
+---  * **no credential** — we cannot verify the PR exists, so a minimal stub is
+---    written and flagged `stub = true`. This is the offline/unconfigured
+---    case, and refusing it would make the verb useless exactly when the token
+---    guidance in `?` has not been followed yet.
+---  * **credential, forge confirms** — the full record is written, identical
+---    to what GetPR would have written.
+---  * **credential, forge refuses** — REFUSED. We could reach the forge and it
+---    said no; writing a stub over that would record a PR that does not exist.
+---
+---Failures carry a `code` so a caller can branch on identity rather than on
+---message text ([[error-identity-not-error-text]]).
+---@param repo table
+---@param branch string
+---@param pr_number integer|string
+---@param opts table?  { reassign: boolean?, allow_stub: boolean? }
+---@return table result  { ok, pr?, kb_doc?, stub?, reason?, code?, error?, conflict? }
+function M.associate(repo, branch, pr_number, opts)
+  opts = opts or {}
+  if not repo then return { ok = false, code = "no_repo", error = "associate: a repo is required" } end
+  if type(branch) ~= "string" or branch == "" then
+    return { ok = false, code = "no_branch", error = "associate: a branch name is required" }
+  end
+  local n = tonumber(pr_number)
+  if not n or n ~= math.floor(n) or n <= 0 then
+    return { ok = false, code = "bad_number",
+      error = string.format("associate: '%s' is not a PR number", tostring(pr_number)) }
+  end
+
+  if not _branch_exists(repo, branch) then
+    return { ok = false, code = "no_such_branch",
+      error = string.format("associate: this repository has no branch '%s'", branch) }
+  end
+
+  -- A branch may claim at most ONE PR. Two documents naming the same branch
+  -- make `find_for_worktree` depend on glob order for which badge appears, so
+  -- a re-point is an explicit act, not a silent second write.
+  local conflict
+  for _, doc in ipairs(M.kb_docs(repo)) do
+    if doc.fields.branch == branch and tostring(doc.fields.number) ~= tostring(n) then
+      conflict = { number = doc.fields.number, kb_doc = doc.path }
+      break
+    end
+  end
+  if conflict and not opts.reassign then
+    return { ok = false, code = "conflict", conflict = conflict,
+      error = string.format("'%s' is already associated with PR #%s (%s)",
+        branch, tostring(conflict.number), conflict.kb_doc) }
+  end
+
+  local remote_info = M.parse_remote(_get_repo_remote_url(repo))
+  local token = credentials.resolve_token(repo.slug, remote_info.host)
+
+  local pr, reason, stub
+  if token then
+    local got, gerr = M.get_pr(repo, n)
+    if not got then
+      return { ok = false, code = "forge_refused",
+        error = string.format("the forge could not confirm PR #%d: %s", n, tostring(gerr)) }
+    end
+    pr = got
+    pr.number = pr.number or n
+  else
+    if opts.allow_stub == false then
+      return { ok = false, code = "no_credential",
+        error = "no credential profile resolved — register one with :WorktreeAuth set" }
+    end
+    -- Unverified: record only what the caller told us, and say so.
+    stub = true
+    reason = "no credential profile resolved; wrote an unverified stub. "
+      .. "Register a token with :WorktreeAuth set, then re-run to fill in "
+      .. "title, state, base and base_sha."
+    pr = { number = n, title = string.format("PR #%d", n), body = "",
+           state = "open", draft = false, base_ref = "", base_sha = "", author = "" }
+  end
+
+  -- Re-pointing: clear the losing document's branch BEFORE writing the winner,
+  -- so a failure between the two leaves zero associations rather than two.
+  if conflict then
+    local cleared, cerr = M.set_kb_doc_branch(conflict.kb_doc, "")
+    if not cleared then
+      return { ok = false, code = "reassign_failed",
+        error = string.format("could not release '%s' from PR #%s: %s",
+          branch, tostring(conflict.number), tostring(cerr)) }
+    end
+  end
+
+  local kb_doc, werr = M.write_kb_doc(repo, pr, branch)
+  if not kb_doc then
+    return { ok = false, code = "write_failed",
+      error = string.format("could not write the association: %s", tostring(werr)) }
+  end
+
+  return { ok = true, pr = pr, kb_doc = kb_doc, branch = branch,
+           stub = stub, reason = reason,
+           reassigned_from = conflict and conflict.number or nil }
+end
+
+---set_kb_doc_branch rewrites one document's `branch:` line in place.
+---
+---In place, rather than re-rendering through `write_kb_doc`: the document also
+---carries the PR's description and any prose a human added under it, and
+---re-rendering from a parsed frontmatter would silently drop the body.
+---@param path string
+---@param branch string   "" to clear the association
+---@return boolean ok, string? err
+function M.set_kb_doc_branch(path, branch)
+  if vim.fn.filereadable(path) ~= 1 then return false, "no such document: " .. tostring(path) end
+  local ok_r, lines = pcall(vim.fn.readfile, path)
+  if not ok_r or type(lines) ~= "table" then return false, "could not read " .. path end
+  local in_fm, done = false, false
+  for i, l in ipairs(lines) do
+    if l == "---" then
+      if not in_fm then in_fm = true else break end
+    elseif in_fm and l:match("^branch:") then
+      lines[i] = "branch: " .. tostring(branch or "")
+      done = true
+      break
+    end
+  end
+  if not done then return false, "no `branch:` line in " .. path end
+
+  local text = table.concat(lines, "\n") .. "\n"
+  local ok_atomic, fs_atomic = pcall(require, "auto-core.fs.atomic")
+  if ok_atomic and type(fs_atomic.write) == "function" then
+    local wok, werr = fs_atomic.write(path, text, { mkdir = true })
+    if not wok then return false, tostring(werr or "atomic write failed") end
+    return true, nil
+  end
+  local ok_w = pcall(vim.fn.writefile, lines, path)
+  if not ok_w then return false, "could not write " .. path end
+  return true, nil
+end
+
+---dissociate releases `branch` from whatever PR currently claims it.
+---
+---It clears the document's `branch:` rather than deleting the document: the
+---PR's title, base and description are still true, and a later re-associate
+---should not have to re-fetch them. Deleting is the user's call, not ours.
+---
+---A branch LITERALLY named `pr-<N>` cannot be dissociated, because the name is
+---itself the association (`find_for_worktree` rule 1). Saying so is the whole
+---point — the alternative is a verb that reports success and changes nothing.
+---@param repo table
+---@param branch string
+---@return table result  { ok, kb_doc?, number?, code?, error? }
+function M.dissociate(repo, branch)
+  if not repo then return { ok = false, code = "no_repo", error = "dissociate: a repo is required" } end
+  if type(branch) ~= "string" or branch == "" then
+    return { ok = false, code = "no_branch", error = "dissociate: a branch name is required" }
+  end
+
+  local claimed
+  for _, doc in ipairs(M.kb_docs(repo)) do
+    if doc.fields.branch == branch then
+      claimed = { number = doc.fields.number, kb_doc = doc.path }
+      break
+    end
+  end
+
+  local by_name = branch:match("^pr%-(%d+)$")
+  if by_name and not claimed then
+    return { ok = false, code = "branch_name_association", number = tonumber(by_name),
+      error = string.format(
+        "'%s' is associated with PR #%s by its NAME, not by a document — "
+        .. "rename the branch to release it", branch, by_name) }
+  end
+
+  if not claimed then
+    return { ok = false, code = "not_associated",
+      error = string.format("'%s' is not associated with a PR", branch) }
+  end
+
+  local ok_c, cerr = M.set_kb_doc_branch(claimed.kb_doc, "")
+  if not ok_c then
+    return { ok = false, code = "write_failed",
+      error = string.format("could not release '%s': %s", branch, tostring(cerr)) }
+  end
+
+  -- Clearing the document does NOT win against rule 1. Say so rather than
+  -- letting the badge reappear on the next repaint with no explanation.
+  local residual = by_name and tonumber(by_name) or nil
+  return { ok = true, kb_doc = claimed.kb_doc, number = claimed.number,
+           still_named_pr = residual }
 end
 
 return M

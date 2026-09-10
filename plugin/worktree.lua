@@ -172,6 +172,77 @@ vim.api.nvim_create_user_command("WorktreeGetPR", function(opts)
   end
 end, { nargs = "?", desc = "Worktree: fetch PR branch and create worktree (ADR-0083)" })
 
+-- :WorktreeAssociatePR / :WorktreeDissociatePR (ADR-0083 r10.7)
+--
+-- Both act on the branch checked out at cwd, and on the repo that owns it —
+-- the same resolution :WorktreeGetPR uses, so a cwd inside a repo outside the
+-- inventory is REFUSED rather than silently applied to the first repo.
+local function _cwd_repo_and_branch(cmd)
+  local repos_mod = require("worktree.repos")
+  local repo, rerr = repos_mod.getpr_target_repo(vim.fn.getcwd())
+  if not repo then
+    vim.notify(cmd .. ": " .. tostring(rerr), vim.log.levels.ERROR)
+    return nil
+  end
+  local out = vim.system({ "git", "-C", vim.fn.getcwd(), "rev-parse",
+    "--abbrev-ref", "HEAD" }, { text = true }):wait()
+  local branch = vim.trim(out.stdout or "")
+  if out.code ~= 0 or branch == "" or branch == "HEAD" then
+    vim.notify(cmd .. ": cwd is not on a named branch (detached HEAD?)", vim.log.levels.ERROR)
+    return nil
+  end
+  return repo, branch
+end
+
+vim.api.nvim_create_user_command("WorktreeAssociatePR", function(opts)
+  local repo, branch = _cwd_repo_and_branch("WorktreeAssociatePR")
+  if not repo then return end
+  local pr_mod = require("worktree.pr")
+  local function go(num)
+    local res = pr_mod.associate(repo, branch, num, { reassign = opts.bang })
+    if not res.ok then
+      local msg = "WorktreeAssociatePR: " .. tostring(res.error)
+      if res.code == "conflict" then
+        msg = msg .. " — re-run with ! to re-point it"
+      end
+      vim.notify(msg, vim.log.levels.ERROR)
+      return
+    end
+    local note = string.format("WorktreeAssociatePR: %s is now PR #%s",
+      branch, tostring(res.pr and res.pr.number or num))
+    if res.reassigned_from then
+      note = note .. string.format(" (released from #%s)", tostring(res.reassigned_from))
+    end
+    vim.notify(note, vim.log.levels.INFO)
+    if res.stub then vim.notify("WorktreeAssociatePR: " .. tostring(res.reason), vim.log.levels.WARN) end
+  end
+  local n = tonumber(opts.args)
+  if n then
+    go(n)
+  else
+    vim.ui.input({ prompt = string.format("Associate %s with PR #: ", branch) }, function(input)
+      if input and vim.trim(input) ~= "" then go(vim.trim(input)) end
+    end)
+  end
+end, { bang = true, nargs = "?", desc = "Worktree: associate the cwd branch with a PR (! to re-point)" })
+
+vim.api.nvim_create_user_command("WorktreeDissociatePR", function()
+  local repo, branch = _cwd_repo_and_branch("WorktreeDissociatePR")
+  if not repo then return end
+  local res = require("worktree.pr").dissociate(repo, branch)
+  if not res.ok then
+    vim.notify("WorktreeDissociatePR: " .. tostring(res.error), vim.log.levels.ERROR)
+    return
+  end
+  vim.notify(string.format("WorktreeDissociatePR: %s released from PR #%s",
+    branch, tostring(res.number)), vim.log.levels.INFO)
+  if res.still_named_pr then
+    vim.notify(string.format(
+      "WorktreeDissociatePR: the branch is still NAMED pr-%s, so it stays associated by name — rename it to fully release",
+      tostring(res.still_named_pr)), vim.log.levels.WARN)
+  end
+end, { desc = "Worktree: release the cwd branch from its PR" })
+
 vim.api.nvim_create_user_command("WorktreeCreatePR", function(opts)
   local repos_mod = require("worktree.repos")
   local root_repos = repos_mod.repos()

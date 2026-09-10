@@ -693,6 +693,176 @@ do
   repos_mod.repos = saved_repos
 end
 
+-- 5j. associate / dissociate — binding an EXISTING branch to a PR (r10.7).
+--
+-- Until now an association could only be made as a side effect of GetPR or
+-- CreatePR, so a branch that already had a PR (opened with `gh` outside nvim,
+-- or renamed) could be bound only by hand-editing the KB document.
+--
+-- Every cell asserts through the CONSUMER (`find_for_worktree`) wherever the
+-- claim is "this is now associated" — the point of the verb is the badge, not
+-- the file.
+local function assoc_fixture(name)
+  -- A real repo, because associate REFUSES a branch git cannot resolve; a
+  -- fixture that skipped this would pass while asserting nothing about it.
+  local dir = vim.fn.tempname() .. "-" .. name
+  vim.fn.mkdir(dir, "p")
+  local function g(...) return vim.fn.system({ "git", "-C", dir,
+    "-c", "user.email=t@t", "-c", "user.name=t", ... }) end
+  vim.fn.system({ "git", "-C", dir, "init", "-q", "-b", "main" })
+  vim.fn.writefile({ "x" }, dir .. "/f.txt"); g("add", "."); g("commit", "-qm", "c1")
+  g("branch", "feat/widget-x"); g("branch", "pr-7"); g("branch", "spare")
+  return dir
+end
+
+do
+  local kb = vim.fn.tempname() .. "-kb-assoc"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+
+  local dir = assoc_fixture("assoc")
+  local slug = "acme__assoc"
+  local repo = { slug = slug, path = dir, url = "git@github.com:acme/assoc.git",
+                 remote = "git@github.com:acme/assoc.git" }
+
+  -- (1) No credential: an unverified STUB, flagged, and the badge appears.
+  local res = pr_mod.associate(repo, "feat/widget-x", 42)
+  ok("5j: *** associate with no token writes an unverified stub ***",
+    res.ok == true and res.stub == true, vim.inspect(res))
+  ok("5j: the stub says WHY it is unverified and how to fix it",
+    type(res.reason) == "string" and res.reason:find("WorktreeAuth", 1, true) ~= nil,
+    tostring(res.reason))
+  local found = pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" })
+  ok("5j: *** the branch is now PR #42 to find_for_worktree ***",
+    found ~= nil and tostring(found.number) == "42", vim.inspect(found))
+  ok("5j: an unrelated branch is still unassociated",
+    pr_mod.find_for_worktree(repo, { branch = "main" }) == nil)
+
+  -- (2) Refusals, by CODE not by message text.
+  local bad = pr_mod.associate(repo, "feat/widget-x", "not-a-number")
+  ok("5j: a non-numeric PR is refused with code bad_number",
+    bad.ok == false and bad.code == "bad_number", vim.inspect(bad))
+  local ghost = pr_mod.associate(repo, "no/such/branch", 43)
+  ok("5j: *** a branch git cannot resolve is refused (no_such_branch) ***",
+    ghost.ok == false and ghost.code == "no_such_branch", vim.inspect(ghost))
+  ok("5j: and refusing it wrote nothing",
+    pr_mod.find_for_worktree(repo, { branch = "no/such/branch" }) == nil)
+
+  -- (3) One branch, one PR. A second claim needs an explicit re-point.
+  local clash = pr_mod.associate(repo, "feat/widget-x", 99)
+  ok("5j: *** a second PR for the same branch is refused (conflict) ***",
+    clash.ok == false and clash.code == "conflict"
+      and tostring(clash.conflict and clash.conflict.number) == "42", vim.inspect(clash))
+  ok("5j: the refused re-point left #42 in place",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }).number) == "42")
+
+  local moved = pr_mod.associate(repo, "feat/widget-x", 99, { reassign = true })
+  ok("5j: reassign=true re-points the branch", moved.ok == true, vim.inspect(moved))
+  ok("5j: it reports which PR it was released from",
+    tostring(moved.reassigned_from) == "42", tostring(moved.reassigned_from))
+  ok("5j: *** the branch now resolves to #99, not #42 ***",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }).number) == "99")
+  -- Specificity: the OLD document must have released the branch, or two
+  -- documents claim it and the badge depends on glob order.
+  local still_42 = false
+  for _, d in ipairs(pr_mod.kb_docs(repo)) do
+    if tostring(d.fields.number) == "42" and d.fields.branch == "feat/widget-x" then still_42 = true end
+  end
+  ok("5j: *** the released document no longer claims the branch ***", still_42 == false)
+
+  -- (4) An explicit association beats the pr-<N> naming convention.
+  --
+  -- The fixture has to be ADVERSARIAL to test this at all. `globpath` returns
+  -- lexical order, so associating `pr-7` with #12 proves nothing: `pr-12.md`
+  -- sorts first and wins under first-match-wins too — the cell passes on sort
+  -- order, not on precedence (caught by falsification: reverting the rule left
+  -- it green). The discriminating shape needs the NAME-matching document
+  -- (`pr-7.md`) to be reached BEFORE the BRANCH-matching one, so: give #7 to a
+  -- different branch, then associate `pr-7` with #8. `pr-7.md` < `pr-8.md`.
+  local other7 = pr_mod.associate(repo, "main", 7)
+  ok("5j: (fixture) #7 belongs to another branch, so pr-7.md exists and sorts first",
+    other7.ok == true, vim.inspect(other7))
+  local named = pr_mod.associate(repo, "pr-7", 8)
+  ok("5j: a pr-<N>-named branch can be associated with a different PR", named.ok == true,
+    vim.inspect(named))
+  ok("5j: *** the document wins over the branch NAME (#8, not #7) ***",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "pr-7" }).number) == "8",
+    vim.inspect(pr_mod.find_for_worktree(repo, { branch = "pr-7" })))
+
+  -- (5) dissociate
+  local rel = pr_mod.dissociate(repo, "feat/widget-x")
+  ok("5j: dissociate releases the branch", rel.ok == true and tostring(rel.number) == "99",
+    vim.inspect(rel))
+  ok("5j: *** and find_for_worktree no longer sees a PR ***",
+    pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" }) == nil)
+  ok("5j: dissociating an unassociated branch is refused, not a silent no-op",
+    (function() local r = pr_mod.dissociate(repo, "spare")
+       return r.ok == false and r.code == "not_associated" end)())
+
+  -- A pr-<N>-named branch falls BACK to its name once its document releases.
+  -- Reporting plain success there would be a lie: the badge stays.
+  local rel7 = pr_mod.dissociate(repo, "pr-7")
+  ok("5j: releasing a pr-<N> branch's document succeeds", rel7.ok == true, vim.inspect(rel7))
+  ok("5j: *** but it says the NAME still associates it ***",
+    rel7.still_named_pr == 7, vim.inspect(rel7))
+  ok("5j: and the badge really does come back as #7 (the warning is true)",
+    tostring(pr_mod.find_for_worktree(repo, { branch = "pr-7" }).number) == "7")
+  local named_only = pr_mod.dissociate(repo, "pr-7")
+  ok("5j: dissociating a name-only association is refused with a rename instruction",
+    named_only.ok == false and named_only.code == "branch_name_association"
+      and tostring(named_only.error):find("rename", 1, true) ~= nil, vim.inspect(named_only))
+
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
+do
+  -- (6) WITH a credential: the full forge record, and a forge refusal is not
+  -- papered over with a stub.
+  local kb = vim.fn.tempname() .. "-kb-assoc2"
+  local saved_kb = vim.env.AUTO_AGENTS_KB_ROOT
+  vim.env.AUTO_AGENTS_KB_ROOT = kb
+  local dir = assoc_fixture("assoc2")
+  local slug = "acme__assoc2"
+  local repo = { slug = slug, path = dir, url = "git@github.com:acme/assoc2.git",
+                 remote = "git@github.com:acme/assoc2.git" }
+  creds.set_profile(slug, { kind = "in_memory", token = "tok" })
+
+  pr_mod._mock_http = function(method, url)
+    if method == "GET" and url:find("/pulls/55$") then
+      return 200, vim.json.encode({ number = 55, title = "Real One", body = "b",
+        state = "open", draft = false,
+        base = { ref = "develop", sha = "aaaa000000000000000000000000000000000000" },
+        head = { ref = "feat/widget-x", sha = "bbbb" }, user = { login = "johno" } })
+    end
+    return 404, '{"message":"Not Found"}'
+  end
+
+  local full = pr_mod.associate(repo, "feat/widget-x", 55)
+  ok("5j: *** with a token the record is the forge's, not a stub ***",
+    full.ok == true and full.stub ~= true, vim.inspect(full))
+  local f = pr_mod.find_for_worktree(repo, { branch = "feat/widget-x" })
+  ok("5j: the association carries the forge title", f and f.title == "Real One", vim.inspect(f))
+  ok("5j: and the authoritative base + base_sha, so a range diff is real",
+    f and f.base == "develop" and f.base_sha == "aaaa000000000000000000000000000000000000",
+    vim.inspect(f))
+
+  local gone = pr_mod.associate(repo, "pr-7", 404)
+  ok("5j: *** a PR the forge denies is REFUSED, never stubbed ***",
+    gone.ok == false and gone.code == "forge_refused", vim.inspect(gone))
+  ok("5j: and nothing was written for it",
+    pr_mod.find_for_worktree(repo, { branch = "pr-7" }) ~= nil
+      and tostring(pr_mod.find_for_worktree(repo, { branch = "pr-7" }).number) == "7",
+    "pr-7 should still resolve by NAME only")
+
+  pr_mod._mock_http = nil
+  creds.clear_profile(slug)
+  vim.fn.delete(dir, "rf")
+  vim.env.AUTO_AGENTS_KB_ROOT = saved_kb
+  vim.fn.delete(kb, "rf")
+end
+
 -- 6. dissociate_review validation
 local test_rev_doc = {
   sha = "931d6c5",
