@@ -545,6 +545,16 @@ function M.amend_pr_association(path, pr)
     -- about identity that can disagree with where the file lives). The
     -- directory is the one source that cannot be wrong about itself.
     local slug = path:match("/reviews/([^/]+)/[^/]+$")
+    -- A path outside the canonical layout is REFUSED rather than checked
+    -- loosely. Passing a nil slug to `validate_pair` does not skip the check —
+    -- it makes it derive the slug from the record's own mutable `repo` fields,
+    -- which is exactly the weaker answer this function exists to avoid. Silent
+    -- downgrade is worse than refusal: the caller would believe it got the
+    -- strong check.
+    if not slug then
+      return false, "refusing to attach a PR to a review outside the review "
+        .. "store (expected .../reviews/<slug>/<file>): " .. path
+    end
     local pok, pproblems = M.validate_pair(data, { slug = slug })
     if not pok then
       return false, "refusing to attach a PR to an unpaired review: "
