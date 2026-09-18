@@ -165,12 +165,23 @@ ok("it amends while the pair is intact",
 -- schema-valid; only the pair is broken.
 vim.fn.delete(paired.document)
 local uok, uerr = review.amend_pr_association(RPATH(3), 22)
-ok("*** amending an UNPAIRED review is refused ***", uok == false, tostring(uerr))
+ok("*** ATTACHING a PR to an UNPAIRED review is refused ***", uok == false, tostring(uerr))
 ok("the refusal says the pair is the problem",
   tostring(uerr):find("unpaired", 1, true) ~= nil, tostring(uerr))
 ok("*** and nothing was written — the earlier pr survives ***",
   (review.load(SLUG, SHA, 3) or {}).pr == 11,
   tostring((review.load(SLUG, SHA, 3) or {}).pr))
+
+-- ── 6b. but CLEARING is always possible ─────────────────────────────
+-- The asymmetry is deliberate. Attaching makes a review postable, so it must
+-- be whole. Clearing makes it unpostable — and refusing to clear would strand
+-- exactly the review that most needs detaching: one whose Markdown is gone,
+-- still naming a PR, with `d` refusing because it is broken.
+local cok, cerr = review.amend_pr_association(RPATH(3), nil)
+ok("*** an UNPAIRED review can still be DISSOCIATED ***", cok, tostring(cerr))
+ok("and the association is gone",
+  (store.read_json(RPATH(3)) or {}).pr == nil,
+  tostring((store.read_json(RPATH(3)) or {}).pr))
 
 io.stdout:write(("\n%d passed, %d failed\n"):format(pass, fail)); io.stdout:flush()
 vim.cmd(fail > 0 and "cq!" or "qa!")

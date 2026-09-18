@@ -526,16 +526,30 @@ function M.amend_pr_association(path, pr)
   -- rewritten here — republishing exactly the unpaired artifact `save` exists
   -- to refuse. Every writer of a canonical review checks both; this one is a
   -- writer.
-  -- The slug comes from the PATH — `reviews/<slug>/<file>` — which is where
-  -- `save` actually put this review. Not from the caller (which could hand us
-  -- a different one) and not from the record's own `repo` fields (which are a
-  -- claim about identity, and can disagree with where the file lives). The
-  -- directory is the one source that cannot be wrong about itself.
-  local slug = path:match("/reviews/([^/]+)/[^/]+$")
-  local pok, pproblems = M.validate_pair(data, { slug = slug })
-  if not pok then
-    return false, "refusing to amend an unpaired review: "
-      .. table.concat(pproblems or {}, "; ")
+  -- The pair check applies to ATTACHING a PR, not to clearing one, and the
+  -- asymmetry is the point rather than an oversight.
+  --
+  -- Attaching makes a review POSTABLE: it is about to be published to a PR, so
+  -- it had better be a whole artifact, and `validate_pair` is what stops an
+  -- unpaired one being republished as if it were.
+  --
+  -- Clearing makes a review UNPOSTABLE. Requiring validity to detach would
+  -- strand the exact case that most needs detaching — a review whose Markdown
+  -- was deleted, still naming a PR, with `d` refusing to disconnect it because
+  -- it is broken. The check would be protecting a PR from an artifact we are
+  -- in the act of disconnecting from it.
+  if pr ~= nil then
+    -- The slug comes from the PATH — `reviews/<slug>/<file>` — which is where
+    -- `save` actually put this review. Not from the caller (which could hand
+    -- us a different one) and not from the record's own `repo` fields (a claim
+    -- about identity that can disagree with where the file lives). The
+    -- directory is the one source that cannot be wrong about itself.
+    local slug = path:match("/reviews/([^/]+)/[^/]+$")
+    local pok, pproblems = M.validate_pair(data, { slug = slug })
+    if not pok then
+      return false, "refusing to attach a PR to an unpaired review: "
+        .. table.concat(pproblems or {}, "; ")
+    end
   end
 
   local wok, werr = store.write_json(path, data)
