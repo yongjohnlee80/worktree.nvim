@@ -492,16 +492,18 @@ local AMENDABLE_FIELD = "pr"
 ---The record is loaded HERE rather than accepted from the caller, so what is
 ---written is the canonical file with one field changed, not whatever table the
 ---caller happened to be holding.
----@param slug string
----@param commit string   full sha of the reviewed commit
----@param revision integer
+---Addressed by PATH, not by (slug, commit, revision). The caller is amending
+---the review it is LOOKING AT, and the panel knows that file by path; deriving
+---a path from an identity instead means a record whose location and identity
+---disagree is either missed or, worse, written somewhere else. One address,
+---no reconstruction.
+---@param path string  the review JSON to amend
 ---@param pr integer|string|nil  the PR number, or nil to clear the association
 ---@return boolean ok, string? err
-function M.amend_pr_association(slug, commit, revision, pr)
-  if type(slug) ~= "string" or type(commit) ~= "string" then
-    return false, "amend_pr_association needs a slug and a commit sha"
+function M.amend_pr_association(path, pr)
+  if type(path) ~= "string" or path == "" then
+    return false, "amend_pr_association needs the path of the review to amend"
   end
-  local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, commit, revision)
   local data, rerr = store.read_json(path)
   if not data then
     return false, rerr or ("no review at " .. path)
@@ -524,6 +526,12 @@ function M.amend_pr_association(slug, commit, revision, pr)
   -- rewritten here — republishing exactly the unpaired artifact `save` exists
   -- to refuse. Every writer of a canonical review checks both; this one is a
   -- writer.
+  -- The slug comes from the PATH — `reviews/<slug>/<file>` — which is where
+  -- `save` actually put this review. Not from the caller (which could hand us
+  -- a different one) and not from the record's own `repo` fields (which are a
+  -- claim about identity, and can disagree with where the file lives). The
+  -- directory is the one source that cannot be wrong about itself.
+  local slug = path:match("/reviews/([^/]+)/[^/]+$")
   local pok, pproblems = M.validate_pair(data, { slug = slug })
   if not pok then
     return false, "refusing to amend an unpaired review: "

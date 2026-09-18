@@ -54,6 +54,10 @@ local store = require("worktree.store")
 
 local SLUG = "owner__repo"
 local SHA = string.rep("c", 40)
+-- Reviews are addressed by PATH: the caller amends the file it is looking at.
+local function RPATH(rev)
+  return store.reviews_dir(SLUG) .. "/" .. review.filename(SLUG, SHA, rev)
+end
 
 -- A paired review on disk: the store refuses an unpaired one, so the document
 -- has to exist before the JSON will be accepted.
@@ -91,7 +95,7 @@ ok("*** and it has NO pr — the defect r11 fixes ***",
   on_disk ~= nil and on_disk.pr == nil, on_disk and tostring(on_disk.pr))
 
 -- ── 1. the missing inverse ──────────────────────────────────────────
-local aok, aerr = review.amend_pr_association(SLUG, SHA, 1, 3522)
+local aok, aerr = review.amend_pr_association(RPATH(1), 3522)
 ok("amend_pr_association attaches a PR to a written review", aok, tostring(aerr))
 ok("and the association is on disk",
   (review.load(SLUG, SHA, 1) or {}).pr == 3522,
@@ -99,10 +103,10 @@ ok("and the association is on disk",
 
 -- ── 2. the same writer clears it (both directions, one path) ────────
 ok("the same writer clears the association",
-  select(1, review.amend_pr_association(SLUG, SHA, 1, nil)))
+  select(1, review.amend_pr_association(RPATH(1), nil)))
 ok("and the pr key is gone, not set to something falsy",
   (review.load(SLUG, SHA, 1) or {}).pr == nil)
-review.amend_pr_association(SLUG, SHA, 1, 3522)
+review.amend_pr_association(RPATH(1), 3522)
 
 -- ── 3. GUARD THE PREMISE: content is unreachable through this path ──
 -- The premise of the exemption is that `pr` is routing metadata and this path
@@ -131,18 +135,18 @@ ok("*** and the original findings survive the attempt ***",
   (review.load(SLUG, SHA, 1) or {}).summary)
 
 -- ── 5. refusals are reported, not silent ────────────────────────────
-local mok, merr = review.amend_pr_association(SLUG, string.rep("f", 40), 1, 1)
+local mok, merr = review.amend_pr_association(store.reviews_dir(SLUG) .. "/nope.json", 1)
 ok("amending a review that does not exist fails with a reason",
   mok == false and merr ~= nil, tostring(merr))
-local bok, berr = review.amend_pr_association(nil, SHA, 1, 1)
-ok("a missing slug fails with a reason", bok == false and berr ~= nil, tostring(berr))
+local bok, berr = review.amend_pr_association(nil, 1)
+ok("a missing path fails with a reason", bok == false and berr ~= nil, tostring(berr))
 
 -- A structurally broken record is not silently rewritten just because we
 -- touched one field of it.
 vim.fn.mkdir(store.reviews_dir(SLUG), "p")
 local broken = store.reviews_dir(SLUG) .. "/" .. review.filename(SLUG, SHA, 2)
 vim.fn.writefile({ vim.json.encode({ schema = "worktree.review/1" }) }, broken)
-local iok, ierr = review.amend_pr_association(SLUG, SHA, 2, 9)
+local iok, ierr = review.amend_pr_association(RPATH(2), 9)
 ok("an invalid review is refused rather than rewritten",
   iok == false and ierr ~= nil, tostring(ierr))
 
@@ -155,12 +159,12 @@ local paired = make(3, "pair intact")
 local p3 = review.save(SLUG, paired)
 ok("a third review is on disk, paired", p3 ~= nil)
 ok("it amends while the pair is intact",
-  select(1, review.amend_pr_association(SLUG, SHA, 3, 11)))
+  select(1, review.amend_pr_association(RPATH(3), 11)))
 
 -- Delete the Markdown out from under it. The JSON is untouched and still
 -- schema-valid; only the pair is broken.
 vim.fn.delete(paired.document)
-local uok, uerr = review.amend_pr_association(SLUG, SHA, 3, 22)
+local uok, uerr = review.amend_pr_association(RPATH(3), 22)
 ok("*** amending an UNPAIRED review is refused ***", uok == false, tostring(uerr))
 ok("the refusal says the pair is the problem",
   tostring(uerr):find("unpaired", 1, true) ~= nil, tostring(uerr))
