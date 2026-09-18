@@ -1047,8 +1047,23 @@ do
     kept ~= nil and kept.summary == "FIRST summary", kept and kept.summary)
   ok("10d-r1: the refusal names the revision so the caller can bump",
     tostring(ierr):match("r1") ~= nil or tostring(ierr):match("revision") ~= nil, tostring(ierr))
-  ok("10d-r1: an explicit overwrite is still possible for a deliberate amend",
-    review.save("immut__repo", _smoke_pair(imm2, "immut__repo"), { overwrite = true }) ~= nil)
+  -- r11: the generic `overwrite` escape hatch is GONE. It could rewrite any
+  -- field of a written review, so the one legitimate amendment — attaching a PR
+  -- number — rested on every caller choosing to touch only that field. A caller
+  -- being careful is a convention, not a mechanism.
+  ok("10d-r1: *** there is no overwrite escape hatch left — the option is inert ***",
+    review.save("immut__repo", _smoke_pair(imm2, "immut__repo"),
+      { overwrite = true }) == nil)
+  local amok, amerr = review.amend_pr_association("immut__repo", imm.commit, 1, 4242)
+  ok("10d-r1: the PR cross-reference CAN still be amended", amok, tostring(amerr))
+  local amended = review.load("immut__repo", imm.commit, 1)
+  ok("10d-r1: and the amend is on disk", amended and tostring(amended.pr) == "4242",
+    amended and tostring(amended.pr))
+  ok("10d-r1: *** while the reviewer's findings are untouched ***",
+    amended and amended.summary == "FIRST summary", amended and amended.summary)
+  ok("10d-r1: the association can be cleared again",
+    select(1, review.amend_pr_association("immut__repo", imm.commit, 1, nil))
+      and (review.load("immut__repo", imm.commit, 1) or {}).pr == nil)
 
   -- save_next claims atomically, so two agents cannot both take rN.
   local nx = vim.deepcopy(r); nx.commit = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef"
@@ -1626,12 +1641,21 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   local kept = review.load("toctou__repo", string.rep("a", 40), 1)
   ok("14a: and the original review is intact",
     kept ~= nil and kept.summary == "S1", kept and kept.summary)
-  ok("14a: CONTROL — an explicit overwrite still replaces deliberately",
+  -- r11: this control used to prove an explicit overwrite REPLACED the review,
+  -- summary and all. That capability is removed, so the control now proves the
+  -- opposite — a content amendment cannot be expressed at all — and that the
+  -- one permitted amendment still works.
+  ok("14a: CONTROL — a content replace is no longer possible",
     review.save("toctou__repo", _smoke_pair((function()
       local r = mkreview(1); r.summary = "AMENDED"; return r
-    end)(), "toctou__repo"), { overwrite = true }) ~= nil)
-  ok("14a: CONTROL — and the amend is what is now on disk",
-    (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "AMENDED")
+    end)(), "toctou__repo"), { overwrite = true }) == nil)
+  ok("14a: CONTROL — and the original summary survives",
+    (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "S1")
+  ok("14a: CONTROL — the PR cross-reference amends through the narrow writer",
+    select(1, review.amend_pr_association("toctou__repo", string.rep("a", 40), 1, 77)))
+  ok("14a: CONTROL — and that is what changed, nothing else",
+    (review.load("toctou__repo", string.rep("a", 40), 1) or {}).pr == 77
+      and (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "S1")
 
   -- ── #4: the validation gaps r1 asked for and I did not deliver ──
   local function bad(mut)

@@ -57,6 +57,7 @@ M.VERDICTS = {
 ---@field created string?
 ---@field verdict string?      approved | change_requested | comment
 ---@field summary string?
+---@field pr integer|string?   the PR this review posts to; see amend_pr_association
 ---@field comments WorktreeReviewComment[]
 
 ---filename builds the canonical name. `short` is the abbreviated sha as git
@@ -404,14 +405,22 @@ end
 ---save writes a review, refusing an invalid one. Writing a malformed review
 ---would leave a file the panel cannot render and the uploader cannot use.
 ---
----A review already on disk is IMMUTABLE. `review-json` §3 says a re-review is
----a new revision, never an edit, but nothing enforced that: this wrote the
----canonical path unconditionally and `fs_rename` replaces, so saving r1 twice
----destroyed the first review and returned success to both writers (r1 MF2).
----Pass `{ overwrite = true }` for a deliberate amend of your own file.
+---A review already on disk is IMMUTABLE, and there is no longer any way to ask
+---this function to replace one. `review-json` §3 says a re-review is a new
+---revision, never an edit, but nothing enforced that: this wrote the canonical
+---path unconditionally and `fs_rename` replaces, so saving r1 twice destroyed
+---the first review and returned success to both writers (r1 MF2).
+---
+---An `{ overwrite = true }` escape hatch used to sit here for "a deliberate
+---amend of your own file". It is REMOVED (r11). It could rewrite any field of
+---a written review -- findings, verdict, summary -- so the one legitimate
+---amendment we have, attaching a PR number, could not be narrowed by the
+---caller being careful: a caller being careful is a convention, not a
+---mechanism. `amend_pr_association` replaces it and can change exactly one
+---field. Nothing in either repo asked for broader amendment.
 ---@param slug string
 ---@param review WorktreeReview
----@param opts { overwrite: boolean? }?
+---@param opts table?
 ---@return string? path, string? err
 function M.save(slug, review, opts)
   -- A PRIMITIVE, not the supported writer (ADR-0067 §2.5). `save_pair` is.
@@ -441,28 +450,77 @@ function M.save(slug, review, opts)
   local name = M.filename(slug, review.commit, review.revision)
   local path = dir .. "/" .. name
   local taken_msg = ("revision r%d already exists for this commit — a re-review "
-    .. "is a new revision, never an edit; claim the next one with save_next() "
-    .. "(or pass overwrite=true to amend deliberately): %s")
+    .. "is a new revision, never an edit; claim the next one with save_next(). "
+    .. "A written review cannot be replaced: the only amendment is "
+    .. "amend_pr_association(), which changes the PR cross-reference and "
+    .. "nothing else: %s")
     :format(review.revision, name)
 
-  if not (opts and opts.overwrite) then
-    -- CLAIM, not check-then-write (r2 #2). r1 said a pre-write `fs_stat` was
-    -- not enough; I acted on that only in `save_next` and left this path as
-    -- stat-then-replacing-write, so two writers that both observed absence both
-    -- returned success and the later rename destroyed the earlier review.
-    -- Reproduced with a real second process. The exclusive create IS the gate.
-    local ok_enc, encoded = pcall(store.encode_pretty, review)
-    if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
-    local claimed, cerr = store.create_exclusive(path, encoded)
-    if claimed then return path, nil end
-    if cerr then return nil, cerr end
-    return nil, taken_msg          -- claimed=false with no err means "taken"
+  -- CLAIM, not check-then-write (r2 #2). r1 said a pre-write `fs_stat` was
+  -- not enough; I acted on that only in `save_next` and left this path as
+  -- stat-then-replacing-write, so two writers that both observed absence both
+  -- returned success and the later rename destroyed the earlier review.
+  -- Reproduced with a real second process. The exclusive create IS the gate.
+  --
+  -- There is no branch past it. Every write through this function is a claim,
+  -- so a written review cannot be replaced here at all (r11).
+  local ok_enc, encoded = pcall(store.encode_pretty, review)
+  if not ok_enc then return nil, "encode failed: " .. tostring(encoded) end
+  local claimed, cerr = store.create_exclusive(path, encoded)
+  if claimed then return path, nil end
+  if cerr then return nil, cerr end
+  return nil, taken_msg            -- claimed=false with no err means "taken"
+end
+
+---AMENDABLE_FIELD is the entire set of fields a written review may acquire or
+---lose after the fact: one, and it is a cross-reference rather than content.
+---
+---`pr` names where a finished review should be POSTED. It is routing metadata,
+---not a finding — ADR-0067's immutability protects what a reviewer wrote, and
+---was never argued about the destination address.
+local AMENDABLE_FIELD = "pr"
+
+---amend_pr_association attaches a PR number to a written review, or clears it.
+---
+---This is the ONLY way a review on disk changes after it is written, and it is
+---narrow by construction rather than by convention: the caller passes a PR
+---number, never a review body, so there is no parameter through which a
+---finding, verdict or summary could be rewritten. That distinction is the whole
+---point — an earlier design routed this through a generic `overwrite` writer
+---and would have rested on every caller choosing to touch only `pr`.
+---
+---The record is loaded HERE rather than accepted from the caller, so what is
+---written is the canonical file with one field changed, not whatever table the
+---caller happened to be holding.
+---@param slug string
+---@param commit string   full sha of the reviewed commit
+---@param revision integer
+---@param pr integer|string|nil  the PR number, or nil to clear the association
+---@return boolean ok, string? err
+function M.amend_pr_association(slug, commit, revision, pr)
+  if type(slug) ~= "string" or type(commit) ~= "string" then
+    return false, "amend_pr_association needs a slug and a commit sha"
+  end
+  local path = store.reviews_dir(slug) .. "/" .. M.filename(slug, commit, revision)
+  local data, rerr = store.read_json(path)
+  if not data then
+    return false, rerr or ("no review at " .. path)
   end
 
-  -- An explicit amend IS a replace, so the replacing write belongs here.
-  local wok, werr = store.write_json(path, review)
-  if not wok then return nil, werr end
-  return path, nil
+  data[AMENDABLE_FIELD] = (pr ~= nil) and pr or nil
+
+  -- Re-validate the amended record. Attaching a PR cannot break the schema or
+  -- the pair, but a file that was already broken should not be rewritten
+  -- silently just because we touched one field of it.
+  local vok, problems = M.validate(data)
+  if not vok then
+    return false, "refusing to amend an invalid review: "
+      .. table.concat(problems or {}, "; ")
+  end
+
+  local wok, werr = store.write_json(path, data)
+  if not wok then return false, werr end
+  return true, nil
 end
 
 ---save_next claims the next free revision for this commit and writes it,
