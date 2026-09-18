@@ -827,6 +827,10 @@ do
   local store  = require("worktree.store")
   local watch  = require("worktree.watch")
   local review = require("worktree.review")
+  -- r11: reviews are amended by PATH — the caller amends the file it holds.
+  local function review_path(slug, sha, rev)
+    return store.reviews_dir(slug) .. "/" .. review.filename(slug, sha, rev)
+  end
 
 
   local repos  = require("worktree.repos")
@@ -1054,7 +1058,7 @@ do
   ok("10d-r1: *** there is no overwrite escape hatch left — the option is inert ***",
     review.save("immut__repo", _smoke_pair(imm2, "immut__repo"),
       { overwrite = true }) == nil)
-  local amok, amerr = review.amend_pr_association("immut__repo", imm.commit, 1, 4242)
+  local amok, amerr = review.amend_pr_association(review_path("immut__repo", imm.commit, 1), 4242)
   ok("10d-r1: the PR cross-reference CAN still be amended", amok, tostring(amerr))
   local amended = review.load("immut__repo", imm.commit, 1)
   ok("10d-r1: and the amend is on disk", amended and tostring(amended.pr) == "4242",
@@ -1062,7 +1066,7 @@ do
   ok("10d-r1: *** while the reviewer's findings are untouched ***",
     amended and amended.summary == "FIRST summary", amended and amended.summary)
   ok("10d-r1: the association can be cleared again",
-    select(1, review.amend_pr_association("immut__repo", imm.commit, 1, nil))
+    select(1, review.amend_pr_association(review_path("immut__repo", imm.commit, 1), nil))
       and (review.load("immut__repo", imm.commit, 1) or {}).pr == nil)
 
   -- save_next claims atomically, so two agents cannot both take rN.
@@ -1605,6 +1609,10 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   local store = require("worktree.store")
   local review = require("worktree.review")
   local watch = require("worktree.watch")
+  -- r11: reviews are amended by PATH (scoped per block, like the requires above).
+  local function review_path(slug, sha, rev)
+    return store.reviews_dir(slug) .. "/" .. review.filename(slug, sha, rev)
+  end
   local uv = vim.uv or vim.loop
   local root = vim.fn.tempname() .. "-r2"
   vim.fn.mkdir(root, "p")
@@ -1652,7 +1660,7 @@ print("\n[14] ADR-0060 r2 — save atomicity, validation gaps, prune honesty")
   ok("14a: CONTROL — and the original summary survives",
     (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "S1")
   ok("14a: CONTROL — the PR cross-reference amends through the narrow writer",
-    select(1, review.amend_pr_association("toctou__repo", string.rep("a", 40), 1, 77)))
+    select(1, review.amend_pr_association(review_path("toctou__repo", string.rep("a", 40), 1), 77)))
   ok("14a: CONTROL — and that is what changed, nothing else",
     (review.load("toctou__repo", string.rep("a", 40), 1) or {}).pr == 77
       and (review.load("toctou__repo", string.rep("a", 40), 1) or {}).summary == "S1")
