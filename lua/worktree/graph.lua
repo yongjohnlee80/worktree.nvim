@@ -1294,12 +1294,9 @@ function M.open()
   if type(core.git.graph.invalidate_fan_out) == "function" then
     pcall(core.git.graph.invalidate_fan_out, state.root)
   end
-  state.repos = core.git.graph.fan_out(state.root, { max_depth = 3 })
-  if #state.repos == 0 then
-    log("no git repositories found under " .. state.root,
-      vim.log.levels.WARN)
-    return
-  end
+  -- Discovery is NOT run here any more; see the loading state below. The float
+  -- is built and painted first, and the repo list arrives into it.
+  state.repos = {}
   state.selected = nil
 
   state.mfloat = core.ui.float.multi.new({
@@ -1343,22 +1340,80 @@ function M.open()
   })
   state.mfloat:open()
 
-  render_left()
-  bind_left_keys()
-  -- Bind action keys (Tab/S-Tab/<C-h>/<C-l>/f/F/p) to the preview
-  -- pane buffer so the user can navigate AWAY from preview without
-  -- closing the panel. Without this, pressing Tab from preview was
-  -- a no-op (auto-core.ui.float.multi only stamps q/<Esc> per pane;
-  -- consumer binds the rest). Preview's bufnr is stable across
-  -- cursor moves (we only update its content via nvim_buf_set_lines),
-  -- so binding once at open is enough.
-  do
-    local pv_buf = state.mfloat:bufnr("preview")
-    if pv_buf then bind_pane_action_keys(pv_buf) end
+  -- ── the loading state (ADR-0193) ──────────────────────────────────
+  --
+  -- Discovery spawns two git processes per repository directory found, and the
+  -- graph draw reads `git log --all` to completion. Run before this point they
+  -- cost seconds during which the terminal shows nothing at all, because Neovim
+  -- does not flush a redraw between two synchronous statements in one call
+  -- stack: moving the work below `mfloat:open()` textually would change
+  -- nothing. The yield is what makes the float appear.
+  --
+  -- Shape borrowed from `update_preview_now` (ADR-0041 Batch A), which solved
+  -- this one level down for the preview pane: placeholder first, generation
+  -- counter captured at call time, liveness guards in the callback.
+  M._open_generation = (M._open_generation or 0) + 1
+  local gen = M._open_generation
+
+  set_buf_lines(state.mfloat:bufnr("left"), {
+    string.format(" Repos — %s", vim.fn.fnamemodify(state.root or "", ":~")),
+    "",
+    "  (scanning…)",
+  })
+  set_buf_lines(state.mfloat:bufnr("middle"), { "", "  (loading commit graph…)" })
+
+  ---still_current answers "is this callback's work still wanted?" — the panel
+  ---can be closed, or reopened onto a different root, while git is running.
+  local function still_current()
+    return state.mfloat ~= nil and M._open_generation == gen
   end
-  -- First repo selection so the middle/preview panes have content.
-  select_repo(1)
+
+  ---after_repos runs on the main loop once discovery resolves.
+  local function after_repos(repos)
+    if not still_current() then return end
+    state.repos = repos or {}
+    if #state.repos == 0 then
+      -- The float is already open by the time we know this, so the empty case
+      -- closes it rather than returning early as it used to.
+      log("no git repositories found under " .. state.root, vim.log.levels.WARN)
+      M.close()
+      return
+    end
+    render_left()
+    bind_left_keys()
+    do
+      local pv = state.mfloat:bufnr("preview")
+      if pv then bind_pane_action_keys(pv) end
+    end
+    -- A second yield before the graph draw: `gitgraph.draw` reads `git log
+    -- --all` synchronously and is third-party (wrapped, not forked), so it
+    -- still blocks when it runs — but the repo list is painted before it does,
+    -- instead of after everything.
+    vim.schedule(function()
+      if not still_current() then return end
+      select_repo(1)
+    end)
+  end
+
+  local fan_async = core.git.graph.fan_out_async
+  if type(fan_async) == "function" then
+    -- auto-core >= the release carrying fan_out_async: genuinely off-loop.
+    fan_async(state.root, { max_depth = 3 }, function(repos)
+      vim.schedule(function() after_repos(repos) end)
+    end)
+  else
+    -- Soft dependency, the same shape `update_preview_now` uses for
+    -- `show_stat_async`: an older auto-core still works, and still paints the
+    -- float first — the scan blocks once it starts, but the panel is up and
+    -- says what it is doing.
+    vim.schedule(function()
+      if not still_current() then return end
+      local okr, repos = pcall(core.git.graph.fan_out, state.root, { max_depth = 3 })
+      after_repos(okr and repos or {})
+    end)
+  end
 end
+
 
 ---Bind action keys to the middle pane buffer. Called after each
 ---gitgraph draw because gitgraph creates a new buffer per draw, so

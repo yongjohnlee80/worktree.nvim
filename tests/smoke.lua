@@ -422,14 +422,32 @@ end
 wt.graph.set_root(repo_path)
 wt.graph.open()
 
--- Toggle remote branches synchronously
-vim.api.nvim_feedkeys("R", "xt", false)
-
+-- `open()` now paints the float first and fills it once discovery resolves
+-- (ADR-0193), so the repo list is NOT present the instant open() returns.
+-- Reading immediately here used to work only because everything was
+-- synchronous; it would now read the "(scanning…)" placeholder and report a
+-- missing branch that is merely not-yet-arrived. Poll for the observable
+-- instead, the same shape section 9 already uses for the async preview.
 local mfloat = core.ui.float.multi.get("worktree.graph")
 local left_win = mfloat:winid("left")
-local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(left_win), 0, -1, false)
+local function left_lines()
+  if not (left_win and vim.api.nvim_win_is_valid(left_win)) then return {} end
+  return vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(left_win), 0, -1, false)
+end
+local listed = vim.wait(8000, function()
+  for _, l in ipairs(left_lines()) do
+    if l:find("Repos (", 1, true) then return true end
+  end
+  return false
+end, 25)
+ok("the repo list arrives after the float is painted (ADR-0193)", listed,
+  vim.inspect(left_lines()))
+
+-- Toggle remote branches
+vim.api.nvim_feedkeys("R", "xt", false)
 
 local remote_branch_row = nil
+local lines = left_lines()
 for i, line in ipairs(lines) do
   -- v0.4.5: remote branches now render as `(origin/<branch>)`, the
   -- parens being the only thing distinguishing them from worktree
