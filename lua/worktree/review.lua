@@ -518,6 +518,18 @@ function M.amend_pr_association(slug, commit, revision, pr)
       .. table.concat(problems or {}, "; ")
   end
 
+  -- The PAIR check as well, not the schema check alone. `validate` ignores
+  -- unknown fields and says nothing about the Markdown the JSON points at, so a
+  -- schema-valid record whose document has been deleted would otherwise be
+  -- rewritten here — republishing exactly the unpaired artifact `save` exists
+  -- to refuse. Every writer of a canonical review checks both; this one is a
+  -- writer.
+  local pok, pproblems = M.validate_pair(data, { slug = slug })
+  if not pok then
+    return false, "refusing to amend an unpaired review: "
+      .. table.concat(pproblems or {}, "; ")
+  end
+
   local wok, werr = store.write_json(path, data)
   if not wok then return false, werr end
   return true, nil

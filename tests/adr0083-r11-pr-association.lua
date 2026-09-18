@@ -146,5 +146,27 @@ local iok, ierr = review.amend_pr_association(SLUG, SHA, 2, 9)
 ok("an invalid review is refused rather than rewritten",
   iok == false and ierr ~= nil, tostring(ierr))
 
+-- ── 6. an UNPAIRED review is refused, not rewritten ─────────────────
+-- `validate` ignores unknown fields and says nothing about the Markdown the
+-- JSON points at, so a schema-valid record whose document has been deleted is
+-- still invalid as a PAIR. Amending it would republish exactly the unpaired
+-- artifact `save` refuses to create. (agent:zen, PR #34 r0.)
+local paired = make(3, "pair intact")
+local p3 = review.save(SLUG, paired)
+ok("a third review is on disk, paired", p3 ~= nil)
+ok("it amends while the pair is intact",
+  select(1, review.amend_pr_association(SLUG, SHA, 3, 11)))
+
+-- Delete the Markdown out from under it. The JSON is untouched and still
+-- schema-valid; only the pair is broken.
+vim.fn.delete(paired.document)
+local uok, uerr = review.amend_pr_association(SLUG, SHA, 3, 22)
+ok("*** amending an UNPAIRED review is refused ***", uok == false, tostring(uerr))
+ok("the refusal says the pair is the problem",
+  tostring(uerr):find("unpaired", 1, true) ~= nil, tostring(uerr))
+ok("*** and nothing was written — the earlier pr survives ***",
+  (review.load(SLUG, SHA, 3) or {}).pr == 11,
+  tostring((review.load(SLUG, SHA, 3) or {}).pr))
+
 io.stdout:write(("\n%d passed, %d failed\n"):format(pass, fail)); io.stdout:flush()
 vim.cmd(fail > 0 and "cq!" or "qa!")
