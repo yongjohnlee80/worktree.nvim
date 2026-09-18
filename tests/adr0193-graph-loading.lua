@@ -16,28 +16,37 @@ local plugin_root = vim.fn.fnamemodify(
   vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"), ":h:h")
 vim.opt.runtimepath:prepend(plugin_root)
 -- `:h:h` — plugin_root is a WORKTREE, so one `:h` only reaches the repo dir.
--- Candidates are matched by SYMBOL, not by path: a path proves some copy is
--- there, not that it can serve. This suite needs `fan_out_async`, and an
--- auto-core predating it would take the soft-dep fallback everywhere and pass
--- §1-§5 while never exercising the async path at all.
+-- Candidate order and symbol-matching mirror smoke.lua: a path proves some copy
+-- is there, not that it can serve.
+--
+-- The required symbol is `fan_out_async`. This suite
+-- INSTALLS its own `fan_out_async` stub (that is the whole technique — the
+-- moment discovery resolves has to be controllable), and §6 deletes the field
+-- outright to exercise the soft-dep fallback. So what auto-core itself ships
+-- is irrelevant here, and requiring the newer symbol made this suite fail
+-- against CI's deliberately pinned auto-core while testing nothing extra.
+-- Whether auto-core's real `fan_out_async` works is auto-core's own suite's
+-- job; this one's job is that the CONSUMER drives an async-shaped API
+-- correctly.
 local siblings = vim.fn.fnamemodify(plugin_root, ":h:h")
 local branch_dir = vim.fn.fnamemodify(plugin_root, ":t")
+local LAZY_AC = vim.fn.expand("~/.local/share/nvim/lazy")
 local ac = nil
 for _, c in ipairs({
-  siblings .. "/auto-core.nvim",
+  LAZY_AC .. "/auto-core.nvim",
   siblings .. "/auto-core.nvim/main",
   siblings .. "/auto-core.nvim/" .. branch_dir,
 }) do
   local f = c .. "/lua/auto-core/git/graph.lua"
   if vim.fn.filereadable(f) == 1
       and table.concat(vim.fn.readfile(f), "\n")
-        :find("function M.fan_out_async", 1, true) then
+        :find("function M.fan_out", 1, true) then
     ac = c
   end
 end
 if not ac then
-  io.stdout:write("  FAIL  no auto-core providing fan_out_async under "
-    .. siblings .. "\n")
+  io.stdout:write("  FAIL  no auto-core providing git.graph.fan_out found\n")
+  io.stdout:write("\n0 passed, 1 failed\n")
   vim.cmd("cq!")
 end
 vim.opt.runtimepath:prepend(ac)
@@ -117,18 +126,55 @@ ok("the repo list replaces the placeholder once discovery resolves",
 ok("the placeholder is gone", left_text():find("scanning", 1, true) == nil,
   vim.inspect(left_lines()))
 
--- ── 4. a superseded generation must not overwrite ───────────────────
--- Reopening bumps the generation. The FIRST open's callback, arriving late,
--- must be ignored rather than painting stale content over the new panel.
+-- ── 4. a SUPERSEDED generation must not overwrite a newer open ──────
+-- The ordering matters and an earlier version of this cell got it wrong: it
+-- closed the panel BEFORE firing the late callback, which proves close-safety
+-- and says nothing about an older answer landing on a newer panel. Generation
+-- A must still be PENDING while generation B is on screen.
 wt.graph.close()
 pending = nil
 wt.graph.set_root(root)
 wt.graph.open()
-local late_cb = pending
-ok("a second open started its own discovery", late_cb ~= nil)
+local cb_A = pending                   -- generation A: deliberately left pending
+ok("generation A requested discovery", cb_A ~= nil)
 
+wt.graph.close()
+pending = nil
+wt.graph.set_root(root)
+wt.graph.open()
+local cb_B = pending                   -- generation B: the panel now on screen
+ok("generation B requested its own discovery", cb_B ~= nil and cb_B ~= cb_A)
+ok("B is showing its placeholder", left_text():find("scanning", 1, true) ~= nil,
+  vim.inspect(left_lines()))
+
+-- A answers now, while B's panel is open. Its payload is distinguishable, so
+-- "A painted over B" is observable rather than inferred.
+local STALE = {
+  { common_dir = root .. "/solo/.git", label = "STALE-FROM-A",
+    sample_worktree = root .. "/solo", is_bare = false },
+}
+local a_ok = pcall(function() cb_A(STALE) end)
+ok("a superseded callback does not error", a_ok)
+vim.wait(300, function() return false end, 20)   -- let any scheduled paint run
+ok("the superseded answer did NOT paint over the newer panel",
+  left_text():find("STALE-FROM-A", 1, true) == nil, vim.inspect(left_lines()))
+ok("and B's placeholder is intact, still awaiting its own answer",
+  left_text():find("scanning", 1, true) ~= nil, vim.inspect(left_lines()))
+
+-- B then resolves normally, proving the panel was not left wedged by A.
+cb_B(REPOS)
+vim.wait(3000, function() return left_text():find("Repos (", 1, true) ~= nil end, 20)
+ok("B's own answer still lands after the superseded one was discarded",
+  left_text():find("Repos (", 1, true) ~= nil, vim.inspect(left_lines()))
+
+-- ── 4b. close safety, kept as its own cell ──────────────────────────
+wt.graph.close()
+pending = nil
+wt.graph.set_root(root)
+wt.graph.open()
+local after_close_cb = pending
 wt.graph.close()          -- close before the answer lands
-local closed_ok = pcall(function() if late_cb then late_cb(REPOS) end end)
+local closed_ok = pcall(function() if after_close_cb then after_close_cb(REPOS) end end)
 ok("a callback landing after close does not error", closed_ok)
 ok("and it did not resurrect the panel", not wt.graph.is_open())
 
