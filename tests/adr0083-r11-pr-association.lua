@@ -183,5 +183,32 @@ ok("and the association is gone",
   (store.read_json(RPATH(3)) or {}).pr == nil,
   tostring((store.read_json(RPATH(3)) or {}).pr))
 
+-- ── 7. a NON-CANONICAL path is refused, not checked loosely ─────────
+-- `validate_pair` with a nil slug does not skip the pair check — it derives
+-- the slug from the record's own mutable `repo` fields, the weaker answer this
+-- function exists to avoid. A path outside reviews/<slug>/<file> must be
+-- refused outright, or the caller silently gets the weak check while believing
+-- it got the strong one. (agent:zen, r11 joint review.)
+local odd_dir = vim.fn.tempname() .. "-loose"
+vim.fn.mkdir(odd_dir, "p")
+local odd = odd_dir .. "/stray.review.json"
+local stray = make(5, "a review filed somewhere odd")
+stray.pr = nil
+vim.fn.writefile({ vim.json.encode(stray) }, odd)
+
+local ook, oerr = review.amend_pr_association(odd, 99)
+ok("*** a review outside reviews/<slug>/ is refused an attach ***",
+  ook == false, tostring(oerr))
+ok("the refusal names the layout it expected",
+  tostring(oerr):find("reviews/<slug>/<file>", 1, true) ~= nil, tostring(oerr))
+ok("*** and nothing was written to it ***",
+  (store.read_json(odd) or {}).pr == nil,
+  tostring((store.read_json(odd) or {}).pr))
+
+-- Clearing still works there: detaching is always permitted (see 6b), and a
+-- non-canonical location is no reason to strand an association.
+ok("but clearing is still allowed on such a path",
+  select(1, review.amend_pr_association(odd, nil)))
+
 io.stdout:write(("\n%d passed, %d failed\n"):format(pass, fail)); io.stdout:flush()
 vim.cmd(fail > 0 and "cq!" or "qa!")
