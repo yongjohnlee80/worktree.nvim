@@ -366,6 +366,53 @@ function M.reviews(repo, sha)
   return review.list_for(repo.slug, sha)
 end
 
+---_authorized_review_path proves that `path` is exactly THIS repo's canonical
+---review file, and yields the resolved path plus its parsed identity.
+---
+---ONE resolver for every by-path review operation. The proof below was written
+---for `remove_review` and hardened twice under review; archiving needs the same
+---proof, and a second copy of it is a second place for the two halves to drift
+---apart. `verb` only spells the refusal ("delete", "archive"), and `what` only
+---names the caller in its argument errors — the security-bearing text is shared.
+---@return string? resolved, string? short, integer? rev, string? err
+local function _authorized_review_path(repo, path, what, verb)
+  if not repo or not repo.slug then return nil, nil, nil, what .. ": repo.slug required" end
+  if type(path) ~= "string" or path == "" then return nil, nil, nil, what .. ": path required" end
+  local dir = store.reviews_dir(repo.slug)
+  local resolved = vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
+  local root = vim.fn.resolve(vim.fn.fnamemodify(dir, ":p")):gsub("/$", "")
+  if resolved:sub(1, #root + 1) ~= root .. "/" then
+    return nil, nil, nil, ("refusing to %s outside %s: %s"):format(verb, root, resolved)
+  end
+  -- CONTAINMENT IS NOT IDENTITY, and conflating the two was a cross-repository
+  -- delete. The prefix check above proves WHERE the file sits; the operation is
+  -- keyed on the slug inside its NAME. Those are two different facts, so a
+  -- path under this repo's directory that is NAMED for another repo passed the
+  -- check and then removed the other repo's review — the claimed local file
+  -- did not even have to exist (lector, worktree#4 must-fix, 2026-09-02).
+  --
+  -- So the name's identity is bound to THIS repo, and the authorized path is
+  -- required to be the exact canonical target: one source for the
+  -- authorization and for the effect. `review.remove_path` / `archive_path`
+  -- re-check the same invariant on their own, and both are kept — this one can
+  -- say which repo the caller confused, which a caller can act on.
+  local name = resolved:match("[^/]+$") or resolved
+  local slug, short, rev = review.parse_filename(name)
+  if not (slug and short and rev) then
+    return nil, nil, nil, "not a review filename: " .. name
+  end
+  if slug ~= repo.slug then
+    return nil, nil, nil,
+      ("this review is named for %s, not %s: %s"):format(slug, repo.slug, name)
+  end
+  local canonical = vim.fn.resolve(vim.fn.fnamemodify(
+    dir .. "/" .. review.filename(repo.slug, short, rev), ":p"))
+  if canonical ~= resolved then
+    return nil, nil, nil, "refusing: not this review's canonical location: " .. resolved
+  end
+  return resolved, short, rev
+end
+
 ---remove_review deletes one review JSON and fences its revision (§11.6).
 ---
 ---CONTAINED: the path must resolve inside this repo's own reviews directory.
@@ -376,52 +423,88 @@ end
 ---@param path string
 ---@return boolean ok, string? err, table? detail
 function M.remove_review(repo, path)
-  if not repo or not repo.slug then return false, "remove_review: repo.slug required" end
-  if type(path) ~= "string" or path == "" then return false, "remove_review: path required" end
-  local dir = store.reviews_dir(repo.slug)
-  local resolved = vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
-  local root = vim.fn.resolve(vim.fn.fnamemodify(dir, ":p")):gsub("/$", "")
-  if resolved:sub(1, #root + 1) ~= root .. "/" then
-    return false, "refusing to delete outside " .. root .. ": " .. resolved
-  end
-  -- CONTAINMENT IS NOT IDENTITY, and conflating the two was a cross-repository
-  -- delete. The prefix check above proves WHERE the file sits; the delete is
-  -- keyed on the slug inside its NAME. Those are two different facts, so a
-  -- path under this repo's directory that is NAMED for another repo passed the
-  -- check and then removed the other repo's review — the claimed local file
-  -- did not even have to exist (lector, worktree#4 must-fix, 2026-09-02).
-  --
-  -- So the name's identity is bound to THIS repo, and the authorized path is
-  -- required to be the exact canonical target: one source for the
-  -- authorization and for the effect. `review.remove_path` now re-checks the
-  -- same invariant on its own, and both are kept — this one can say which repo
-  -- the caller confused, which a caller can act on.
-  local name = resolved:match("[^/]+$") or resolved
-  local slug, short, rev = review.parse_filename(name)
-  if not (slug and short and rev) then
-    return false, "not a review filename: " .. name
-  end
-  if slug ~= repo.slug then
-    return false, ("this review is named for %s, not %s: %s"):format(slug, repo.slug, name)
-  end
-  local canonical = vim.fn.resolve(vim.fn.fnamemodify(
-    dir .. "/" .. review.filename(repo.slug, short, rev), ":p"))
-  if canonical ~= resolved then
-    return false, "refusing: not this review's canonical location: " .. resolved
-  end
+  local resolved, _, _, aerr = _authorized_review_path(repo, path, "remove_review", "delete")
+  if not resolved then return false, aerr end
   return review.remove_path(resolved)
+end
+
+---archive_review hides ONE review from the active listing, leaving both halves
+---of the ADR-0067 pair untouched (ADR-0195 D2). It is the REVERSIBLE answer to
+---"this review is dealt with, stop showing it" — the thing `remove_review` was
+---being used for, at the cost of destroying the KB record.
+---
+---Same containment-and-identity proof as the delete. Archiving is reversible, so
+---the stakes are lower, but a proof that only guards the dangerous verb is a
+---proof that has to be remembered; this one is simply always applied.
+---@param repo WorktreeRepo
+---@param path string
+---@return boolean ok, string? err
+function M.archive_review(repo, path)
+  local resolved, _, _, aerr = _authorized_review_path(repo, path, "archive_review", "archive")
+  if not resolved then return false, aerr end
+  return review.archive_path(resolved)
+end
+
+---unarchive_review restores ONE review to the active listing.
+---@param repo WorktreeRepo
+---@param path string
+---@return boolean ok, string? err
+function M.unarchive_review(repo, path)
+  local resolved, _, _, aerr = _authorized_review_path(repo, path, "unarchive_review", "unarchive")
+  if not resolved then return false, aerr end
+  return review.unarchive_path(resolved)
+end
+
+---doctor_archive RECONCILES the marker store: it drops markers whose review no
+---longer exists, and reports every cleanup failure explicitly (ADR-0195 D2).
+---
+---It repairs rather than reports, because the state it deals with is invisible
+---by nature — an orphan marker shadows a review that is not there — and a doctor
+---that only names the problem leaves it exactly as invisible as it found it.
+---
+---Orphans are the designed outcome of a partial delete: `review.remove` unlinks
+---the marker AFTER the pair, so a failure there leaves one behind on purpose,
+---recoverable here. They also come from outside the API — a pair deleted by
+---hand, a clone that dropped the JSON but kept `archived/`.
+---
+---A marker that fails validation over a review that is STILL THERE is reported
+---under `unreadable` and never touched: it is hiding a real review, and dropping
+---it would silently unarchive something the user deliberately hid.
+---@param repo WorktreeRepo
+---@return { dropped: string[], failed: { path: string, err: string }[], unreadable: string[] } result, string? err
+function M.doctor_archive(repo)
+  if not repo or not repo.slug then
+    return { dropped = {}, failed = {}, unreadable = {} }, "doctor_archive: repo.slug required"
+  end
+  return review.reconcile_archive(repo.slug)
+end
+
+---archive_orphans lists orphaned markers WITHOUT repairing anything, for a
+---caller that wants to show the damage before acting on it.
+---@param repo WorktreeRepo
+---@return string[] paths
+function M.archive_orphans(repo)
+  if not repo or not repo.slug then return {} end
+  return review.orphan_markers(repo.slug)
 end
 
 ---reviews_described describes ONE commit's reviews — the rows a commit expands
 ---to, with the severity each carries. `reviews(repo, sha)` stays the cheap
 ---revision listing for callers that need nothing more (the diff view's
 ---annotation merge is one).
+---
+---`opts.include_archived` selects the listing (ADR-0195 D2): `"active"`
+---(default) hides archived reviews, `"archived_only"` shows just those, `"all"`
+---shows both. The DEFAULT is what makes archiving mean anything — a caller that
+---passes nothing gets the hidden-reviews-hidden behaviour, so a panel has to opt
+---IN to seeing them rather than remembering to opt out.
 ---@param repo WorktreeRepo
 ---@param sha string
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
 ---@return table[] reviews
-function M.reviews_described(repo, sha)
+function M.reviews_described(repo, sha, opts)
   if not repo or not repo.slug or not sha then return {} end
-  return review.described_for(repo.slug, sha)
+  return review.described_for(repo.slug, sha, opts)
 end
 
 ---tally_paths merges described reviews into the per-file tally a tree badges
@@ -436,11 +519,16 @@ function M.tally_paths(described) return review.tally_paths(described) end
 ---One directory scan plus a stat per file. The panel draws the section's count
 ---on a collapsed row, and a listing that had to read every document to say "3"
 ---would put a per-repaint cost on a row nobody has expanded.
+---`opts.include_archived` matches `reviews_all`, and the DEFAULT matches too.
+---This is the count the panel draws on the collapsed section row, and it reaches
+---the store by its own cheap path — so an archive that only taught `reviews_all`
+---to hide rows would leave the number above them still counting the hidden ones.
 ---@param repo WorktreeRepo
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
 ---@return { slug: string, short: string, revision: integer, path: string, name: string, mtime: integer }[]
-function M.reviews_index(repo)
+function M.reviews_index(repo, opts)
   if not repo or not repo.slug then return {} end
-  return review.list_all(repo.slug)
+  return review.index_all(repo.slug, opts)
 end
 
 ---reviews_dir is where this repo's reviews are stored, for an info view.
@@ -459,15 +547,17 @@ end
 ---filename, so once history is rewritten `reviews(repo, sha)` can no longer
 ---find it and the file is invisible in the tree — which is precisely when
 ---someone needs to see it and re-point it.
+---`opts.include_archived` selects the listing (ADR-0195 D2), with the same
+---vocabulary and the same "active" default as `reviews_described`. This is the
+---listing the panel's Reviews section reads and counts, so an archive that did
+---not reach HERE would not be an archive at all — the rows would still show and
+---the collapsed count would still include them.
 ---@param repo WorktreeRepo
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
 ---@return table[] reviews   `review.describe` records, most recent first
-function M.reviews_all(repo)
+function M.reviews_all(repo, opts)
   if not repo or not repo.slug then return {} end
-  local out = {}
-  for _, rec in ipairs(review.list_all(repo.slug)) do
-    out[#out + 1] = review.describe(rec.path) or rec
-  end
-  return out
+  return review.described_all(repo.slug, opts)
 end
 
 ---review_meta describes ONE review file by path — what an info view prints.

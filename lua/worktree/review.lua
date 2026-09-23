@@ -1241,6 +1241,11 @@ local function _abs(p)
   return vim.fn.resolve(vim.fn.fnamemodify(tostring(p or ""), ":p"))
 end
 
+-- Forward declaration: the archive-marker validator is defined with the rest
+-- of the archive section below, but `remove` must preflight through the SAME
+-- validator rather than a second, looser check of its own.
+local _marker_state
+
 ---remove deletes a review's canonical JSON and FENCES its revision number.
 ---
 ---The delete ALONE would be wrong. `max_recorded_revision` — the allocator
@@ -1293,6 +1298,49 @@ function M.remove(slug, sha, revision)
     tombstone = M.tombstone_path(slug, sha, rev),
   }
   if merr then detail.describe_error = tostring(merr) end
+
+  -- PREFLIGHT the archive marker WITHOUT mutating it (ADR-0195 D2, ADR-0081 §2.3a).
+  --
+  -- My first cut cleared the marker HERE, before the fence and the unlink, on
+  -- the argument that a reappearing review is a lesser harm than an invisible
+  -- one. Lector was right that this reverses the contract this ADR already
+  -- accepted, and the deciding point is not which wrong state looks worse: a
+  -- pre-clear followed by a failed fence or a failed pair delete SILENTLY
+  -- UNARCHIVES a review the user deliberately hid, and nothing is designed to
+  -- recover that. The approved ordering leaves an ORPHAN MARKER instead, which
+  -- `doctor_archive` exists to reconcile. Prefer the failure mode that already
+  -- has a recovery path over the one that merely looks reversible.
+  --
+  -- Validating here still matters, and it mutates nothing: an unknown marker
+  -- means we cannot say what state this review is in, and destroying a pair in
+  -- that condition is the one thing that cannot be undone. Unknown blocks, and
+  -- blocking costs no bytes.
+  local marker = M.archive_marker_path(slug, sha, rev)
+  local mstate, mserr = _marker_state(slug, sha, rev)
+  if mstate == "unknown" then
+    detail.marker = marker
+    detail.marker_error = tostring(mserr or "unknown")
+    return false, ("the archive marker could not be validated, so NOTHING was "
+      .. "deleted: %s"):format(tostring(mserr or "unknown")), detail
+  end
+  detail.marker_present = (mstate == "valid")
+
+  -- The marker is unlinked LAST, after the pair is gone (D2). A failure here is
+  -- a PARTIAL, not a swallowed error: the pair really is deleted and the
+  -- revision really is fenced, so saying "removed" would be true, and saying
+  -- nothing about the leftover marker would hide the one piece of state that
+  -- outlives the review. `doctor_archive` is the reconciliation for exactly
+  -- this, and the message says so rather than leaving the user to discover it.
+  local function _finish(d)
+    if mstate ~= "valid" then return true, nil, d end
+    local mok, merr = ds.delete(marker)
+    if mok then d.marker_removed = true; return true, nil, d end
+    d.marker = marker
+    d.marker_error = tostring(merr or "unknown")
+    return false, ("the review pair was deleted and the revision fenced, but its "
+      .. "archive marker could not be removed (%s). It remains at %s -- run "
+      .. "doctor_archive to reconcile it."):format(tostring(merr or "unknown"), marker), d
+  end
 
   local tombstoned, terr = M.retire(slug, sha, rev, nil)
   if not tombstoned then
@@ -1357,7 +1405,7 @@ function M.remove(slug, sha, revision)
       -- noted so a caller that wants to log it can.
       detail.document_absent = true
       detail.document_searched = true
-      return true, nil, detail
+      return _finish(detail)
     end
     detail.document_unknown = true
     detail.document_candidates = left
@@ -1417,7 +1465,7 @@ function M.remove(slug, sha, revision)
     end
   end
   detail.json_removed, detail.fenced = true, true
-  return true, nil, detail
+  return _finish(detail)
 end
 
 ---remove_path is `remove` addressed by FILE, which is how a panel row knows a
@@ -1456,13 +1504,420 @@ end
 ---described_for is `list_for` with every file described — the shape a tree needs
 ---to render a commit's review rows AND to badge its changed files, from ONE
 ---read pass over the documents.
+---`opts.include_archived` selects which reviews are listed (ADR-0195 D2):
+---`"active"` (default) hides archived ones, `"archived_only"` shows just those,
+---`"all"` shows both. Every returned record carries `archived` (boolean) and,
+---when its marker could not be read, `archive_error`.
 ---@param slug string
 ---@param sha string
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
 ---@return table[] reviews   `describe` records, newest revision first
-function M.described_for(slug, sha)
+function M.described_for(slug, sha, opts)
+  local mode = (opts or {}).include_archived or "active"
   local out = {}
   for _, rec in ipairs(M.list_for(slug, sha)) do
-    out[#out + 1] = M.describe(rec.path) or rec
+    local d = M.describe(rec.path) or rec
+    local name = (rec.path or ""):match("[^/]+$") or ""
+    local s, sh, rv = M.parse_filename(name)
+    local archived = false
+    if s and sh and rv then
+      local a, aerr = M.is_archived(s, sh, rv)
+      if a == nil then
+        -- FAIL-CLOSED. An unreadable marker is NOT "not archived": reading it
+        -- that way would resurface a review the user hid. It stays hidden and
+        -- carries the reason, which is what the panel surfaces (ADR-0195 D2).
+        archived, d.archive_error = true, aerr
+      else
+        archived = a
+      end
+    end
+    d.archived = archived
+    if mode == "all"
+      or (mode == "active" and not archived)
+      or (mode == "archived_only" and archived) then
+      out[#out + 1] = d
+    end
+  end
+  return out
+end
+
+-- ── archive markers (ADR-0195 D2) ──────────────────────────────────────────
+--
+-- ARCHIVE hides a review from the active listing while leaving BOTH halves of
+-- the ADR-0067 pair exactly where they are. It is the reversible sibling of
+-- `remove`, which deletes the pair and fences the revision.
+--
+-- The state is ONE MARKER DOCUMENT PER REVIEW rather than a per-repo index: two
+-- Neovim instances share `store.root()`, so a shared map would be a
+-- read-modify-write whose last writer silently drops the other's archive. Two
+-- archives touch two different files and cannot contend.
+--
+-- The marker also leaves the pair's PATH untouched, so every task `review:`
+-- reference keeps resolving, and the revision allocator still counts the file on
+-- disk — an archived r2 still occupies revision 2, so the next review is r3.
+
+local ARCHIVE_SCHEMA = "worktree.review.archived/1"
+
+---archived_dir is where a repo's markers live: beside the JSON projections they
+---shadow, so a marker and its review cannot end up in different clones.
+---@param slug string
+---@return string
+function M.archived_dir(slug)
+  return store.reviews_dir(slug) .. "/archived"
+end
+
+---archive_marker_path keys the marker on the review's CANONICAL BASENAME — the
+---same identity the store already uses. The marker filename IS the key.
+---@param slug string
+---@param sha string
+---@param revision integer
+---@return string
+function M.archive_marker_path(slug, sha, revision)
+  return M.archived_dir(slug) .. "/" .. M.filename(slug, sha, revision) .. ".archived.json"
+end
+
+---_marker_state is THE validator. Every read and every mutation goes through it,
+---because a check that only the read path performs is not a guard — the first
+---cut validated in `is_archived` and then let `unarchive` and `remove` unlink
+---whatever was there without parsing it, so a corrupt marker was silently
+---erased by the very operations that most needed to understand it.
+---
+---Three facts, all required: the file PARSES, the schema is EXACTLY ours, and
+---the persisted `review` IS this review's canonical basename. That last one was
+---written into every marker from the start and consulted by nothing — a field
+---asserting an identity that no code checks is decoration, and it is what
+---catches a marker copied or renamed between reviews.
+---@return "absent"|"valid"|"unknown" state, string? err
+function _marker_state(slug, sha, revision)
+  local ds = require("auto-core.docstore")
+  local p = M.archive_marker_path(slug, sha, revision)
+  if not ds.exists(p) then return "absent" end
+  local data, rerr = ds.read_json(p)
+  if data == nil then
+    return "unknown", ("archive marker at %s could not be read: %s")
+      :format(p, tostring(rerr or "unknown"))
+  end
+  if type(data) ~= "table" or data.schema ~= ARCHIVE_SCHEMA then
+    return "unknown", ("archive marker at %s is malformed (schema %s, want %s)")
+      :format(p, tostring(type(data) == "table" and data.schema or type(data)), ARCHIVE_SCHEMA)
+  end
+  local want = M.filename(slug, sha, revision)
+  if data.review ~= want then
+    return "unknown", ("archive marker at %s names review %s, not %s")
+      :format(p, tostring(data.review), want)
+  end
+  return "valid"
+end
+
+---is_archived answers for ONE review.
+---
+---FAIL-CLOSED: a marker that is present but malformed, unreadable or naming a
+---different review returns `nil, err` rather than `false`. Reporting it as "not
+---archived" would resurface a review the user hid, which is the one outcome
+---archiving exists to prevent.
+---@return boolean? archived, string? err
+function M.is_archived(slug, sha, revision)
+  local state, err = _marker_state(slug, sha, revision)
+  if state == "unknown" then return nil, err end
+  return state == "valid"
+end
+
+---archive marks ONE review archived. Idempotent: an existing VALID marker is
+---success. An existing MALFORMED one is an ERROR rather than a silent overwrite
+---— the state has to be understood before it is declared already-correct.
+---@return boolean ok, string? err
+function M.archive(slug, sha, revision)
+  if type(slug) ~= "string" or slug == "" then return false, "archive: slug required" end
+  if type(sha) ~= "string" or sha == "" then return false, "archive: sha required" end
+  local rev = tonumber(revision)
+  if not rev then return false, "archive: revision required" end
+
+  local ds = require("auto-core.docstore")
+  local canonical = store.reviews_dir(slug) .. "/" .. M.filename(slug, sha, rev)
+  if not ds.exists(canonical) then return false, "no such review: " .. canonical end
+
+  local archived, aerr = M.is_archived(slug, sha, rev)
+  if archived == nil then return false, aerr end
+  if archived then return true end
+
+  local dok, derr = ds.ensure_dir(M.archived_dir(slug))
+  if dok == false then
+    return false, ("could not create %s: %s"):format(M.archived_dir(slug), tostring(derr or "unknown"))
+  end
+
+  local p = M.archive_marker_path(slug, sha, rev)
+  local content = ds.encode_pretty({
+    schema      = ARCHIVE_SCHEMA,
+    review      = M.filename(slug, sha, rev),
+    archived_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+  })
+  local ok, cerr = ds.create_exclusive(p, content)
+  if not ok then
+    -- Another instance may have created it between the check and the create.
+    -- That is the SAME outcome asked for, so re-read rather than report a race.
+    local again = M.is_archived(slug, sha, rev)
+    if again then return true end
+    return false, ("could not write the archive marker at %s: %s")
+      :format(p, tostring(cerr or "unknown"))
+  end
+  return true
+end
+
+---unarchive restores ONE review to the active listing. Idempotent: no marker is
+---success, because the requested end state already holds.
+---
+---An UNKNOWN marker is REFUSED, not erased. Unlinking whatever happens to sit at
+---that path would destroy the only evidence of a state we just admitted we do
+---not understand, and it would do it through the operation a user reaches for
+---when something looks wrong. Blocking has to cost no bytes.
+---
+---`opts.force` is the deliberate recovery, and it exists so that refusing is not
+---a dead end: it removes an unknown marker ON PURPOSE, named as such by the
+---caller. Fail-closed is the default; force is a decision.
+---@param opts { force: boolean? }?
+---@return boolean ok, string? err
+function M.unarchive(slug, sha, revision, opts)
+  if type(slug) ~= "string" or slug == "" then return false, "unarchive: slug required" end
+  if type(sha) ~= "string" or sha == "" then return false, "unarchive: sha required" end
+  local rev = tonumber(revision)
+  if not rev then return false, "unarchive: revision required" end
+
+  local ds = require("auto-core.docstore")
+  local p = M.archive_marker_path(slug, sha, rev)
+  local state, serr = _marker_state(slug, sha, rev)
+  if state == "absent" then return true end
+  if state == "unknown" and not (opts or {}).force then
+    return false, ("refusing to remove an archive marker that could not be "
+      .. "validated -- nothing was touched. Re-run with force to remove it "
+      .. "deliberately: %s"):format(tostring(serr or "unknown"))
+  end
+  local ok, derr = ds.delete(p)
+  if not ok then
+    return false, ("could not remove the archive marker at %s: %s")
+      :format(p, tostring(derr or "unknown"))
+  end
+  return true
+end
+
+---_canonical_parts validates a review PATH the way `remove_path` does and yields
+---its identity. One validator for every by-file archive entry point.
+---@return string? slug, string? short, integer? rev, string? err
+local function _canonical_parts(path, what)
+  if type(path) ~= "string" or path == "" then return nil, nil, nil, what .. ": path required" end
+  local name = path:match("[^/]+$") or path
+  local slug, short, rev = M.parse_filename(name)
+  if not (slug and short and rev) then
+    return nil, nil, nil, "not a review filename: " .. name
+  end
+  local canonical = store.reviews_dir(slug) .. "/" .. M.filename(slug, short, rev)
+  if _abs(canonical) ~= _abs(path) then
+    return nil, nil, nil, ("refusing: %s is not the canonical location of %s (that is %s)")
+      :format(path, name, canonical)
+  end
+  return slug, short, rev
+end
+
+---archive_path is `archive` addressed by FILE, which is how a panel row knows a
+---review. Same canonical-location proof `remove_path` makes.
+---@return boolean ok, string? err
+function M.archive_path(path)
+  local slug, short, rev, err = _canonical_parts(path, "archive_path")
+  if not slug then return false, err end
+  return M.archive(slug, short, rev)
+end
+
+---unarchive_path is `unarchive` addressed by FILE.
+---@return boolean ok, string? err
+function M.unarchive_path(path)
+  local slug, short, rev, err = _canonical_parts(path, "unarchive_path")
+  if not slug then return false, err end
+  return M.unarchive(slug, short, rev)
+end
+
+---archived_names is the set of review basenames that have a marker, from ONE
+---directory scan and no document reads.
+---
+---It does not parse, and it does not need to: a VALID marker means archived, and
+---an UNKNOWN one fails closed to archived too, so for the question "is this row
+---in the active listing" mere presence is the whole answer. That is what lets
+---the cheap count stay cheap while agreeing exactly with the described listing —
+---and the agreement is asserted, because two listings that disagree about what
+---is hidden are worse than one that is simply wrong.
+---@param slug string
+---@return table<string, boolean>
+function M.archived_names(slug)
+  local ds = require("auto-core.docstore")
+  local out = {}
+  local dir = M.archived_dir(slug)
+  if not ds.exists(dir) then return out end
+  for _, name in ipairs(ds.list(dir, "%.archived%.json$") or {}) do
+    out[(name:gsub("%.archived%.json$", ""))] = true
+  end
+  return out
+end
+
+---index_all is `list_all` filtered by archive state — the CHEAP listing behind
+---the panel's collapsed count.
+---
+---The count had its own path into the store (`reviews_index` -> `list_all`) and
+---so kept counting archived reviews after the described listing stopped showing
+---them: a section reading "(3)" over two rows. A number that disagrees with the
+---rows under it is not a smaller bug than the rows being wrong.
+---@param slug string
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
+---@return table[]
+function M.index_all(slug, opts)
+  local mode = (opts or {}).include_archived or "active"
+  local all = M.list_all(slug)
+  if mode == "all" then return all end
+  local archived = M.archived_names(slug)
+  local out = {}
+  for _, rec in ipairs(all) do
+    local is_arch = archived[rec.name] == true
+    if (mode == "archived_only") == is_arch then out[#out + 1] = rec end
+  end
+  return out
+end
+
+---described_all is `list_all` with every file described and the archive state
+---applied — the REPO-WIDE listing, as opposed to `described_for`'s one commit.
+---
+---This is the one the repos panel's Reviews section actually reads, and the
+---first cut of this work wired `described_for` and left it alone: the per-commit
+---rows honoured an archive while the section that lists every review still
+---showed it, and the collapsed count still counted it. Archiving that the main
+---listing ignores is not archiving. Same `include_archived` vocabulary, same
+---fail-closed rule, so the two listings cannot drift.
+---@param slug string
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
+---@return table[] reviews
+function M.described_all(slug, opts)
+  local mode = (opts or {}).include_archived or "active"
+  local out = {}
+  for _, rec in ipairs(M.list_all(slug)) do
+    local d = M.describe(rec.path) or rec
+    local archived = false
+    if rec.slug and rec.short and rec.revision then
+      local a, aerr = M.is_archived(rec.slug, rec.short, rec.revision)
+      if a == nil then
+        archived, d.archive_error = true, aerr
+      else
+        archived = a
+      end
+    end
+    d.archived = archived
+    if mode == "all"
+      or (mode == "active" and not archived)
+      or (mode == "archived_only" and archived) then
+      out[#out + 1] = d
+    end
+  end
+  return out
+end
+
+---reconcile_archive DROPS the markers whose review no longer exists, which is
+---what the D2 contract means by reconciliation — listing them is a report, not a
+---repair, and a doctor that only names the problem leaves the invisible state
+---exactly as invisible as it found it.
+---
+---Only ORPHANS are dropped, and the distinction is load-bearing: a marker whose
+---review is GONE can be removed with nothing to lose, while a marker that merely
+---fails validation over a LIVE review is hiding a real review, and dropping that
+---would silently unarchive it. The second kind is reported, never touched.
+---
+---Every cleanup failure is explicit (§2.3a): a doctor that reports "0 failures"
+---because it never looked is the reassuring answer given by accident.
+---@param slug string
+---@return { dropped: string[], failed: { path: string, err: string }[], unreadable: string[] }
+function M.reconcile_archive(slug)
+  local ds = require("auto-core.docstore")
+  local res = { dropped = {}, failed = {}, unreadable = {} }
+  for _, e in ipairs(M.classify_markers(slug)) do
+    if e.state == "orphan" then
+      -- PROVEN absent: a canonical marker naming a review that is not there.
+      -- Nothing is lost by removing it and the invisible state goes away.
+      local ok, err = ds.delete(e.path)
+      if ok then
+        res.dropped[#res.dropped + 1] = e.path
+      else
+        res.failed[#res.failed + 1] = { path = e.path, err = tostring(err or "unknown") }
+      end
+    elseif e.state == "unknown" then
+      -- We could not establish whose marker this is. Deleting an identity we
+      -- cannot establish is the same error as trusting a marker we cannot
+      -- parse, pointed the other way — unknown must block a delete, never
+      -- authorise one. Report it and leave every byte alone.
+      res.unreadable[#res.unreadable + 1] = e.path
+    elseif _marker_state(e.slug, e.short, e.revision) == "unknown" then
+      -- A marker that will not validate over a review that is STILL THERE is
+      -- hiding a real review; dropping it would silently unarchive it.
+      res.unreadable[#res.unreadable + 1] = e.path
+    end
+  end
+  return res
+end
+
+---orphan_markers lists markers whose review no longer exists — what a delete
+---performed outside this API (or an interrupted one) leaves behind.
+---@param slug string
+---@return string[] paths
+function M.orphan_markers(slug)
+  local out = {}
+  for _, e in ipairs(M.classify_markers(slug)) do
+    if e.state == "orphan" then out[#out + 1] = e.path end
+  end
+  return out
+end
+
+---classify_markers reads `archived/` once and says what each entry IS.
+---
+---`docstore.list` takes a LUA PATTERN and returns NAMES, not paths. A glob
+---passed here silently matches nothing, and a name used as a path silently
+---points at the cwd — both of which read as "no orphans", which is the answer a
+---doctor must never give by accident.
+---
+---The three states exist because "orphan" has to be PROVEN, not assumed. The
+---first cut derived the review path and treated a nil — an unparseable or
+---non-canonical basename — as an orphan, so `archived/not-a-review.archived.json`
+---was deleted by the doctor. That is deleting an identity it could not
+---establish, which is the same mistake as trusting a marker it could not parse,
+---pointed the other way: unknown must block a delete, not authorise one.
+---@param slug string
+---@return { path: string, name: string, state: "orphan"|"live"|"unknown" }[]
+function M.classify_markers(slug)
+  local ds = require("auto-core.docstore")
+  local out = {}
+  local dir = M.archived_dir(slug)
+  if not ds.exists(dir) then return out end
+  for _, name in ipairs(ds.list(dir, "%.archived%.json$") or {}) do
+    local base = (name:gsub("%.archived%.json$", ""))
+    local s, sh, rv = M.parse_filename(base)
+    local path = dir .. "/" .. name
+    if not (s and sh and rv) then
+      -- Not a review filename at all. We cannot say WHOSE marker this is, so we
+      -- do not get to decide it is nobody's.
+      out[#out + 1] = { path = path, name = name, state = "unknown" }
+    else
+      local canonical = store.reviews_dir(s) .. "/" .. M.filename(s, sh, rv)
+      -- CONTAINMENT IS NOT IDENTITY, here too. A marker sitting in THIS repo's
+      -- `archived/` while NAMED for another repo resolves to the other repo's
+      -- reviews directory, so "the review is absent" would be a fact about
+      -- somewhere else entirely — and acting on it would let one repo's doctor
+      -- reach into another's namespace. That is the shape of the
+      -- cross-repository delete this module was already hardened against.
+      --
+      -- A name that does not round-trip is not this store's naming either,
+      -- whatever it parsed into.
+      if s ~= slug or M.filename(s, sh, rv) ~= base then
+        out[#out + 1] = { path = path, name = name, state = "unknown" }
+      elseif ds.exists(canonical) then
+        out[#out + 1] = { path = path, name = name, state = "live",
+                          slug = s, short = sh, revision = rv }
+      else
+        out[#out + 1] = { path = path, name = name, state = "orphan",
+                          slug = s, short = sh, revision = rv }
+      end
+    end
   end
   return out
 end
