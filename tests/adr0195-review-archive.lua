@@ -346,7 +346,7 @@ print("\n[9b] *** the cheap COUNT agrees with the rows it sits above ***")
 review.archive(slug, sha, w1.revision)
 ok("[9b] *** the count DROPS the archived review ***",
   not has_name(repos.reviews_index(repo), review.filename(slug, sha, w1.revision)),
-  vim.inspect(#repos.reviews_index(repo))) 
+  vim.inspect(#repos.reviews_index(repo)))
 ok("[9b] *** and count == rows, which is the property that broke ***",
   #repos.reviews_index(repo) == #repos.reviews_all(repo),
   ("index=%d all=%d"):format(#repos.reviews_index(repo), #repos.reviews_all(repo)))
