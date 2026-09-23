@@ -455,17 +455,36 @@ function M.unarchive_review(repo, path)
   return review.unarchive_path(resolved)
 end
 
----doctor_archive reports markers whose review no longer exists.
+---doctor_archive RECONCILES the marker store: it drops markers whose review no
+---longer exists, and reports every cleanup failure explicitly (ADR-0195 D2).
 ---
----`remove` clears a review's marker before it deletes anything, so this API
----leaves none behind. Orphans come from the world OUTSIDE it: a pair deleted by
----hand, a clone that dropped the JSON but kept `archived/`, an interrupted
----filesystem. They are invisible by nature — an orphan marker shadows a review
----that is not there — so the only way to see one is to ask.
+---It repairs rather than reports, because the state it deals with is invisible
+---by nature — an orphan marker shadows a review that is not there — and a doctor
+---that only names the problem leaves it exactly as invisible as it found it.
+---
+---Orphans are the designed outcome of a partial delete: `review.remove` unlinks
+---the marker AFTER the pair, so a failure there leaves one behind on purpose,
+---recoverable here. They also come from outside the API — a pair deleted by
+---hand, a clone that dropped the JSON but kept `archived/`.
+---
+---A marker that fails validation over a review that is STILL THERE is reported
+---under `unreadable` and never touched: it is hiding a real review, and dropping
+---it would silently unarchive something the user deliberately hid.
 ---@param repo WorktreeRepo
----@return string[] paths, string? err
+---@return { dropped: string[], failed: { path: string, err: string }[], unreadable: string[] } result, string? err
 function M.doctor_archive(repo)
-  if not repo or not repo.slug then return {}, "doctor_archive: repo.slug required" end
+  if not repo or not repo.slug then
+    return { dropped = {}, failed = {}, unreadable = {} }, "doctor_archive: repo.slug required"
+  end
+  return review.reconcile_archive(repo.slug)
+end
+
+---archive_orphans lists orphaned markers WITHOUT repairing anything, for a
+---caller that wants to show the damage before acting on it.
+---@param repo WorktreeRepo
+---@return string[] paths
+function M.archive_orphans(repo)
+  if not repo or not repo.slug then return {} end
   return review.orphan_markers(repo.slug)
 end
 
@@ -523,15 +542,17 @@ end
 ---filename, so once history is rewritten `reviews(repo, sha)` can no longer
 ---find it and the file is invisible in the tree — which is precisely when
 ---someone needs to see it and re-point it.
+---`opts.include_archived` selects the listing (ADR-0195 D2), with the same
+---vocabulary and the same "active" default as `reviews_described`. This is the
+---listing the panel's Reviews section reads and counts, so an archive that did
+---not reach HERE would not be an archive at all — the rows would still show and
+---the collapsed count would still include them.
 ---@param repo WorktreeRepo
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
 ---@return table[] reviews   `review.describe` records, most recent first
-function M.reviews_all(repo)
+function M.reviews_all(repo, opts)
   if not repo or not repo.slug then return {} end
-  local out = {}
-  for _, rec in ipairs(review.list_all(repo.slug)) do
-    out[#out + 1] = review.describe(rec.path) or rec
-  end
-  return out
+  return review.described_all(repo.slug, opts)
 end
 
 ---review_meta describes ONE review file by path — what an info view prints.

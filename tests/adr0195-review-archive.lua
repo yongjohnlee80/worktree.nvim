@@ -223,49 +223,215 @@ ok("[7] *** a review restored at that name is ACTIVE, not silently hidden ***",
   vim.inspect({ review.is_archived(slug, sha, 1) }))
 vim.fn.delete(canonical)
 
-print("\n[8] a marker that cannot be cleared REFUSES the delete outright")
--- Ordering is the safety property. Clearing the marker and then failing to
--- delete makes a review REAPPEAR: wrong, but visible and re-archivable. Deleting
--- the pair and then failing to clear the marker leaves the trap. So the
--- destructive step goes last, and an un-clearable marker stops everything.
+
+print("\n[8] *** the marker is unlinked AFTER the pair, and a failure is a PARTIAL ***")
+-- The ordering is the accepted D2 contract, and my first cut reversed it. I
+-- pre-cleared the marker before the fence, arguing a reappearing review is a
+-- lesser harm than an invisible one. The deciding point is not which wrong state
+-- looks worse: a pre-clear followed by ANY later failure silently UNARCHIVES a
+-- review the user deliberately hid, and nothing recovers that. Unlinking last
+-- leaves an orphan marker instead — which doctor_archive exists to reconcile.
 local r3 = write_review("third")
 local rev3 = r3.revision
 review.archive(slug, sha, rev3)
 local dir = review.archived_dir(slug)
 vim.fn.system({ "chmod", "500", dir })
-local bok, berr = review.remove(slug, sha, rev3)
-local blocked = bok == false
+local bok, berr, bdetail = review.remove(slug, sha, rev3)
 vim.fn.system({ "chmod", "700", dir })
-if blocked then
-  ok("[8] *** the delete is refused when the marker cannot be cleared ***", true)
-  ok("[8] and it says so rather than reporting a clean removal",
-    tostring(berr):find("NOTHING was deleted", 1, true) ~= nil, berr)
-  ok("[8] *** the review JSON is UNTOUCHED ***", ds.exists(r3.json_path), r3.json_path)
-  local m3 = review.describe(r3.json_path)
-  ok("[8] *** its Markdown is untouched ***",
-    m3 and m3.document and ds.exists(m3.document), m3 and m3.document)
-  ok("[8] *** and the revision was NOT fenced, so nothing is half-done ***",
-    select(1, review.is_archived(slug, sha, rev3)) == true)
+if bok == false and tostring(berr):find("archive marker", 1, true) then
+  ok("[8] *** the pair delete is NOT refused by an un-unlinkable marker ***",
+    bdetail and bdetail.json_removed == true, vim.inspect(bdetail))
+  ok("[8] *** the partial is reported, not swallowed as success ***", bok == false, berr)
+  ok("[8] and it names doctor_archive as the recovery",
+    tostring(berr):find("doctor_archive", 1, true) ~= nil, berr)
+  ok("[8] *** the review JSON really is gone — the delete did happen ***",
+    not ds.exists(r3.json_path), r3.json_path)
+  ok("[8] the leftover marker is named in the detail",
+    bdetail and bdetail.marker_error ~= nil and bdetail.marker ~= nil, vim.inspect(bdetail))
 else
-  -- Running as root, or on a filesystem that ignores the mode bit: the guard
-  -- cannot be provoked, so say that rather than record a pass it never earned.
+  -- Running as root, or a filesystem ignoring the mode bit: the partial cannot
+  -- be provoked. Say so rather than record five passes it never earned.
   ok("[8] SKIPPED — the directory mode did not block the unlink (root?)", true)
   ok("[8] SKIPPED", true); ok("[8] SKIPPED", true)
   ok("[8] SKIPPED", true); ok("[8] SKIPPED", true)
 end
 
-print("\n[9] doctor_archive finds what this API cannot leave behind")
--- Orphans come from OUTSIDE the API: a pair deleted by hand, a clone that
--- dropped the JSON but kept `archived/`. They are invisible by nature — a marker
--- shadowing a review that is not there — so the only way to see one is to ask.
-review.unarchive(slug, sha, rev3)
-review.archive(slug, sha, rev3)
-vim.fn.delete(r3.json_path)
-local orphans = repos.doctor_archive(repo)
-ok("[9] *** an orphaned marker is reported ***", #orphans == 1, vim.inspect(orphans))
-ok("[9] and it is named by its marker path",
-  orphans[1] and orphans[1]:find("%.archived%.json$") ~= nil, orphans[1])
-ok("[9] doctor_archive requires a repo slug",
+local function rnames(list)
+  local out = {}
+  for _, d in ipairs(list) do out[#out + 1] = "r" .. tostring(d.revision) end
+  table.sort(out)
+  return table.concat(out, ",")
+end
+local function has_rev(list, rev)
+  for _, d in ipairs(list) do if d.revision == rev then return true end end
+  return false
+end
+
+print("\n[8b] *** a FAILED delete must not silently unarchive ***")
+-- This is the cell that tells the two orderings apart, and its absence is why
+-- my first falsification of the ordering came back green: every other cell here
+-- observes the SUCCESS path, where pre-clear and unlink-last agree. The
+-- difference only shows when a step AFTER the marker fails.
+--
+-- Make the PAIR DELETE fail (the reviews dir is unwritable) while the archived/
+-- subdir stays writable, so a pre-clear would succeed and then strand the
+-- review UNARCHIVED — visible again, with no record that the user ever hid it
+-- and nothing designed to recover the intent.
+local k = write_review("ordering")
+review.archive(slug, sha, k.revision)
+vim.fn.system({ "chmod", "500", store.reviews_dir(slug) })
+local kok = review.remove(slug, sha, k.revision)
+vim.fn.system({ "chmod", "700", store.reviews_dir(slug) })
+if kok == false and ds.exists(k.json_path) then
+  ok("[8b] fixture: the delete really did fail with the pair intact", true)
+  ok("[8b] *** the review is STILL ARCHIVED — intent survived the failure ***",
+    select(1, review.is_archived(slug, sha, k.revision)) == true,
+    vim.inspect({ review.is_archived(slug, sha, k.revision) }))
+  ok("[8b] *** and it did not silently reappear in the active listing ***",
+    not has_rev(review.described_for(slug, sha), k.revision),
+    rnames(review.described_for(slug, sha)))
+else
+  ok("[8b] SKIPPED — the directory mode did not block the delete (root?)", true)
+  ok("[8b] SKIPPED", true); ok("[8b] SKIPPED", true)
+end
+review.unarchive(slug, sha, k.revision)
+review.remove(slug, sha, k.revision)
+
+print("\n[9] *** the REPO-WIDE listing honours archiving too ***")
+-- This is the listing the repos panel's Reviews section actually reads, and the
+-- first cut wired described_for (per commit) while leaving it alone: per-commit
+-- rows honoured an archive while the section listing every review still showed
+-- it, and the collapsed count still counted it. Archiving the main listing
+-- ignores is not archiving. Lector's probe: described_for(active) returned r2
+-- while reviews_all returned r1,r2.
+local w1 = write_review("wide-one")
+local w2 = write_review("wide-two")
+review.archive(slug, sha, w1.revision)
+-- Membership, not set equality: this listing is REPO-WIDE, so it also carries
+-- every review the earlier sections left behind. Asserting the whole set would
+-- be asserting those sections' bookkeeping, which is not what this cell is for.
+local has = has_rev
+local active_all = repos.reviews_all(repo)
+ok("[9] *** reviews_all DEFAULTS to active and drops the archived row ***",
+  not has(active_all, w1.revision), rnames(active_all))
+ok("[9] *** the collapsed COUNT is honest — it counts what it shows ***",
+  #active_all == #repos.reviews_all(repo, { include_archived = "all" }) - 1,
+  ("active=%d all=%d"):format(#active_all,
+    #repos.reviews_all(repo, { include_archived = "all" })))
+ok("[9] the un-archived sibling is still listed", has(active_all, w2.revision),
+  rnames(active_all))
+ok("[9] `all` still reaches both",
+  has(repos.reviews_all(repo, { include_archived = "all" }), w1.revision)
+    and has(repos.reviews_all(repo, { include_archived = "all" }), w2.revision),
+  rnames(repos.reviews_all(repo, { include_archived = "all" })))
+ok("[9] `archived_only` reaches the archived one and not its sibling",
+  has(repos.reviews_all(repo, { include_archived = "archived_only" }), w1.revision)
+    and not has(repos.reviews_all(repo, { include_archived = "archived_only" }), w2.revision),
+  rnames(repos.reviews_all(repo, { include_archived = "archived_only" })))
+ok("[9] and the two listings AGREE about this review",
+  has(review.described_for(slug, sha, { include_archived = "archived_only" }), w1.revision),
+  "per-commit vs repo-wide")
+review.unarchive(slug, sha, w1.revision)
+
+print("\n[10] *** an UNKNOWN marker blocks every mutation, and costs no bytes ***")
+-- Validating only on the READ path is not a guard. The first cut checked the
+-- schema in is_archived and then let unarchive and remove unlink whatever sat
+-- at that path without parsing it — so the operations that most needed to
+-- understand a corrupt marker were the ones that destroyed it.
+review.archive(slug, sha, w1.revision)
+local m1 = review.archive_marker_path(slug, sha, w1.revision)
+vim.fn.writefile({ "{ not json" }, m1)
+
+local uok, uerr = review.unarchive(slug, sha, w1.revision)
+ok("[10] *** unarchive REFUSES an unvalidatable marker ***", uok == false, uerr)
+ok("[10] *** and the marker's bytes are still there ***", ds.exists(m1), m1)
+ok("[10] the refusal points at the deliberate recovery",
+  tostring(uerr):find("force", 1, true) ~= nil, uerr)
+
+local dok2, derr2 = review.remove(slug, sha, w1.revision)
+ok("[10] *** remove REFUSES too — nothing is destroyed in an unknown state ***",
+  dok2 == false, derr2)
+ok("[10] *** and the review JSON is untouched ***", ds.exists(w1.json_path), w1.json_path)
+ok("[10] *** and the marker is untouched ***", ds.exists(m1), m1)
+
+-- Refusing must not be a dead end, so force is the named, deliberate escape.
+ok("[10] force removes it ON PURPOSE",
+  review.unarchive(slug, sha, w1.revision, { force = true }) == true)
+ok("[10] and only then are the bytes gone", not ds.exists(m1), m1)
+
+print("\n[11] *** the marker's persisted identity is CHECKED, not just written ***")
+-- Every marker records `review = <canonical basename>`. Nothing read it back,
+-- so it was decoration: a field asserting an identity that no code consults.
+review.archive(slug, sha, w1.revision)
+local raw = table.concat(vim.fn.readfile(m1), "\n")
+ok("[11] fixture: the marker really does persist the review name",
+  raw:find(review.filename(slug, sha, w1.revision), 1, true) ~= nil, raw)
+-- A marker copied or renamed between reviews keeps the OTHER review's name.
+vim.fn.writefile({ vim.json.encode({
+  schema = "worktree.review.archived/1",
+  review = review.filename(slug, sha, w2.revision),
+  archived_at = "2026-01-01T00:00:00Z",
+}) }, m1)
+local idok, iderr = review.is_archived(slug, sha, w1.revision)
+ok("[11] *** a marker naming a DIFFERENT review is not trusted ***",
+  idok == nil and type(iderr) == "string", vim.inspect({ idok, iderr }))
+ok("[11] and the error names both sides",
+  tostring(iderr):find(review.filename(slug, sha, w2.revision), 1, true) ~= nil, iderr)
+ok("[11] the review stays hidden rather than resurfacing",
+  rnames(review.described_for(slug, sha, { include_archived = "active" })):find(
+    "r" .. w1.revision, 1, true) == nil,
+  rnames(review.described_for(slug, sha, { include_archived = "active" })))
+review.unarchive(slug, sha, w1.revision, { force = true })
+
+print("\n[12] *** doctor_archive REPAIRS, and reports every failure explicitly ***")
+-- Listing is a report, not a repair. A doctor that only names invisible state
+-- leaves it exactly as invisible as it found it.
+review.archive(slug, sha, w1.revision)
+local orphan = review.archive_marker_path(slug, sha, w1.revision)
+vim.fn.delete(w1.json_path)          -- the pair is gone; the marker is now an orphan
+ok("[12] fixture: the orphan exists", ds.exists(orphan), orphan)
+local function lists(paths, p) for _, x in ipairs(paths) do if x == p then return true end end return false end
+ok("[12] archive_orphans REPORTS without repairing",
+  lists(repos.archive_orphans(repo), orphan) and ds.exists(orphan), orphan)
+
+local res = repos.doctor_archive(repo)
+ok("[12] *** the orphan is DROPPED, not merely listed ***",
+  lists(res.dropped, orphan) and not ds.exists(orphan), vim.inspect(res))
+ok("[12] with no failures reported", #res.failed == 0, vim.inspect(res.failed))
+ok("[12] and it is idempotent — a second run finds nothing left",
+  #repos.doctor_archive(repo).dropped == 0)
+ok("[12] the earlier partial delete's orphan was reconciled too",
+  #repos.archive_orphans(repo) == 0, vim.inspect(repos.archive_orphans(repo)))
+
+-- A marker that will not validate but whose review is STILL THERE is hiding a
+-- real review. Dropping it would silently unarchive something the user hid.
+review.archive(slug, sha, w2.revision)
+local m2 = review.archive_marker_path(slug, sha, w2.revision)
+vim.fn.writefile({ "{ corrupt" }, m2)
+local res2 = repos.doctor_archive(repo)
+ok("[12] *** a corrupt marker over a LIVE review is NOT dropped ***",
+  ds.exists(m2), m2)
+ok("[12] it is reported under `unreadable` instead",
+  #res2.unreadable == 1 and res2.unreadable[1] == m2, vim.inspect(res2))
+ok("[12] and that review is still hidden, not resurfaced",
+  rnames(repos.reviews_all(repo)):find("r" .. w2.revision, 1, true) == nil,
+  rnames(repos.reviews_all(repo)))
+
+-- An un-droppable orphan is an explicit failure, never a silent zero.
+vim.fn.writefile({ "{ corrupt" }, m2)
+review.unarchive(slug, sha, w2.revision, { force = true })
+review.archive(slug, sha, w2.revision)
+vim.fn.delete(w2.json_path)
+vim.fn.system({ "chmod", "500", review.archived_dir(slug) })
+local res3 = repos.doctor_archive(repo)
+vim.fn.system({ "chmod", "700", review.archived_dir(slug) })
+if #res3.dropped == 0 then
+  ok("[12] *** a cleanup failure is REPORTED, not counted as clean ***",
+    #res3.failed >= 1 and res3.failed[1].err ~= nil, vim.inspect(res3))
+else
+  ok("[12] SKIPPED — the directory mode did not block the unlink (root?)", true)
+end
+ok("[12] doctor_archive requires a repo slug",
   select(2, repos.doctor_archive(nil)) ~= nil)
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", pass, fail)); io.stdout:flush()
