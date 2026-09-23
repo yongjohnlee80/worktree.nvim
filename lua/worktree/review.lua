@@ -1734,6 +1734,51 @@ function M.unarchive_path(path)
   return M.unarchive(slug, short, rev)
 end
 
+---archived_names is the set of review basenames that have a marker, from ONE
+---directory scan and no document reads.
+---
+---It does not parse, and it does not need to: a VALID marker means archived, and
+---an UNKNOWN one fails closed to archived too, so for the question "is this row
+---in the active listing" mere presence is the whole answer. That is what lets
+---the cheap count stay cheap while agreeing exactly with the described listing —
+---and the agreement is asserted, because two listings that disagree about what
+---is hidden are worse than one that is simply wrong.
+---@param slug string
+---@return table<string, boolean>
+function M.archived_names(slug)
+  local ds = require("auto-core.docstore")
+  local out = {}
+  local dir = M.archived_dir(slug)
+  if not ds.exists(dir) then return out end
+  for _, name in ipairs(ds.list(dir, "%.archived%.json$") or {}) do
+    out[(name:gsub("%.archived%.json$", ""))] = true
+  end
+  return out
+end
+
+---index_all is `list_all` filtered by archive state — the CHEAP listing behind
+---the panel's collapsed count.
+---
+---The count had its own path into the store (`reviews_index` -> `list_all`) and
+---so kept counting archived reviews after the described listing stopped showing
+---them: a section reading "(3)" over two rows. A number that disagrees with the
+---rows under it is not a smaller bug than the rows being wrong.
+---@param slug string
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
+---@return table[]
+function M.index_all(slug, opts)
+  local mode = (opts or {}).include_archived or "active"
+  local all = M.list_all(slug)
+  if mode == "all" then return all end
+  local archived = M.archived_names(slug)
+  local out = {}
+  for _, rec in ipairs(all) do
+    local is_arch = archived[rec.name] == true
+    if (mode == "archived_only") == is_arch then out[#out + 1] = rec end
+  end
+  return out
+end
+
 ---described_all is `list_all` with every file described and the archive state
 ---applied — the REPO-WIDE listing, as opposed to `described_for`'s one commit.
 ---
@@ -1787,26 +1832,26 @@ end
 function M.reconcile_archive(slug)
   local ds = require("auto-core.docstore")
   local res = { dropped = {}, failed = {}, unreadable = {} }
-  for _, p in ipairs(M.orphan_markers(slug)) do
-    local ok, err = ds.delete(p)
-    if ok then
-      res.dropped[#res.dropped + 1] = p
-    else
-      res.failed[#res.failed + 1] = { path = p, err = tostring(err or "unknown") }
-    end
-  end
-  -- A marker that will not validate but whose review is still there stays put.
-  local dir = M.archived_dir(slug)
-  if ds.exists(dir) then
-    for _, name in ipairs(ds.list(dir, "%.archived%.json$") or {}) do
-      local base = (name:gsub("%.archived%.json$", ""))
-      local s, sh, rv = M.parse_filename(base)
-      if s and sh and rv then
-        local live = store.reviews_dir(s) .. "/" .. M.filename(s, sh, rv)
-        if ds.exists(live) and _marker_state(s, sh, rv) == "unknown" then
-          res.unreadable[#res.unreadable + 1] = dir .. "/" .. name
-        end
+  for _, e in ipairs(M.classify_markers(slug)) do
+    if e.state == "orphan" then
+      -- PROVEN absent: a canonical marker naming a review that is not there.
+      -- Nothing is lost by removing it and the invisible state goes away.
+      local ok, err = ds.delete(e.path)
+      if ok then
+        res.dropped[#res.dropped + 1] = e.path
+      else
+        res.failed[#res.failed + 1] = { path = e.path, err = tostring(err or "unknown") }
       end
+    elseif e.state == "unknown" then
+      -- We could not establish whose marker this is. Deleting an identity we
+      -- cannot establish is the same error as trusting a marker we cannot
+      -- parse, pointed the other way — unknown must block a delete, never
+      -- authorise one. Report it and leave every byte alone.
+      res.unreadable[#res.unreadable + 1] = e.path
+    elseif _marker_state(e.slug, e.short, e.revision) == "unknown" then
+      -- A marker that will not validate over a review that is STILL THERE is
+      -- hiding a real review; dropping it would silently unarchive it.
+      res.unreadable[#res.unreadable + 1] = e.path
     end
   end
   return res
@@ -1817,20 +1862,62 @@ end
 ---@param slug string
 ---@return string[] paths
 function M.orphan_markers(slug)
+  local out = {}
+  for _, e in ipairs(M.classify_markers(slug)) do
+    if e.state == "orphan" then out[#out + 1] = e.path end
+  end
+  return out
+end
+
+---classify_markers reads `archived/` once and says what each entry IS.
+---
+---`docstore.list` takes a LUA PATTERN and returns NAMES, not paths. A glob
+---passed here silently matches nothing, and a name used as a path silently
+---points at the cwd — both of which read as "no orphans", which is the answer a
+---doctor must never give by accident.
+---
+---The three states exist because "orphan" has to be PROVEN, not assumed. The
+---first cut derived the review path and treated a nil — an unparseable or
+---non-canonical basename — as an orphan, so `archived/not-a-review.archived.json`
+---was deleted by the doctor. That is deleting an identity it could not
+---establish, which is the same mistake as trusting a marker it could not parse,
+---pointed the other way: unknown must block a delete, not authorise one.
+---@param slug string
+---@return { path: string, name: string, state: "orphan"|"live"|"unknown" }[]
+function M.classify_markers(slug)
   local ds = require("auto-core.docstore")
   local out = {}
   local dir = M.archived_dir(slug)
   if not ds.exists(dir) then return out end
-  -- `docstore.list` takes a LUA PATTERN and returns NAMES, not paths. A glob
-  -- passed here silently matches nothing, and a name used as a path silently
-  -- points at the cwd — both of which read as "no orphans", which is the answer
-  -- a doctor must never give by accident.
   for _, name in ipairs(ds.list(dir, "%.archived%.json$") or {}) do
     local base = (name:gsub("%.archived%.json$", ""))
     local s, sh, rv = M.parse_filename(base)
-    local review_path = (s and sh and rv)
-      and (store.reviews_dir(s) .. "/" .. M.filename(s, sh, rv)) or nil
-    if not review_path or not ds.exists(review_path) then out[#out + 1] = dir .. "/" .. name end
+    local path = dir .. "/" .. name
+    if not (s and sh and rv) then
+      -- Not a review filename at all. We cannot say WHOSE marker this is, so we
+      -- do not get to decide it is nobody's.
+      out[#out + 1] = { path = path, name = name, state = "unknown" }
+    else
+      local canonical = store.reviews_dir(s) .. "/" .. M.filename(s, sh, rv)
+      -- CONTAINMENT IS NOT IDENTITY, here too. A marker sitting in THIS repo's
+      -- `archived/` while NAMED for another repo resolves to the other repo's
+      -- reviews directory, so "the review is absent" would be a fact about
+      -- somewhere else entirely — and acting on it would let one repo's doctor
+      -- reach into another's namespace. That is the shape of the
+      -- cross-repository delete this module was already hardened against.
+      --
+      -- A name that does not round-trip is not this store's naming either,
+      -- whatever it parsed into.
+      if s ~= slug or M.filename(s, sh, rv) ~= base then
+        out[#out + 1] = { path = path, name = name, state = "unknown" }
+      elseif ds.exists(canonical) then
+        out[#out + 1] = { path = path, name = name, state = "live",
+                          slug = s, short = sh, revision = rv }
+      else
+        out[#out + 1] = { path = path, name = name, state = "orphan",
+                          slug = s, short = sh, revision = rv }
+      end
+    end
   end
   return out
 end

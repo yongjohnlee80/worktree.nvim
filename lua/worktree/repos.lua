@@ -519,11 +519,16 @@ function M.tally_paths(described) return review.tally_paths(described) end
 ---One directory scan plus a stat per file. The panel draws the section's count
 ---on a collapsed row, and a listing that had to read every document to say "3"
 ---would put a per-repaint cost on a row nobody has expanded.
+---`opts.include_archived` matches `reviews_all`, and the DEFAULT matches too.
+---This is the count the panel draws on the collapsed section row, and it reaches
+---the store by its own cheap path — so an archive that only taught `reviews_all`
+---to hide rows would leave the number above them still counting the hidden ones.
 ---@param repo WorktreeRepo
+---@param opts { include_archived: ("active"|"all"|"archived_only")? }?
 ---@return { slug: string, short: string, revision: integer, path: string, name: string, mtime: integer }[]
-function M.reviews_index(repo)
+function M.reviews_index(repo, opts)
   if not repo or not repo.slug then return {} end
-  return review.list_all(repo.slug)
+  return review.index_all(repo.slug, opts)
 end
 
 ---reviews_dir is where this repo's reviews are stored, for an info view.

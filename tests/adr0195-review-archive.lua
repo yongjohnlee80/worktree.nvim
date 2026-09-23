@@ -262,6 +262,10 @@ local function rnames(list)
   table.sort(out)
   return table.concat(out, ",")
 end
+local function has_name(list, name)
+  for _, d in ipairs(list) do if (d.name or d.path or ""):find(name, 1, true) then return true end end
+  return false
+end
 local function has_rev(list, rev)
   for _, d in ipairs(list) do if d.revision == rev then return true end end
   return false
@@ -332,6 +336,44 @@ ok("[9] and the two listings AGREE about this review",
   has(review.described_for(slug, sha, { include_archived = "archived_only" }), w1.revision),
   "per-commit vs repo-wide")
 review.unarchive(slug, sha, w1.revision)
+
+print("\n[9b] *** the cheap COUNT agrees with the rows it sits above ***")
+-- The collapsed section count reaches the store by its OWN path
+-- (reviews_index -> list_all), so teaching only reviews_all to hide rows leaves
+-- the number above them still counting the hidden ones: a section reading "(3)"
+-- over two rows. A number that disagrees with the rows under it is not a
+-- smaller bug than the rows being wrong.
+review.archive(slug, sha, w1.revision)
+ok("[9b] *** the count DROPS the archived review ***",
+  not has_name(repos.reviews_index(repo), review.filename(slug, sha, w1.revision)),
+  vim.inspect(#repos.reviews_index(repo))) 
+ok("[9b] *** and count == rows, which is the property that broke ***",
+  #repos.reviews_index(repo) == #repos.reviews_all(repo),
+  ("index=%d all=%d"):format(#repos.reviews_index(repo), #repos.reviews_all(repo)))
+ok("[9b] `all` agrees on both paths",
+  #repos.reviews_index(repo, { include_archived = "all" })
+    == #repos.reviews_all(repo, { include_archived = "all" }),
+  ("index=%d all=%d"):format(#repos.reviews_index(repo, { include_archived = "all" }),
+    #repos.reviews_all(repo, { include_archived = "all" })))
+ok("[9b] `archived_only` agrees on both paths",
+  #repos.reviews_index(repo, { include_archived = "archived_only" })
+    == #repos.reviews_all(repo, { include_archived = "archived_only" }),
+  ("index=%d all=%d"):format(
+    #repos.reviews_index(repo, { include_archived = "archived_only" }),
+    #repos.reviews_all(repo, { include_archived = "archived_only" })))
+
+-- An UNKNOWN marker must hide the row on BOTH paths, or the cheap one would
+-- resurface exactly the review the described one fails closed on. The cheap
+-- path does not parse; it does not need to, because presence is the answer.
+local mw = review.archive_marker_path(slug, sha, w1.revision)
+vim.fn.writefile({ "{ corrupt" }, mw)
+ok("[9b] *** an UNKNOWN marker hides the row on the CHEAP path too ***",
+  not has_name(repos.reviews_index(repo), review.filename(slug, sha, w1.revision)),
+  "cheap path")
+ok("[9b] and the two paths still agree",
+  #repos.reviews_index(repo) == #repos.reviews_all(repo),
+  ("index=%d all=%d"):format(#repos.reviews_index(repo), #repos.reviews_all(repo)))
+review.unarchive(slug, sha, w1.revision, { force = true })
 
 print("\n[10] *** an UNKNOWN marker blocks every mutation, and costs no bytes ***")
 -- Validating only on the READ path is not a guard. The first cut checked the
@@ -431,6 +473,38 @@ if #res3.dropped == 0 then
 else
   ok("[12] SKIPPED — the directory mode did not block the unlink (root?)", true)
 end
+-- A marker whose basename is not a review name at all: the doctor cannot say
+-- WHOSE it is, so it does not get to decide it is nobody's. Deleting an identity
+-- it cannot establish is the same error as trusting a marker it cannot parse,
+-- pointed the other way.
+local stray = review.archived_dir(slug) .. "/not-a-review.archived.json"
+vim.fn.mkdir(review.archived_dir(slug), "p")
+vim.fn.writefile({ "{}" }, stray)
+local res4 = repos.doctor_archive(repo)
+ok("[12] *** an UNPARSEABLE marker name is NOT deleted ***", ds.exists(stray), stray)
+ok("[12] it is reported as unreadable, not silently kept",
+  lists(res4.unreadable, stray), vim.inspect(res4))
+ok("[12] and it is never counted as dropped", not lists(res4.dropped, stray),
+  vim.inspect(res4.dropped))
+ok("[12] archive_orphans does not claim it either",
+  not lists(repos.archive_orphans(repo), stray),
+  vim.inspect(repos.archive_orphans(repo)))
+
+-- CONTAINMENT IS NOT IDENTITY, here too: a well-formed marker NAMED for another
+-- repo, sitting in this repo's archived/. Its review path resolves into the
+-- OTHER repo's directory, so "the review is absent" would be a fact about
+-- somewhere else — and acting on it lets one repo's doctor reach into another's
+-- namespace, which is the cross-repository delete this module was hardened
+-- against.
+local skew = review.archived_dir(slug) .. "/own__repo@abc1234.r1.review.json.archived.json"
+vim.fn.writefile({ "{}" }, skew)
+local res5 = repos.doctor_archive(repo)
+ok("[12] *** a marker named for ANOTHER repo is not dropped by this one ***",
+  ds.exists(skew) and not lists(res5.dropped, skew), vim.inspect(res5.dropped))
+ok("[12] it is reported as unreadable instead", lists(res5.unreadable, skew),
+  vim.inspect(res5.unreadable))
+vim.fn.delete(stray); vim.fn.delete(skew)
+
 ok("[12] doctor_archive requires a repo slug",
   select(2, repos.doctor_archive(nil)) ~= nil)
 
