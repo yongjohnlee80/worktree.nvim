@@ -2,6 +2,70 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.20] — 2026-09-23 — reviews can be archived instead of destroyed
+
+Patch. Additive — no existing call changes behaviour unless it passes the new
+option. Reviewed by lector (four rounds).
+
+**Review archiving (ADR-0195 D2/P4).** Until now a review could only be tidied
+away by deleting it, which removed **both** halves of the ADR-0067 pair and
+fenced the revision. Archiving is the reversible verb that was missing: the pair
+stays exactly where it is, every task `review:` reference keeps resolving, and
+the revision stays occupied.
+
+State is one marker document **per review** rather than a per-repo index, so two
+Neovim instances archiving different reviews touch different files and cannot
+contend.
+
+New: `review.archive` / `unarchive` / `is_archived` / `archive_path` /
+`unarchive_path`, `described_all`, `index_all`, `classify_markers`,
+`reconcile_archive`; `repos.archive_review` / `unarchive_review` /
+`doctor_archive` / `archive_orphans`.
+
+`described_for`, `reviews_all` and `reviews_index` take
+`include_archived = "active"` (default) `| "all" | "archived_only"`. The cheap
+count and the described listing are asserted to agree, because a section reading
+`(3)` over two rows is not a smaller bug than wrong rows.
+
+**Fail-closed everywhere it matters.** A marker that cannot be read, has the
+wrong schema, or names a different review leaves the review **hidden** and
+reports why. Reporting it as "not archived" would resurface a review the user
+deliberately hid.
+
+Every mutation goes through the same validator. `unarchive` and `remove` refuse
+an unvalidatable marker rather than unlinking it, because destroying the only
+evidence of a state you have just admitted you do not understand is the wrong
+move; `unarchive(..., { force = true })` is the deliberate recovery.
+
+**Delete ordering, and a doctor that proves identity.** `remove` preflights the
+marker without mutating it, deletes the pair, then unlinks the marker, reporting
+a partial if that last step fails. Clearing the marker first would silently
+unarchive a review on any later failure, with nothing designed to recover the
+intent; the orphan left by unlinking last is what `doctor_archive` reconciles.
+
+`doctor_archive` drops only **proven** orphans: canonical, this repo's own,
+review absent. An unparseable name, or a well-formed marker naming another repo,
+is reported and never touched — deleting an identity you cannot establish is the
+same error as trusting a marker you cannot parse.
+
+`tests/adr0195-review-archive.lua`: 86 cells. Full `run-all` green.
+
+## [v0.5.19] — 2026-09-18 — the graph panel paints before it knows, and a review can acquire its PR
+
+**`graph` (ADR-0193).** `<leader>gt` opens the float and shows a loading state
+immediately, filling it when discovery resolves. The ordering alone was not the
+fix: Neovim does not flush a redraw between two synchronous statements in one
+call stack, so the yield is what makes the panel appear.
+
+**`review` (ADR-0083 r11).** `amend_pr_association` attaches a PR to a written
+review, or clears one, and can change nothing else: it takes a number, never a
+review body. The generic overwrite option is removed from `save`, so a written
+review can no longer be replaced at all. Attaching requires a whole pair and a
+canonical store path; clearing is always permitted, because refusing to detach
+would strand the review that most needs it.
+
+Reviewed by `agent:zen` across five rounds.
+
 ## [v0.5.18] — 2026-09-11 — an unwritable runtime dir now says which one, and the suite stops using yours
 
 Patch. Test isolation and one diagnostic message; no behaviour change to any
