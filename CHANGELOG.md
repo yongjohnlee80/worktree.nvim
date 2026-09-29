@@ -2,6 +2,18 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.21] — 2026-09-29 — `<leader>gw` shows auto-core's shared worktree list
+
+Patch. Needs auto-core.nvim v0.2.32.
+
+`pick` (`<leader>gw`) no longer builds its own list: it shows auto-core's
+`git.worktree.select`, the one list auto-finder's `w` and auto-run's
+`<leader>rw` show too, so the three cannot drift. What a choice does is
+unchanged: pick switches (cd, buffers, LSPs, file tree). Two gains come with
+the shared list: a worktree whose directory was deleted (git's `prunable`) is
+no longer offered, and nvim opened inside a single plain repository now lists
+that repo's own worktrees instead of "no worktrees found".
+
 ## [v0.5.20] — 2026-09-23 — reviews can be archived instead of destroyed
 
 Patch. Additive — no existing call changes behaviour unless it passes the new

@@ -53,6 +53,7 @@ local branch_dir = vim.fn.fnamemodify(plugin_root, ":t")
 local AC_REQUIRES = {
   { "lua/auto-core/git/log.lua",       "function M.unpushed"  },
   { "lua/auto-core/docstore/init.lua", "function M.write_json" },
+  { "lua/auto-core/git/worktree.lua",  "function M.select"     }, -- pick (v0.2.32)
 }
 local function ac_serves(p)
   for _, req in ipairs(AC_REQUIRES) do
@@ -2369,6 +2370,58 @@ end
       core.git.write.push = orig
       return seen == lab
     end)(), "expected the sample worktree")
+end)()
+
+-- ── [16] pick — auto-core's shared worktree list, then a switch ─────
+-- <leader>gw, auto-finder's `w` and auto-run's <leader>rw show ONE list,
+-- auto-core's git.worktree.select. pick is the one that switches (cd); the
+-- other two only move the active worktree.
+print("\n[16] pick — the shared worktree list; a choice switches")
+;(function()
+  local core_wt = require("auto-core.git.worktree")
+  local function git(dir, ...)
+    local r = vim.system({ "git", "-C", dir, "-c", "user.email=s@t", "-c", "user.name=s", ... },
+      { text = true }):wait()
+    return r.code == 0, (r.stderr or "")
+  end
+  local ws = git_mod.norm(vim.fn.tempname() .. "-ws16")
+  vim.fn.mkdir(ws, "p")
+  vim.system({ "git", "init", "-q", "-b", "main", ws .. "/app" }, { text = true }):wait()
+  git(ws .. "/app", "commit", "-q", "--allow-empty", "-m", "init")
+  local okf = git(ws .. "/app", "worktree", "add", "-q", "-b", "feat", ws .. "/app-feat")
+  ok("16: fixture: a plain repo with a linked worktree", okf)
+
+  local saved_root = wt.get_root()
+  local saved_cwd = vim.fn.getcwd()
+  wt.set_root(ws)
+  local real_select = vim.ui.select
+  local seen, pick_index
+  vim.ui.select = function(items, o, cb)
+    seen = { prompt = o.prompt, labels = vim.tbl_map(o.format_item, items), items = items }
+    cb(pick_index and items[pick_index] or nil)
+  end
+
+  wt.pick()
+  local want = {}
+  for _, e in ipairs(core_wt.selectable(ws)) do want[#want + 1] = core_wt.format_entry(e, ws, git_mod.norm(saved_cwd)) end
+  ok("16: pick offers auto-core's list with its labels",
+    seen and #seen.labels == 2 and vim.deep_equal(seen.labels, want), vim.inspect(seen and seen.labels))
+  ok("16: the prompt is 'Switch worktree:'", seen and seen.prompt == "Switch worktree:", seen and seen.prompt)
+  ok("16: cancelling leaves the cwd alone", vim.fn.getcwd() == saved_cwd, vim.fn.getcwd())
+
+  pick_index = 2
+  wt.pick()
+  ok("16: choosing switches the cwd to the worktree", git_mod.norm(vim.fn.getcwd()) == ws .. "/app-feat", vim.fn.getcwd())
+  ok("16: and makes it auto-core's active worktree", core_wt.get_active() == ws .. "/app-feat",
+    tostring(core_wt.get_active()))
+  pick_index = nil
+  wt.pick()
+  ok("16: the list marks the worktree pick switched to", seen.labels[2]:match("^●") ~= nil, vim.inspect(seen.labels))
+
+  vim.ui.select = real_select
+  vim.cmd.cd(vim.fn.fnameescape(saved_cwd))
+  if saved_root then wt.set_root(saved_root) end
+  vim.fn.delete(ws, "rf")
 end)()
 
 -- ───────────────────── summary ─────────────────────
