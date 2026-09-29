@@ -80,6 +80,7 @@ M.create_branch   = repo_fn("create_branch")
 -- git.worktree
 M.parse_porcelain      = wt_fn("parse_porcelain")
 M.collect_worktrees    = wt_fn("collect") -- renamed across the boundary
+M.select_worktree      = wt_fn("select")  -- the shared picker (auto-core >= 0.2.32)
 M.repo_container       = wt_fn("repo_container")
 M.list_child_repos     = wt_fn("list_child_repos")
 M.list_branches        = wt_fn("list_branches")

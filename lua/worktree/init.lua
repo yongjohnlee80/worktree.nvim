@@ -455,28 +455,20 @@ local function switch_to(path)
   ))
 end
 
+-- The list is auto-core's (git.worktree.select), the same one auto-finder's
+-- `w` and auto-run's <leader>rw offer; only what a choice does differs. Here
+-- it switches: cd, buffers, LSPs, file tree. Those two only move the active
+-- worktree and leave the cwd alone.
 function M.pick()
   local root = M.ensure_root()
-  local worktrees = git.collect_worktrees(root)
-  if #worktrees == 0 then
-    log(("no worktrees found under %s"):format(root), vim.log.levels.WARN)
-    return
-  end
-
-  local cwd = git.norm(vim.fn.getcwd())
-  vim.ui.select(worktrees, {
+  local ok, err = git.select_worktree({
+    root = root,
     prompt = "Switch worktree:",
-    format_item = function(wt)
-      local rel = relative_to_root(wt.path)
-      local branch = wt.branch and ("[" .. wt.branch .. "]")
-        or wt.detached and "[detached]"
-        or ""
-      local marker = wt.path == cwd and "●" or " "
-      return ("%s %-40s %s"):format(marker, rel, branch)
-    end,
+    current = git.norm(vim.fn.getcwd()),
   }, function(choice)
     if choice then switch_to(choice.path) end
   end)
+  if not ok then log(err, vim.log.levels.WARN) end
 end
 
 function M.home()

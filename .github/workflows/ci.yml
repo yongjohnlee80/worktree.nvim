@@ -106,7 +106,7 @@ jobs:
           # unavailable (auto-core >= v0.2.22)", on `main` as well as on PRs.
           # A gate that is red for a reason unrelated to the change under test
           # is not a gate; nobody can tell a new failure from the standing one.
-          AUTO_CORE_REF: "16ae176726ba8a5303640fde617aeca7db31822e"  # main @ v0.2.23
+          AUTO_CORE_REF: "132d27a465c221db2eec8d09dec8981228e1e7bc"  # main @ v0.2.32
           PLENARY_REF:   "74b06c6c75e4eeb3108ec01852001636d85a932b"
         run: ./.github/install-deps.sh
 
@@ -151,7 +151,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           # Kept in step with the install pin above — the guard below asserts it.
-          AUTO_CORE_REF: "16ae176726ba8a5303640fde617aeca7db31822e"
+          AUTO_CORE_REF: "132d27a465c221db2eec8d09dec8981228e1e7bc"
         run: |
           # One API call rather than a second clone: compare gives the distance
           # to the default branch directly.
