@@ -688,8 +688,8 @@ local function _orphan_documents(slug, revision)
   local repo = _repo_component(slug)
   local rev = tonumber(revision)
   if not rev then return out, false, "the revision is not a number" end
-  -- `<date>-<repo>-<topic>-r<N>-review.md` under `agents/<reviewer>/reviews/`.
-  local pattern = ("%s/agents/*/reviews/*-r%d-review.md"):format(kb, rev)
+  -- `<date>-<repo>-<topic>-r<N>-review.md` under `reviews/<reviewer>/` (KB v2).
+  local pattern = ("%s/reviews/*/*-r%d-review.md"):format(kb, rev)
   -- Through auto-core: this is a filesystem READ, and a delegate module that
   -- reaches for `vim.fn.glob` itself is exactly how the I/O AC1 counts grows
   -- back one call at a time.
@@ -736,7 +736,7 @@ function M.canonical_document(opts)
     return nil, "date must be YYYY-MM-DD"
   end
   local topic = _sanitize_segment(opts.topic) or "review"
-  return ("%s/agents/%s/reviews/%s-%s-%s-r%d-review.md")
+  return ("%s/reviews/%s/%s-%s-%s-r%d-review.md")
     :format(kb, rslug, date, _repo_component(opts.slug), topic, rev), nil
 end
 
@@ -746,8 +746,8 @@ M.DOC_NAME = "^(%d%d%d%d%-%d%d%-%d%d)%-(.+)%-r(%d+)%-review%.md$"
 ---_under reports whether `path` sits inside `dir` at a COMPONENT boundary.
 ---
 ---A raw prefix comparison is not containment. `vim.fs.normalize` strips the
----trailing slash, so `…/agents/lector/reviews-evil/x` shares the prefix of
----`…/agents/lector/reviews` and was accepted — verified,
+---trailing slash, so `…/reviews/lector-evil/x` shares the prefix of
+---`…/reviews/lector` and was accepted — verified,
 ---`prefix_sibling_accepted=true`. Comparing with the separator restored is what
 ---makes a sibling a sibling.
 local function _under(path, dir)
@@ -782,9 +782,9 @@ function M.check_document_path(doc, opts)
       "reviewer_slug missing or unsafe — ownership of the document cannot be checked"
   end
   if kb and kb ~= "" and rslug then
-    if not _under(doc, ("%s/agents/%s/reviews"):format(kb, rslug)) then
+    if not _under(doc, ("%s/reviews/%s"):format(kb, rslug)) then
       problems[#problems + 1] =
-        "document is not under $KB_ROOT/agents/" .. rslug .. "/reviews/: " .. doc
+        "document is not under $KB_ROOT/reviews/" .. rslug .. "/: " .. doc
     end
   end
   local name = doc:match("([^/]+)$") or ""
@@ -1420,7 +1420,7 @@ function M.remove(slug, sha, revision)
   else
     -- Validate with the DOMAIN validator that already exists, rather than
     -- rebuilding the filename grammar here. `check_document_path` is written for
-    -- exactly this: normalised containment under `$KB_ROOT/agents/<reviewer>/
+    -- exactly this: normalised containment under `$KB_ROOT/reviews/<reviewer>/
     -- reviews/`, the `<date>-<repo>-<topic>-r<N>-review.md` shape, agreement of
     -- the repo component, and agreement of the revision — which is MF1's
     -- requirement verbatim.

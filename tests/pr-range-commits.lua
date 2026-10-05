@@ -214,7 +214,7 @@ do
   -- "main" and diffed against the wrong branch on any PR based elsewhere.
   local kb = sb .. "/kb"
   local slug = "acme__thing"
-  vim.fn.mkdir(string.format("%s/shared/prs/%s", kb, slug), "p")
+  vim.fn.mkdir(string.format("%s/prs/%s", kb, slug), "p")
   vim.fn.writefile({
     "---",
     "number: 77",
@@ -225,7 +225,7 @@ do
     "draft: false",
     "---",
     "body",
-  }, string.format("%s/shared/prs/%s/pr-77.md", kb, slug))
+  }, string.format("%s/prs/%s/pr-77.md", kb, slug))
 
   local saved = vim.env.AUTO_AGENTS_KB_ROOT
   vim.env.AUTO_AGENTS_KB_ROOT = kb

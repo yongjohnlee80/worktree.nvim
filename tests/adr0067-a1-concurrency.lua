@@ -256,7 +256,7 @@ do
       if vim.fn.filereadable(review.reserve_path(SLUG, sha, rev)) == 1 then reserved = true end
     end
     local mds = vim.fn.glob(
-      ("%s/agents/lector/reviews/*-review.md"):format(vim.env.AUTO_AGENTS_KB_ROOT),
+      ("%s/reviews/lector/*-review.md"):format(vim.env.AUTO_AGENTS_KB_ROOT),
       false, true)
     local md_here = false
     for _, f in ipairs(mds) do

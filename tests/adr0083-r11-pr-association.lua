@@ -62,14 +62,14 @@ end
 -- A paired review on disk: the store refuses an unpaired one, so the document
 -- has to exist before the JSON will be accepted.
 local kb = vim.fn.tempname() .. "-kb"
-vim.fn.mkdir(kb .. "/agents/tester/reviews", "p")
+vim.fn.mkdir(kb .. "/reviews/tester", "p")
 vim.env.AUTO_AGENTS_KB_ROOT = kb
 
 -- The pair check is strict: the document lives under
--- $KB_ROOT/agents/<reviewer_slug>/reviews/ and is named
+-- $KB_ROOT/reviews/<reviewer_slug>/ and is named
 -- <date>-<repo>-<topic>-r<N>-review.md, with the revision matching the JSON's.
 local function make(rev, summary)
-  local doc = ("%s/agents/tester/reviews/2026-09-18-repo-r11-association-r%d-review.md")
+  local doc = ("%s/reviews/tester/2026-09-18-repo-r11-association-r%d-review.md")
     :format(kb, rev)
   vim.fn.writefile({ "# review" }, doc)
   return {

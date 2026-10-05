@@ -116,7 +116,7 @@ end
 -- that exercise the write PRIMITIVES pair one for real. Declared at file scope
 -- because several independent sections need it.
 -- $KB_ROOT is isolated here for the same reason XDG is: ADR-0067's paired
--- writes land under $KB_ROOT/agents/<reviewer>/reviews/, so an inherited value
+-- writes land under $KB_ROOT/reviews/<reviewer>/, so an inherited value
 -- means the suite writes into the real knowledge base.
 vim.env.AUTO_AGENTS_KB_ROOT = vim.fn.tempname() .. "-kbroot"
 vim.fn.mkdir(vim.env.AUTO_AGENTS_KB_ROOT, "p")
@@ -990,10 +990,10 @@ do
   -- canonical review, so these tests pair one for real rather than opting out —
   -- an invariant a caller can skip is not an invariant, and no `skip` option
   -- exists. The helper writes a genuine Markdown document under
-  -- $KB_ROOT/agents/<reviewer>/reviews/ and points the review at it.
+  -- $KB_ROOT/reviews/<reviewer>/ and points the review at it.
   local function pair_doc(rv, reviewer_slug)
     local kb = vim.env.AUTO_AGENTS_KB_ROOT
-    local dir = ("%s/agents/%s/reviews"):format(kb, reviewer_slug or "lector")
+    local dir = ("%s/reviews/%s"):format(kb, reviewer_slug or "lector")
     vim.fn.mkdir(dir, "p")
     local path = ("%s/2026-08-24-smoke-r%d-review.md"):format(dir, rv.revision or 1)
     vim.fn.writefile({ "# primary review" }, path)
