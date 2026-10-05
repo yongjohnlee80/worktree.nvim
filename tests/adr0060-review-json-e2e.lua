@@ -30,7 +30,7 @@ end
 local sb = vim.fn.tempname() .. "-skill"
 vim.env.XDG_STATE_HOME = sb .. "/state"
 -- $KB_ROOT must be isolated too, not just XDG. ADR-0067 pairs every review with
--- a Markdown document under $KB_ROOT/agents/<reviewer>/reviews/, so a suite
+-- a Markdown document under $KB_ROOT/reviews/<reviewer>/, so a suite
 -- that leaves this inheriting the real environment WRITES INTO THE LIVE KB —
 -- which this one did until it was caught, leaving six stub files behind and
 -- silently skewing revision allocation on every rerun.

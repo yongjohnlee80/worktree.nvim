@@ -423,12 +423,20 @@ end
 -- writer and a reader cannot disagree about where an association is
 -- ([[shared-resolver-single-source-of-truth]]).
 
----kb_root resolves the knowledge-base root the PR documents live under.
----@return string
+---kb_root resolves the knowledge-base root the PR documents live under,
+---through auto-core's one resolver (`$KB_ROOT`: the project's primary KB from
+---auto-core v0.3.0), as review.lua's does. nil when no KB resolves: a fixed
+---fallback to one person's KB was wrong for every other user and project.
+---@return string?
 function M.kb_root()
-  local r = vim.env.AUTO_AGENTS_KB_ROOT
-  if r and r ~= "" then return r end
-  return vim.fn.expand("~/.config/nvim/.auto-agents-config/kb")
+  local ok, vars = pcall(require, "auto-core.todo.vars")
+  if ok and type(vars) == "table" and type(vars.get) == "function" then
+    local okv, v = pcall(vars.get, "KB_ROOT")
+    if okv and type(v) == "string" and v ~= "" then return v end
+  end
+  local env = vim.env.AUTO_AGENTS_KB_ROOT
+  if type(env) == "string" and env ~= "" then return env end
+  return nil
 end
 
 ---kb_slug names a repo's PR-document namespace.
@@ -440,11 +448,14 @@ function M.kb_slug(repo)
   return "repo"
 end
 
----prs_dir is the directory holding every PR document for `repo`.
+---prs_dir is the directory holding every PR document for `repo`
+---(`prs/<slug>/`, KB v2); nil when no KB resolves.
 ---@param repo table?
----@return string
+---@return string?
 function M.prs_dir(repo)
-  return string.format("%s/shared/prs/%s", M.kb_root(), M.kb_slug(repo))
+  local kb = M.kb_root()
+  if not kb then return nil end
+  return string.format("%s/prs/%s", kb, M.kb_slug(repo))
 end
 
 ---kb_doc_path is the document that records PR #`number` for `repo`.
@@ -452,7 +463,9 @@ end
 ---@param number integer|string
 ---@return string
 function M.kb_doc_path(repo, number)
-  return string.format("%s/pr-%s.md", M.prs_dir(repo), tostring(number))
+  local dir = M.prs_dir(repo)
+  if not dir then return nil end
+  return string.format("%s/pr-%s.md", dir, tostring(number))
 end
 
 ---read_kb_doc parses a PR document's frontmatter into a flat field table.
@@ -492,7 +505,7 @@ end
 ---@return table[]
 function M.kb_docs(repo)
   local dir = M.prs_dir(repo)
-  if vim.fn.isdirectory(dir) ~= 1 then return {} end
+  if not dir or vim.fn.isdirectory(dir) ~= 1 then return {} end
   local out = {}
   for _, p in ipairs(vim.fn.globpath(dir, "pr-*.md", false, true)) do
     local fields = M.read_kb_doc(p)
@@ -506,7 +519,7 @@ end
 ---
 ---This is the association itself, not a by-product of it. `find_for_worktree`
 ---knows a worktree is PR #N by exactly two facts: the branch is literally
----named `pr-<N>`, or a doc under `shared/prs/<slug>/` carries
+---named `pr-<N>`, or a doc under `prs/<slug>/` carries
 ---`branch: <that branch>`. A PR whose head is an ordinary branch name — every
 ---PR opened by `create_pr` — has only the second, so writing this doc is what
 ---makes the `[#N]` badge, `O`'s range diff, and a review's `pr` tag exist at
@@ -524,6 +537,9 @@ function M.write_kb_doc(repo, pr, branch)
     return nil, "write_kb_doc: a PR record with a number is required"
   end
   local path = M.kb_doc_path(repo, pr.number)
+  if not path then
+    return nil, "write_kb_doc: no KB root resolves, so the PR record has nowhere to go"
+  end
   local slug = M.kb_slug(repo)
   local content = table.concat({
     "---",
@@ -938,7 +954,7 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
       tostring(pr_number), vim.trim(add_res.stderr or add_res.stdout or "")) }
   end
 
-  -- 3. Associate: write shared/prs/<repo_slug>/pr-<number>.md. `pr.number` may
+  -- 3. Associate: write prs/<repo_slug>/pr-<number>.md. `pr.number` may
   -- be absent from a sparse forge response, so pin the number the caller asked
   -- for — the doc's filename and `number:` field must agree with it.
   local kb_doc, kberr = M.write_kb_doc(repo,
@@ -1083,7 +1099,7 @@ function M.find_for_worktree(repo, wt)
   -- 1. Check if branch is named pr-<number>
   local pr_num_from_branch = wt.branch:match("^pr%-(%d+)$")
 
-  -- 2. Scan shared/prs/<repo_slug>/. An EXPLICIT branch match wins over a
+  -- 2. Scan prs/<repo_slug>/. An EXPLICIT branch match wins over a
   -- match on the pr-<N> naming convention: when a branch called `pr-7` has
   -- been deliberately associated with #12, the document is the newer, more
   -- specific statement, and letting glob order decide between them made the
@@ -1160,7 +1176,9 @@ end
 ---@param repo table?
 ---@return string
 function M.association_lock(repo)
-  return M.prs_dir(repo) .. "/.association"
+  -- the lock only names a resource: without a KB it is still one per repo
+  local dir = M.prs_dir(repo) or (vim.fn.stdpath("state") .. "/worktree.nvim/prs/" .. M.kb_slug(repo))
+  return dir .. "/.association"
 end
 
 ---_credential_state answers, structurally, what we may do about verification.

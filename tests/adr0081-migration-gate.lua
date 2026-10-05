@@ -69,7 +69,7 @@ local OLD_CANONICAL = '{"reviewer_slug":"lector","comments":[{"line":12,"path":"
   .. '"created":"2026-09-03T03:05:57Z",'
   .. '"repo":{"url":"git@github.com:yongjohnlee80/godiff.git",'
   .. '"owner":"yongjohnlee80","name":"godiff"},"reviewer":"lector",'
-  .. '"document":"KB_ROOT_PLACEHOLDER/agents/lector/reviews/2026-09-03-godiff-godiff-r1-review.md",'
+  .. '"document":"KB_ROOT_PLACEHOLDER/reviews/lector/2026-09-03-godiff-godiff-r1-review.md",'
   .. '"verdict":"change_requested","schema":"worktree.review/1","summary":"one must-fix"}'
 -- A LIVE reservation (lease in absolute epoch SECONDS) and a tombstone.
 local OLD_RESERVE = '{"lease_until":1788000120,"owner":"old-token","created_at":1788000000}'

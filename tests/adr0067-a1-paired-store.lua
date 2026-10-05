@@ -196,7 +196,7 @@ do
 
   local ghost = mk()
   ghost.revision = 500
-  ghost.document = vim.env.AUTO_AGENTS_KB_ROOT .. "/agents/lector/reviews/2026-08-24-ghost-r500-review.md"
+  ghost.document = vim.env.AUTO_AGENTS_KB_ROOT .. "/reviews/lector/2026-08-24-ghost-r500-review.md"
   local p2, e2 = review.save(SLUG, ghost)
   ok("*** and one whose document does NOT EXIST — presence is not existence ***",
     p2 == nil and e2 ~= nil, tostring(e2))
@@ -205,14 +205,14 @@ do
 
   local esc = mk()
   esc.revision = 501
-  esc.document = vim.env.AUTO_AGENTS_KB_ROOT .. "/agents/lector/reviews/../../../etc/2026-08-24-x-r501-review.md"
+  esc.document = vim.env.AUTO_AGENTS_KB_ROOT .. "/reviews/lector/../../../etc/2026-08-24-x-r501-review.md"
   ok("*** a traversal out of $KB_ROOT/agents is refused ***",
     select(1, review.save(SLUG, esc)) == nil)
 
   local other = mk()
   other.revision = 502
   other.reviewer_slug = "lector"
-  local dir = ("%s/agents/someone-else/reviews"):format(vim.env.AUTO_AGENTS_KB_ROOT)
+  local dir = ("%s/reviews/someone-else"):format(vim.env.AUTO_AGENTS_KB_ROOT)
   vim.fn.mkdir(dir, "p")
   other.document = dir .. "/2026-08-24-x-r502-review.md"
   vim.fn.writefile({ "# theirs" }, other.document)
@@ -240,7 +240,7 @@ do
   d.reviewer_slug = "lector"
   d.revision = 1
   d.comments = { { path = "a.go", line = 1, side = "RIGHT", severity = "nit", body = "x" } }
-  local dir = ("%s/agents/lector/reviews"):format(vim.env.AUTO_AGENTS_KB_ROOT)
+  local dir = ("%s/reviews/lector"):format(vim.env.AUTO_AGENTS_KB_ROOT)
   vim.fn.mkdir(dir, "p")
   d.document = dir .. "/2026-08-25-x-r1-review.md"
   vim.fn.writefile({ "# a real file" }, d.document)

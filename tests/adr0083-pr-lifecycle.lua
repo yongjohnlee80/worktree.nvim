@@ -310,7 +310,7 @@ do
   ok("5c: get_pr surfaces the forge base sha (C3)", pr and pr.base_sha == c3, pr and tostring(pr.base_sha))
 
   -- 2) The KB PR doc persists base_sha, and find_for_worktree parses it back.
-  local doc_dir = string.format("%s/shared/prs/%s", kb, slug)
+  local doc_dir = string.format("%s/prs/%s", kb, slug)
   vim.fn.mkdir(doc_dir, "p")
   vim.fn.writefile({ "---", "number: 77", "branch: pr-77",
     "base: base", "base_sha: " .. c3, "---", "x" },

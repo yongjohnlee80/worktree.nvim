@@ -93,7 +93,7 @@ ok("*** findings across two commits, all posted -> posted ***",
 
 -- 7. Falls back to the JSON basename when `name` is absent.
 ok("resolves doc_name from .path when .name is nil",
-  repos.review_posted(repo, { pr = 7, path = "/agents/x/reviews/" .. doc }) == true)
+  repos.review_posted(repo, { pr = 7, path = "/reviews/x/" .. doc }) == true)
 
 -- 8. The review JSON is never required to exist (receipt is the only source).
 ok("posted state needs no review file on disk",

@@ -780,7 +780,8 @@ do
 
     -- MF1 (r4): the SAME conflation survived one layer down, in
     -- `auto-core.docstore.glob`. lector's probe keeps the KB root resolvable
-    -- and makes `$KB_ROOT/agents` UNREADABLE: `vim.fn.glob` reports no error,
+    -- and makes the search root (`$KB_ROOT/reviews` since KB v2; it was
+    -- `$KB_ROOT/agents`) UNREADABLE: `vim.fn.glob` reports no error,
     -- so the search returned what "nothing matched" returns, and `remove`
     -- reported ok=true / document_absent=true with the Markdown still there.
     -- Fixing the caller was not enough; the primitive had to report it too.
@@ -795,9 +796,9 @@ do
       vim.fn.writefile({ '{"document":' }, res7.json_path)
 
       -- The root RESOLVES; only the traversal is denied.
-      vim.fn.system({ "chmod", "000", alt .. "/agents" })
+      vim.fn.system({ "chmod", "000", alt .. "/reviews" })
       local uok, uerr, udetail = review.remove(slug, sha2, res7.revision)
-      vim.fn.system({ "chmod", "755", alt .. "/agents" })
+      vim.fn.system({ "chmod", "755", alt .. "/reviews" })
 
       ok("[11] *** MF1(r4): an UNREADABLE search root is not a clean removal ***",
         uok == false and udetail ~= nil and udetail.document_unknown == true
@@ -821,10 +822,11 @@ do
     end
 
     -- MF1 (r5): the traversal check proved only the FIXED PREFIX was readable.
-    -- lector's probe keeps `$KB_ROOT/agents` readable and denies only
-    -- `agents/lector`, so the wildcard selected the reviewer and the literal
-    -- `reviews` beneath it could not be reached -- empty and silent again, one
-    -- level below where the previous fix looked.
+    -- lector's probe keeps the search root readable and denies only the
+    -- reviewer's directory, so the wildcard selected the reviewer and the
+    -- files beneath it could not be reached -- empty and silent again, one
+    -- level below where the previous fix looked. (KB v2: `reviews/lector`;
+    -- it was `agents/lector`, above a literal `reviews`.)
     do
       local d8 = review.new({ owner = "yongjohnlee80", name = "proj",
         url = "git@github.com:yongjohnlee80/proj.git", commit = sha2,
@@ -835,10 +837,10 @@ do
       ok("[11] fixture: a fourth valid pair exists", res8 ~= nil)
       vim.fn.writefile({ '{"document":' }, res8.json_path)
 
-      -- ONLY the reviewer's directory is denied; `agents` stays readable.
-      vim.fn.system({ "chmod", "000", alt .. "/agents/lector" })
+      -- ONLY the reviewer's directory is denied; `reviews` stays readable.
+      vim.fn.system({ "chmod", "000", alt .. "/reviews/lector" })
       local nok, nerr, ndetail = review.remove(slug, sha2, res8.revision)
-      vim.fn.system({ "chmod", "755", alt .. "/agents/lector" })
+      vim.fn.system({ "chmod", "755", alt .. "/reviews/lector" })
 
       ok("[11] *** MF1(r5): a NESTED denial is not a clean removal either ***",
         nok == false and ndetail ~= nil and ndetail.document_unknown == true
@@ -858,7 +860,7 @@ do
     -- invariant is "the Markdown IS the review": a directory there means the
     -- projection points at something that cannot be read as prose.
     do
-      local dir_doc = sb .. "/kb-dir/agents/lector/reviews"
+      local dir_doc = sb .. "/kb-dir/reviews/lector"
       vim.fn.mkdir(dir_doc, "p")
       local as_dir = dir_doc .. "/2026-09-03-proj-proj-r1-review.md"
       vim.fn.mkdir(as_dir, "p")   -- a DIRECTORY where the document belongs
