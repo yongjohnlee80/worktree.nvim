@@ -245,8 +245,14 @@ makes it submittable) — is read from **one association**. A worktree is PR #N
 when either of these holds (`worktree.pr.find_for_worktree`):
 
 1. its branch is literally named `pr-<N>`; **or**
-2. a KB document `$AUTO_AGENTS_KB_ROOT/shared/prs/<slug>/pr-<N>.md` carries
+2. a KB document `$AUTO_AGENTS_KB_ROOT/prs/<slug>/pr-<N>.md` carries
    `branch: <that worktree's branch>`.
+
+That document is the KB's `pr` type (`_schema/frontmatter.yaml`). It carries
+`type`, `status` (active while the PR is open), `created`, `tags`, `abstract`,
+`repo`, `pr` (the number) and `state` (open, merged or closed; a draft is open
+with `draft: true`). A record written before v0.5.23 carries `number:`; it is
+still read.
 
 Both PR-opening paths write that document, so the ordinary flows need no
 manual step:

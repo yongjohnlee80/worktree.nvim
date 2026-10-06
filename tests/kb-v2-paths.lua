@@ -58,6 +58,36 @@ ok("a paired review lives under reviews/<reviewer>/",
   type(doc) == "string" and doc:find(kb .. "/reviews/lector/2026-10-06-", 1, true) == 1, tostring(doc))
 ok("nothing names the old agents/<reviewer>/reviews/ tree", type(doc) == "string" and not doc:find("/agents/", 1, true))
 
+-- the record follows the KB's `pr` type (ADR 1791209946 §4.4): what _schema/frontmatter.yaml requires
+local function fm_of(p)
+  local out, n = {}, 0
+  for _, l in ipairs(vim.fn.readfile(p)) do
+    if l == "---" then n = n + 1; if n == 2 then break end
+    elseif n == 1 then local k, v = l:match("^([%w_]+):%s*(.*)$"); if k then out[k] = v end end
+  end
+  return out
+end
+local p7 = pr.write_kb_doc(repo, { number = 7, title = 'say "hi"', state = "open", base_ref = "main",
+  created_at = "2026-10-06T01:02:03Z", updated_at = "2026-10-06T01:02:03Z", author = "johno" }, "feat/x")
+local f7 = fm_of(p7)
+ok("the record carries the schema's required fields: type, status, created, tags, abstract",
+  f7.type == "pr" and f7.status == "active" and f7.created == "2026-10-06T01:02:03Z" and f7.tags == '[pr, "autodoc"]'
+  and (f7.abstract or ""):find("autodoc PR #7", 1, true) ~= nil, vim.inspect(f7))
+ok("the number is `pr:`, an integer, and no `number:` is written", f7.pr == "7" and f7.number == nil, vim.inspect(f7))
+ok("the title is quoted so YAML reads it back exactly", f7.title == '"say \\"hi\\""', tostring(f7.title))
+local r7 = pr.read_kb_doc(p7)
+ok("read back: the number from `pr:`, the title unescaped", r7.number == 7 and r7.title == 'say "hi"' and r7.branch == "feat/x", vim.inspect(r7))
+local p8 = pr.write_kb_doc(repo, { number = 8, title = "d", state = "open", draft = true }, "feat/y")
+local f8 = fm_of(p8)
+ok("a draft is state open with draft: true (state is open|merged|closed)", f8.state == "open" and f8.draft == "true" and f8.status == "active", vim.inspect(f8))
+ok("and reads back as a draft", pr.read_kb_doc(p8).draft == true)
+local p10 = pr.write_kb_doc(repo, { number = 10, title = "o", state = "draft" }, "feat/w")
+ok("an older record's state: draft is rewritten as state open, draft: true", fm_of(p10).state == "open" and fm_of(p10).draft == "true", vim.inspect(fm_of(p10)))
+local p9 = pr.write_kb_doc(repo, { number = 9, title = "c", state = "closed" }, "feat/z")
+ok("a closed PR's record is status closed", fm_of(p9).status == "closed" and fm_of(p9).state == "closed")
+vim.fn.writefile({ "---", "type: pr", "repo: autodoc", "number: 11", "branch: old", "---", "" }, kb .. "/prs/autodoc/pr-11.md")
+ok("a record written before `pr:` still reads its `number:`", pr.read_kb_doc(kb .. "/prs/autodoc/pr-11.md").number == 11)
+
 print(string.format("%d passed, %d failed", pass, fail))
 vim.fn.delete(sb, "rf")
 os.exit(fail == 0 and 0 or 1)

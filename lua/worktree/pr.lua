@@ -474,7 +474,7 @@ end
 ---defaulting, because "no `state:` recorded" and "state is open" are different
 ---facts and only the consumer knows which it wants.
 ---@param path string
----@return table? fields   { number, title, state, branch, draft, base, base_sha }
+---@return table? fields   { number (from `pr:`, else `number:`), title, state, branch, draft, base, base_sha }
 function M.read_kb_doc(path)
   if vim.fn.filereadable(path) ~= 1 then return nil end
   local ok, lines = pcall(vim.fn.readfile, path, "", 30)
@@ -485,8 +485,15 @@ function M.read_kb_doc(path)
       if not in_fm then in_fm = true else break end
     elseif in_fm then
       local k, v = l:match("^([%w_]+):%s*(.*)$")
-      local function unquote(s) return (s:gsub('^"(.*)"$', "%1")) end
-      if k == "number" then f.number = tonumber(v) or v
+      local function unquote(s)
+        if s:match('^".*"$') then -- a JSON-quoted (YAML double-quoted) scalar, escapes and all
+          local ok_j, d = pcall(vim.json.decode, s)
+          if ok_j and type(d) == "string" then return d end
+        end
+        return (s:gsub('^"(.*)"$', "%1"))
+      end
+      -- `pr:` is the KB schema's number field; `number:` is what records written before it carry
+      if k == "pr" or (k == "number" and f.number == nil) then f.number = tonumber(v) or v
       elseif k == "title" then f.title = unquote(v)
       elseif k == "state" then f.state = v
       elseif k == "branch" then f.branch = v
@@ -541,19 +548,36 @@ function M.write_kb_doc(repo, pr, branch)
     return nil, "write_kb_doc: no KB root resolves, so the PR record has nowhere to go"
   end
   local slug = M.kb_slug(repo)
-  local content = table.concat({
+  -- The KB's `pr` type (ADR 1791209946 §4.4, _schema/frontmatter.yaml): `pr` is the number, `state`
+  -- is open|merged|closed (a draft is open, with `draft: true`), `status` is active while it is
+  -- open, and type/status/created/tags/abstract are every document's required fields.
+  local state = pr.state or "open"
+  local draft = pr.draft == true or state == "draft" -- an older record's `state: draft`, read back
+  if state == "draft" then state = "open" end
+  local repo_name = slug:match("__(.+)$") or slug
+  local title = pr.title or ""
+  local lines = {
     "---",
     "type: pr",
+    string.format("status: %s", state == "open" and "active" or "closed"),
+    string.format("created: %s", (pr.created_at and pr.created_at ~= "" and pr.created_at) or os.date("%Y-%m-%d")),
+    string.format("updated: %s", (pr.updated_at and pr.updated_at ~= "" and pr.updated_at) or os.date("%Y-%m-%d")),
+    string.format("tags: [pr, %s]", vim.json.encode(repo_name)),
+    string.format("abstract: %s", vim.json.encode(string.format("%s PR #%s, \"%s\": branch %s into %s.",
+      repo_name, tostring(pr.number), title ~= "" and title or "untitled", tostring(branch or "?"), pr.base_ref or "main"))),
     string.format("repo: %s", slug),
-    string.format("number: %s", tostring(pr.number)),
-    string.format("title: %q", pr.title or ""),
-    string.format("state: %s", pr.draft and "draft" or (pr.state or "open")),
+    string.format("pr: %s", tostring(pr.number)),
+    string.format("title: %s", vim.json.encode(title)),
+    string.format("state: %s", state),
+  }
+  if draft then lines[#lines + 1] = "draft: true" end
+  vim.list_extend(lines, {
     string.format("branch: %s", tostring(branch or "")),
     string.format("base: %s", pr.base_ref or "main"),
     string.format("base_sha: %s", pr.base_sha or ""),
     string.format("author: %s", pr.author or ""),
-    string.format("created: %s", (pr.created_at ~= "" and pr.created_at) or os.date("%Y-%m-%d")),
-    string.format("updated: %s", (pr.updated_at ~= "" and pr.updated_at) or os.date("%Y-%m-%d")),
+  })
+  local content = table.concat(vim.list_extend(lines, {
     "---",
     "",
     string.format("# PR #%s — %s", tostring(pr.number), pr.title or ""),
@@ -561,7 +585,7 @@ function M.write_kb_doc(repo, pr, branch)
     "## Description",
     pr.body or "",
     "",
-  }, "\n")
+  }), "\n")
 
   local ok_atomic, fs_atomic = pcall(require, "auto-core.fs.atomic")
   if ok_atomic and type(fs_atomic.write) == "function" then
@@ -956,7 +980,7 @@ function M.fetch_and_create_worktree(repo, pr_number, opts)
 
   -- 3. Associate: write prs/<repo_slug>/pr-<number>.md. `pr.number` may
   -- be absent from a sparse forge response, so pin the number the caller asked
-  -- for — the doc's filename and `number:` field must agree with it.
+  -- for — the doc's filename and `pr:` field must agree with it.
   local kb_doc, kberr = M.write_kb_doc(repo,
     vim.tbl_extend("force", pr, { number = pr.number or pr_number }), branch)
 
