@@ -2,6 +2,20 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.23] — 2026-10-06 — PR records follow the KB schema
+
+Patch. The PR record `write_kb_doc` writes under `prs/<slug>/` is now the KB's
+`pr` type (ADR 1791209946 §4.7). It writes `pr:` (the number) in place of
+`number:`, adds `status`, `tags` and an `abstract`, and writes a draft as
+`state: open` with `draft: true`, because `state` is open, merged or closed. The
+title is JSON-quoted, so YAML reads it back exactly. `read_kb_doc` reads `pr:`
+and still reads an older record's `number:`, so existing associations hold.
+
+## [v0.5.22] — 2026-10-06 — KB v2 paths
+
+Patch. Reviews live under `reviews/<reviewer>/`, and PR records under
+`prs/<slug>/` (ADR 1791209946 §6, PR #38).
+
 ## [v0.5.21] — 2026-09-29 — `<leader>gw` shows auto-core's shared worktree list
 
 Patch. Needs auto-core.nvim v0.2.32.
