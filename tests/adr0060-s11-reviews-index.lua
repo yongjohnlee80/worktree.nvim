@@ -766,9 +766,17 @@ do
       local saved_wr  = vim.env.AUTO_AGENTS_KB_WRITE
       vim.env.AUTO_AGENTS_KB_ROOT, vim.env.AUTO_AGENTS_KB_READ,
         vim.env.AUTO_AGENTS_KB_WRITE = nil, nil, nil
+      -- auto-core.kb: the recorded primary is a hop too (cleared, then recorded again)
+      if kok then kb._reset_for_tests() end
+      ok("[11] fixture: the KB root is unresolvable now", (function()
+        if kok then return kb.root() == nil end
+        local _, vars = pcall(require, "auto-core.todo.vars")
+        return select(2, pcall(vars.get, "KB_ROOT")) == nil
+      end)())
       local sok, serr, sdetail = review.remove(slug, sha2, res5.revision)
       vim.env.AUTO_AGENTS_KB_ROOT, vim.env.AUTO_AGENTS_KB_READ,
         vim.env.AUTO_AGENTS_KB_WRITE = saved_kb, saved_rd, saved_wr
+      if kok then kb.set_primary(nil, { root = alt }, { confirmed = true }) end
 
       ok("[11] *** MF1: a search that could NOT RUN is not a clean removal ***",
         sok == false and sdetail ~= nil and sdetail.document_unknown == true
