@@ -2,6 +2,19 @@
 
 All notable changes to `worktree.nvim` are documented here.
 
+## [v0.5.24] — 2026-10-15 — a review's KB root is auto-core.kb's
+
+Patch. The review store's KB root (`save_pair` without a `kb_root`) comes from
+`auto-core.kb.root()`, auto-core's one KB resolver, and no longer from the todo
+variable `$KB_ROOT`. From auto-core v0.4.2 a todo store's `$KB_ROOT` is AutoDoc's,
+derived from where the store is (ADR 1792015069), and a project's store may lie
+in no KB. An auto-core older than v0.3.0, which has no `kb` module, is still
+asked through `todo.vars`.
+
+Test [11] of `adr0060-s11-reviews-index` isolates through a recorded primary KB
+on auto-core v0.3.0 and later. It read `$AUTO_AGENTS_KB_WRITE`, which auto-core
+stopped reading at v0.3.0, so the drift job against auto-core's main failed it.
+
 ## [v0.5.23] — 2026-10-06 — PR records follow the KB schema
 
 Patch. The PR record `write_kb_doc` writes under `prs/<slug>/` is now the KB's
