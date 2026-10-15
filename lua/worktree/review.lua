@@ -632,12 +632,14 @@ M.sanitize_segment = _sanitize_segment
 ---forgot `kb_root` therefore lost the whole feature rather than a degraded path,
 ---silently, in the one environment nothing exercises (2026-09-03).
 ---
----`auto-core.todo.vars` resolves `KB_ROOT` as `$AUTO_AGENTS_KB_ROOT` →
----`$AUTO_AGENTS_KB_READ[0]` → `$AUTO_AGENTS_KB_WRITE` →
----`auto-agents.kb.root()`, and that last hop exists precisely for "when the
----panel runs in the parent nvim (not an agent)". Its FIRST hop is the env var
----this replaced, so nothing an agent relied on changes — the chain only adds
----the cases the raw read could not see.
+---`auto-core.kb.root()` is auto-core's one KB resolver (ADR 1791209945 §5):
+---the project's recorded primary KB, then `$AUTO_AGENTS_KB_ROOT`, then a
+---first-run import of `auto-agents.kb.root()`, which exists precisely for "when
+---the panel runs in the parent nvim (not an agent)". It is asked first. A todo
+---store's `$KB_ROOT` (`auto-core.todo.vars`) is a different question since
+---auto-core v0.4.2: AutoDoc's, derived from where the store is, and a project's
+---store may lie in no KB. An auto-core older than v0.3.0 has no `kb` module; its
+---`todo.vars` `KB_ROOT` was this same resolution, so it is asked instead.
 ---
 ---auto-core is already a hard dependency of this plugin, so this adds nothing
 ---to the dependency graph. It deliberately does NOT reach for `auto-agents`:
@@ -645,10 +647,16 @@ M.sanitize_segment = _sanitize_segment
 ---alone (Johno, 2026-09-03).
 ---@return string?
 local function _kb_root()
-  local ok, vars = pcall(require, "auto-core.todo.vars")
-  if ok and type(vars) == "table" and type(vars.get) == "function" then
-    local okv, v = pcall(vars.get, "KB_ROOT")
-    if okv and type(v) == "string" and v ~= "" then return v end
+  local ok_kb, kb = pcall(require, "auto-core.kb")
+  if ok_kb and type(kb) == "table" and type(kb.root) == "function" then
+    local okr, v = pcall(kb.root)
+    if okr and type(v) == "string" and v ~= "" then return v end
+  else
+    local ok, vars = pcall(require, "auto-core.todo.vars")
+    if ok and type(vars) == "table" and type(vars.get) == "function" then
+      local okv, v = pcall(vars.get, "KB_ROOT")
+      if okv and type(v) == "string" and v ~= "" then return v end
+    end
   end
   -- An auto-core without the resolver: the raw variable is still better than
   -- nothing, and is what an agent process has.

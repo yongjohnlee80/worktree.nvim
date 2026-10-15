@@ -618,13 +618,14 @@ print("\n[11] the KB root resolves with $AUTO_AGENTS_KB_ROOT UNSET")
 -- process has no such variable, `save_pair` read it raw, and every submit from
 -- the panel died at the preflight while every agent and every test passed.
 --
--- So this section isolates through a LATER hop of the same chain. auto-core
--- resolves KB_ROOT as $AUTO_AGENTS_KB_ROOT > $AUTO_AGENTS_KB_READ[0] >
--- $AUTO_AGENTS_KB_WRITE > auto-agents.kb.root(); unsetting the first two and
--- pointing the third at a temp dir keeps the test safe while proving the
--- RESOLVER is consulted rather than the raw variable — a raw read of
--- AUTO_AGENTS_KB_ROOT cannot see a value that arrives via KB_WRITE, which is
--- what makes the assertion discriminating.
+-- So this section isolates through ANOTHER hop of the resolver. auto-core.kb
+-- (auto-core >= v0.3.0) resolves the project's recorded primary KB first, then
+-- $AUTO_AGENTS_KB_ROOT; recording a primary in this suite's sandboxed state
+-- (XDG_STATE_HOME above) proves the RESOLVER is consulted rather than the raw
+-- variable — a raw read of AUTO_AGENTS_KB_ROOT cannot see a primary. An older
+-- auto-core resolves through todo.vars' chain, $AUTO_AGENTS_KB_ROOT >
+-- $AUTO_AGENTS_KB_READ[0] > $AUTO_AGENTS_KB_WRITE, so there the temp dir goes in
+-- KB_WRITE.
 --
 -- EVERY hop before the chosen one must be neutralised, and the isolation is
 -- ASSERTED BEFORE anything is written. The first cut of this section unset only
@@ -645,9 +646,19 @@ do
   ok("[11] fixture: the variable the old code read is UNSET",
     (vim.env.AUTO_AGENTS_KB_ROOT == nil or vim.env.AUTO_AGENTS_KB_ROOT == ""),
     tostring(vim.env.AUTO_AGENTS_KB_ROOT))
-  local vok, vars = pcall(require, "auto-core.todo.vars")
-  ok("[11] fixture: auto-core's resolver is available", vok and type(vars.get) == "function")
-  local resolved = select(2, pcall(vars.get, "KB_ROOT"))
+  local kok, kb = pcall(require, "auto-core.kb")
+  local resolve
+  if kok and type(kb.root) == "function" then
+    vim.env.AUTO_AGENTS_KB_WRITE = kb_write_before
+    local okp, perr = kb.set_primary(nil, { root = alt }, { confirmed = true })
+    ok("[11] fixture: the project's primary KB is the sandbox's", okp == true, tostring(perr))
+    resolve = function() return kb.root() end
+  else
+    local vok, vars = pcall(require, "auto-core.todo.vars")
+    ok("[11] fixture: auto-core's resolver is available", vok and type(vars.get) == "function")
+    resolve = function() return select(2, pcall(vars.get, "KB_ROOT")) end
+  end
+  local resolved = resolve()
   ok("[11] *** and it answers from a later hop in the chain ***",
     resolved == alt, tostring(resolved))
   -- FAIL-FAST: never exercise a real write against an unproven root. `sb` is
@@ -901,6 +912,7 @@ do
   vim.env.AUTO_AGENTS_KB_ROOT  = kb_root_before
   vim.env.AUTO_AGENTS_KB_READ  = kb_read_before
   vim.env.AUTO_AGENTS_KB_WRITE = kb_write_before
+  if kok and type(kb._reset_for_tests) == "function" then kb._reset_for_tests() end -- the primary
 end
 
 print("\n[12] review JSON is written pretty, with stable key order")
